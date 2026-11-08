@@ -33,7 +33,7 @@
   "engines": {
     "node": ">=20"
   },
-  "packageManager": "pnpm@12.4.2",
+  "packageManager": "pnpm@12.18.0",
   "scripts": {
     "typecheck": "tsc --noEmit",
     "test": "vitest run",
