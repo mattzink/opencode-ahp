@@ -1,0 +1,14 @@
+[tools]
+node = "26"
+
+[settings]
+idiomatic_version_file_enable_tools = ["pnpm"]
+
+[env]
+_.path = ["{{config_root}}/node_modules/.bin"]
+
+[tasks.setup]
+description = "Install dependencies"
+run = "pnpm install"
+sources = ["package.json", "pnpm-lock.yaml"]
+outputs = ["node_modules/.pnpm/lock.yaml"]

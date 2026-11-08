@@ -1,0 +1,1795 @@
+/**
+ * The AHP host: the JSON-RPC 2.0 router over transport connections that
+ * ties the sequencer, channel registry, root state store, and bridge
+ * together (plan §6.1).
+ *
+ * Deviation (plan §14): the plan's §7 module list stopped at bridge.ts;
+ * the router that wires the pure modules to sockets is extracted here (a
+ * `Host` class) so the whole protocol layer is unit-testable and
+ * exercisable by the spike client without a WebSocket runtime.
+ *
+ * Connection model (AHP 1.0.0 lifecycle spec):
+ *  - the first request on a socket is `initialize` (new client) or
+ *    `reconnect` (known clientId — the host keeps a per-clientId registry
+ *    across sockets);
+ *  - `ping` is answered even before initialize;
+ *  - `serverSeq` is a single host-wide sequence (seq.ts);
+ *  - `dispatchAction` and `unsubscribe` are notifications (no id); a
+ *    dispatched action comes back on the `action` notification stream
+ *    (write-ahead reconciliation; rejections carry `rejectionReason`).
+ *
+ * Phase 1 (plan §11): `createSession` + `listSessions`, session/chat
+ * snapshots, the opencode event pump (streaming text/reasoning, tool-call
+ * lifecycle, permission prompts, usage, turn terminals + steering/queue
+ * handoff), and the client-dispatchable actions VS Code sends
+ * (`chat/turnStarted`, `chat/pendingMessageSet`, `chat/toolCallConfirmed`,
+ * `chat/turnCancelled`, drafts/read/title/activeClient echoes, …).
+ *
+ * Session model: one opencode session = one AHP session channel = one
+ * default chat channel (plan §3.2 gap, same as pi-ahp). Channel suffixes
+ * are opaque; opencode session ids start with "ses" and double as
+ * suffixes for externally created sessions.
+ *
+ * Root session lifecycle events (`root/sessionAdded`,
+ * `root/sessionRemoved`, `root/sessionSummaryChanged`) are JSON-RPC
+ * *notifications* in AHP 1.0.0 (ephemeral, not replayed) — only
+ * `root/activeSessionsChanged` is a sequencer action.
+ */
+import {
+  ActionType,
+  PendingMessageKind,
+  ReconnectResultType,
+  ResponsePartKind,
+  SessionInputRequestKind,
+  SessionStatus,
+  ToolCallConfirmationReason,
+  ToolCallStatus,
+  ToolResultContentType,
+  isClientDispatchable,
+  type ActionEnvelope,
+  type ActionOrigin,
+  type ChatAction,
+  type ChatSummary,
+  type ChatState,
+  type ChatToolCallConfirmedAction,
+  type ChatTurnCancelledAction,
+  type ChatTurnStartedAction,
+  type ErrorResponsePart,
+  type Implementation,
+  type Message,
+  type ReconnectResult,
+  type RootAction,
+  type SessionAction,
+  type SessionActiveClient,
+  type SessionState,
+  type SessionSummary,
+  type SessionToolConfirmationRequest,
+  type Snapshot,
+  type StateAction,
+  type ToolCallConfirmationState,
+  type ToolCallState,
+  type ToolDefinition,
+  type ToolResultContent,
+} from "@microsoft/agent-host-protocol";
+import {
+  agentDirectoryCustomization,
+  agentIDFromUri,
+  buildSessionSummary,
+  chatSummaryOf,
+  displayNameFor,
+  initialChatState,
+  initialSessionState,
+  invocationMessageFor,
+  mapCatalog,
+  mapAgentCustomizations,
+  pastTenseMessageFor,
+  userMessage,
+  type FacadeDelivery,
+  type FacadeEvent,
+  type FacadeModelRef,
+  type FacadeSession,
+  type OpencodeFacade,
+} from "./bridge.js";
+import { ChannelRegistry, ROOT_CHANNEL, channelKind, chatChannelURI, sessionChannelURI, sessionIDOf } from "./channels.js";
+import { ERROR_INVALID_PARAMS, handleInitialize } from "./handshake.js";
+import { isRecord } from "./options.js";
+import { Sequencer } from "./seq.js";
+import {
+  createChatStateStore,
+  createRootStateStore,
+  createSessionStateStore,
+  type ChatStateStore,
+  type RootStateStore,
+  type SessionStateStore,
+} from "./state.js";
+
+export const ERROR_PARSE = -32700;
+export const ERROR_INVALID_REQUEST = -32600;
+export const ERROR_METHOD_NOT_FOUND = -32601;
+export const ERROR_INTERNAL = -32603;
+export const ERROR_SESSION_NOT_FOUND = -32001;
+export const ERROR_NO_PROVIDER = -32002;
+export const ERROR_SESSION_EXISTS = -32003;
+
+// ActionType / ReconnectResultType are `declare const enum` in the package
+// but are also real runtime objects (verified against the published dist),
+// so the value imports are safe under both tsc (inlined) and Bun.
+
+interface RpcMessage {
+  jsonrpc?: unknown;
+  id?: unknown;
+  method?: unknown;
+  params?: unknown;
+}
+
+interface SocketState {
+  initialized: boolean;
+  /** Negotiated version (set by initialize, inherited on reconnect). */
+  version: string | null;
+  clientId: string | null;
+}
+
+/**
+ * Per-clientId registry record — survives socket closes so `reconnect`
+ * can replay for the same client (AHP lifecycle spec).
+ */
+interface ClientRecord {
+  version: string;
+  socketId: number | null;
+}
+
+/**
+ * Everything the host knows about one live opencode session: the two
+ * official-reducer stores (session + its single chat), the denormalized
+ * summary fields for root notifications, and the per-turn tracking the
+ * event pump needs to join opencode events to AHP turns.
+ */
+interface SessionRecord {
+  /** The opencode session id (`ses_…`). */
+  sessionID: string;
+  /** The AHP session channel URI (`ahp-session:/<suffix>`). */
+  channel: string;
+  /** Identity `SessionSummary.provider` (fixed at registration). */
+  provider: string;
+  createdAt: string;
+  /** Denormalized `SessionSummary.modifiedAt` (ISO; lexicographic = chronological). */
+  modifiedAt: string;
+  sessionStore: SessionStateStore;
+  chatStore: ChatStateStore;
+  // ── turn tracking (event-pump join state) ────────────────────────────
+  /** The AHP turnId the pump joins opencode events to, or null. */
+  currentTurnId: string | null;
+  turnStartedAt: number | null;
+  /** `<providerID>/<modelID>` captured from `session.step.started` (usage model ref). */
+  turnModelRef: string | null;
+  // ── part / tool tracking ─────────────────────────────────────────────
+  /** Emitted part keys (`<assistantMessageID>:<kind>:<ordinal>`). */
+  parts: Set<string>;
+  /** toolCallId → raw JSON input text (`session.tool.input.ended.text`). */
+  toolInput: Map<string, string>;
+  /** toolCallId → opencode tool name (`session.tool.input.started.name`). */
+  toolName: Map<string, string>;
+  /** toolCallIds that already received `chat/toolCallReady`. */
+  toolReady: Set<string>;
+  /** toolCallId → opencode permission request id. */
+  permissionForTool: Map<string, string>;
+  /** opencode permission request id → toolCallId. */
+  toolForPermission: Map<string, string>;
+  /** The most recent `session.inbox.enqueued` (external/TUI prompt tracking). */
+  lastInbox: { text: string; delivery: string } | null;
+}
+
+export interface HostOptions {
+  serverInfo: Implementation;
+  facade: OpencodeFacade;
+  replayWindow: number;
+  /** The opencode instance's working directory (InitializeResult.defaultDirectory). */
+  defaultDirectory?: string;
+  /** Deliver a JSON-serializable frame to a connection. */
+  send: (socketId: number, message: unknown) => void;
+  /** Close one connection (a superseded duplicate clientId). */
+  close?: (socketId: number, code?: number, reason?: string) => void;
+  log?: (message: string) => void;
+}
+
+/** Version assumed for a reconnecting client the host has never seen (host restart). */
+const RECONNECT_DEFAULT_VERSION = "1.0.0";
+/**
+ * Grace before the pump registers an externally created session
+ * (`session.created`): a concurrent `createSession` may still be resolving
+ * for the same opencode session under a client-chosen channel; the slower
+ * path is healed by the delete+recreate remap in `handleCreateSession`.
+ */
+const EXTERNAL_REGISTER_GRACE_MS = 250;
+/** Default page size for `listSessions` (AHP `PaginatedParams.limit`). */
+const LIST_SESSIONS_DEFAULT_LIMIT = 100;
+
+export class Host {
+  private readonly seq: Sequencer;
+  private readonly channels = new ChannelRegistry();
+  private readonly state: RootStateStore;
+  private readonly sockets = new Map<number, SocketState>();
+  private readonly clients = new Map<string, ClientRecord>();
+  /**
+   * Live sessions, keyed by opencode session id (the event-pump join key).
+   * `byChannel` maps a session/chat channel URI to the same record for the
+   * client-facing lookups — the channel suffix is not always the opencode id
+   * (client-chosen suffixes), so the two keyings differ.
+   */
+  private readonly sessions = new Map<string, SessionRecord>();
+  private readonly byChannel = new Map<string, SessionRecord>();
+  private readonly opts: HostOptions;
+  private readonly log: (message: string) => void;
+  private turnCounter = 0;
+  private pumpController: AbortController | null = null;
+
+  constructor(opts: HostOptions) {
+    this.opts = opts;
+    this.log = opts.log ?? (() => {});
+    this.seq = new Sequencer(opts.replayWindow);
+    this.state = createRootStateStore({ agents: [] });
+  }
+
+  // ── transport callbacks ────────────────────────────────────────────────
+
+  onOpen(socketId: number): void {
+    this.sockets.set(socketId, { initialized: false, version: null, clientId: null });
+  }
+
+  onMessage(socketId: number, text: string): void {
+    let raw: unknown;
+    try {
+      raw = JSON.parse(text);
+    } catch {
+      this.sendFrame(socketId, {
+        jsonrpc: "2.0",
+        id: null,
+        error: { code: ERROR_PARSE, message: "parse error" },
+      });
+      return;
+    }
+    if (!isRecord(raw) || raw.jsonrpc !== "2.0" || typeof raw.method !== "string") {
+      this.sendFrame(socketId, {
+        jsonrpc: "2.0",
+        id: isRecord(raw) ? raw.id ?? null : null,
+        error: { code: ERROR_INVALID_REQUEST, message: "invalid request" },
+      });
+      return;
+    }
+    // The routing is async (catalog reads await the opencode registry);
+    // each message is handled independently.
+    void this.route(socketId, raw).catch((err) => {
+      // R2: a bad frame or a bridge error must never take down the host.
+      this.log(
+        `error handling ${String(raw.method)}: ${err instanceof Error ? err.stack ?? err.message : String(err)}`,
+      );
+      if (raw.id !== undefined) {
+        this.sendFrame(socketId, {
+          jsonrpc: "2.0",
+          id: raw.id,
+          error: { code: ERROR_INTERNAL, message: "internal error" },
+        });
+      }
+    });
+  }
+
+  onClose(socketId: number): void {
+    const socket = this.sockets.get(socketId);
+    if (socket?.clientId) {
+      const record = this.clients.get(socket.clientId);
+      if (record && record.socketId === socketId) record.socketId = null;
+    }
+    this.channels.removeSocket(socketId);
+    this.sockets.delete(socketId);
+    // MVP gap: active clients are not evicted on disconnect (the spec
+    // expects eviction without a timely reconnect); they refresh via
+    // `session/activeClientSet` on the next turn/dispatch.
+  }
+
+  // ── event pump ─────────────────────────────────────────────────────────
+
+  /**
+   * Start the opencode event → AHP action pump. Idempotent. The pump is a
+   * single sequential async loop, so event handling and client-dispatch
+   * handling (same event loop) interleave without races on the per-turn
+   * join state.
+   */
+  startEventPump(): void {
+    if (this.pumpController !== null) return;
+    const controller = new AbortController();
+    this.pumpController = controller;
+    void (async () => {
+      try {
+        for await (const event of this.opts.facade.events(controller.signal)) {
+          if (controller.signal.aborted) break;
+          await this.handleEvent(event);
+        }
+      } catch (err) {
+        this.log(`event pump failed: ${err instanceof Error ? err.stack ?? err.message : String(err)}`);
+      } finally {
+        if (this.pumpController === controller) this.pumpController = null;
+      }
+    })();
+  }
+
+  /** Stop the event pump (teardown). Idempotent. */
+  stopEventPump(): void {
+    this.pumpController?.abort();
+    this.pumpController = null;
+  }
+
+  // ── routing ────────────────────────────────────────────────────────────
+
+  private async route(socketId: number, msg: RpcMessage): Promise<void> {
+    const socket = this.sockets.get(socketId);
+    if (!socket) return;
+    const method = msg.method as string;
+
+    if (!socket.initialized) {
+      if (method === "ping") {
+        // ping is answered even before initialize (AHP transport spec).
+        this.sendFrame(socketId, { jsonrpc: "2.0", id: msg.id ?? null, result: null });
+        return;
+      }
+      if (method === "initialize") {
+        await this.handleInitialize(socketId, msg);
+        return;
+      }
+      if (method === "reconnect") {
+        await this.handleReconnect(socketId, msg);
+        return;
+      }
+      if (msg.id !== undefined) {
+        this.sendFrame(socketId, {
+          jsonrpc: "2.0",
+          id: msg.id,
+          error: {
+            code: ERROR_INVALID_REQUEST,
+            message: `not initialized: ${method} must follow initialize or reconnect`,
+          },
+        });
+        return;
+      }
+      this.log(`ignoring pre-initialize notification ${method} on socket ${socketId}`);
+      return;
+    }
+
+    switch (method) {
+      case "ping":
+        this.sendFrame(socketId, { jsonrpc: "2.0", id: msg.id ?? null, result: null });
+        break;
+      case "subscribe":
+        await this.handleSubscribe(socketId, msg);
+        break;
+      case "unsubscribe":
+        this.handleUnsubscribe(socketId, msg); // notification (no id)
+        break;
+      case "dispatchAction":
+        await this.handleDispatchAction(socketId, msg); // notification (no id)
+        break;
+      case "listSessions":
+        await this.handleListSessions(socketId, msg);
+        break;
+      case "createSession":
+        await this.handleCreateSession(socketId, msg);
+        break;
+      case "setClientManagedSettingsPermissions":
+        // VS Code-specific post-init notification (plan §14.7): the
+        // permissions VS Code manages in its own settings UI. AHP 1.0.0
+        // has no counterpart — accept deliberately (parse + log), never
+        // error; the connection stays up.
+        this.log(
+          `setClientManagedSettingsPermissions received (${describeParams(msg.params)}); accepted (no-op)`,
+        );
+        break;
+      case "initialize":
+      case "reconnect":
+        this.sendFrame(socketId, {
+          jsonrpc: "2.0",
+          id: msg.id ?? null,
+          error: {
+            code: ERROR_INVALID_REQUEST,
+            message: `${method} is only valid before the handshake`,
+          },
+        });
+        break;
+      default:
+        if (msg.id !== undefined) {
+          this.sendFrame(socketId, {
+            jsonrpc: "2.0",
+            id: msg.id,
+            error: { code: ERROR_METHOD_NOT_FOUND, message: `unknown method: ${method}` },
+          });
+        } else {
+          this.log(`ignoring unknown notification ${method} on socket ${socketId}`);
+        }
+    }
+  }
+
+  private sendFrame(socketId: number, message: unknown): void {
+    this.opts.send(socketId, message);
+  }
+
+  // ── commands ───────────────────────────────────────────────────────────
+
+  private async handleInitialize(socketId: number, msg: RpcMessage): Promise<void> {
+    const socket = this.sockets.get(socketId)!;
+    const outcome = await handleInitialize({
+      params: msg.params,
+      serverInfo: this.opts.serverInfo,
+      serverSeq: this.seq.seq,
+      defaultDirectory: this.opts.defaultDirectory,
+      snapshotFor: (uri) => this.snapshotFor(uri),
+    });
+    if (!outcome.ok) {
+      this.sendFrame(socketId, { jsonrpc: "2.0", id: msg.id ?? null, error: outcome.error });
+      return;
+    }
+
+    const clientId = (msg.params as { clientId: string }).clientId;
+    const existing = this.clients.get(clientId);
+    if (existing && existing.socketId !== null && existing.socketId !== socketId) {
+      // A newer connection with the same clientId supersedes the old one.
+      this.log(`client ${clientId} re-initialized on socket ${socketId}; closing socket ${existing.socketId}`);
+      this.opts.close?.(existing.socketId, 4000, "superseded by a newer connection");
+    }
+
+    socket.initialized = true;
+    socket.version = outcome.result.protocolVersion;
+    socket.clientId = clientId;
+    this.clients.set(clientId, { version: outcome.result.protocolVersion, socketId });
+
+    // Register the initial subscriptions right after the snapshot
+    // computation above; no action can slip in between.
+    const params = isRecord(msg.params) ? msg.params : {};
+    const initial = Array.isArray(params["initialSubscriptions"])
+      ? params["initialSubscriptions"]
+      : [];
+    for (const uri of initial) {
+      if (typeof uri === "string" && uri.length > 0) {
+        this.channels.subscribe(socketId, uri);
+      }
+    }
+
+    this.sendFrame(socketId, { jsonrpc: "2.0", id: msg.id ?? null, result: outcome.result });
+  }
+
+  private async handleReconnect(socketId: number, msg: RpcMessage): Promise<void> {
+    const params = msg.params;
+    if (!isRecord(params) || params["channel"] !== ROOT_CHANNEL) {
+      this.sendFrame(socketId, {
+        jsonrpc: "2.0",
+        id: msg.id ?? null,
+        error: { code: ERROR_INVALID_PARAMS, message: `reconnect must target ${ROOT_CHANNEL}` },
+      });
+      return;
+    }
+    const clientId = params["clientId"];
+    const lastSeen = params["lastSeenServerSeq"];
+    const subscriptions = params["subscriptions"];
+    if (typeof clientId !== "string" || clientId.length === 0 ||
+        !Number.isInteger(lastSeen) || (lastSeen as number) < 0 ||
+        !Array.isArray(subscriptions) || !subscriptions.every((u) => typeof u === "string")) {
+      this.sendFrame(socketId, {
+        jsonrpc: "2.0",
+        id: msg.id ?? null,
+        error: { code: ERROR_INVALID_PARAMS, message: "invalid reconnect params" },
+      });
+      return;
+    }
+    const clientSubs = subscriptions as string[];
+
+    const record = this.clients.get(clientId);
+    const known = record !== undefined;
+    const version = record?.version ?? RECONNECT_DEFAULT_VERSION;
+
+    const socket = this.sockets.get(socketId)!;
+    socket.initialized = true;
+    socket.version = version;
+    socket.clientId = clientId;
+    this.clients.set(clientId, { version, socketId });
+
+    // Resolve every requested subscription; unresolvable ones are reported
+    // in `missing` (the client drops them — AHP lifecycle spec).
+    const snapshots: Snapshot[] = [];
+    const missing: string[] = [];
+    for (const uri of clientSubs) {
+      const snap = await this.snapshotFor(uri);
+      if (snap) snapshots.push(snap);
+      else missing.push(uri);
+    }
+    for (const uri of clientSubs) {
+      this.channels.subscribe(socketId, uri);
+    }
+
+    // Replay when the client is known and its gap is still in the window;
+    // otherwise fresh snapshots.
+    let result: ReconnectResult;
+    const replay = this.seq.since(lastSeen as number);
+    if (known && replay !== null) {
+      const set = new Set(clientSubs);
+      result = {
+        type: ReconnectResultType.Replay,
+        actions: replay.filter((a) => set.has(a.channel)),
+        missing,
+      };
+    } else {
+      result = { type: ReconnectResultType.Snapshot, snapshots };
+    }
+    this.sendFrame(socketId, { jsonrpc: "2.0", id: msg.id ?? null, result });
+  }
+
+  private async handleSubscribe(socketId: number, msg: RpcMessage): Promise<void> {
+    const params = isRecord(msg.params) ? msg.params : {};
+    const uri = params["channel"];
+    if (typeof uri !== "string" || uri.length === 0) {
+      this.sendFrame(socketId, {
+        jsonrpc: "2.0",
+        id: msg.id ?? null,
+        error: { code: ERROR_INVALID_PARAMS, message: "subscribe requires a channel URI" },
+      });
+      return;
+    }
+    const outcome = this.channels.subscribe(socketId, uri);
+    if (!outcome.ok) {
+      this.sendFrame(socketId, {
+        jsonrpc: "2.0",
+        id: msg.id ?? null,
+        error: {
+          code:
+            outcome.reason === "no-such-session"
+              ? ERROR_SESSION_NOT_FOUND
+              : ERROR_INVALID_PARAMS,
+          message: `cannot subscribe to ${uri}`,
+        },
+      });
+      return;
+    }
+    const snap = await this.snapshotFor(uri);
+    this.sendFrame(socketId, {
+      jsonrpc: "2.0",
+      id: msg.id ?? null,
+      result: snap ? { snapshot: snap } : {},
+    });
+  }
+
+  private handleUnsubscribe(socketId: number, msg: RpcMessage): void {
+    const params = isRecord(msg.params) ? msg.params : {};
+    const uri = params["channel"];
+    if (typeof uri !== "string" || uri.length === 0) return;
+    this.channels.unsubscribe(socketId, uri);
+  }
+
+  /**
+   * `createSession` (AHP 1.0.0 session-channel command). Creates a real
+   * opencode session, seeds its session/chat stores, publishes the
+   * session-channel lifecycle actions, announces the session on the root
+   * channel, and responds `null` (per the command contract).
+   *
+   * Error codes: -32002 (no agent for the requested provider),
+   * -32003 (the session URI already exists).
+   */
+  private async handleCreateSession(socketId: number, msg: RpcMessage): Promise<void> {
+    const params = isRecord(msg.params) ? msg.params : {};
+    const channel = params["channel"];
+    if (typeof channel !== "string" || channelKind(channel) !== "session") {
+      this.sendError(socketId, msg.id, ERROR_INVALID_PARAMS, "createSession requires an ahp-session:/… channel");
+      return;
+    }
+    const suffix = sessionIDOf(channel) as string;
+    for (const rec of this.sessions.values()) {
+      if (rec.channel === channel) {
+        this.sendError(socketId, msg.id, ERROR_SESSION_EXISTS, "Session already exists");
+        return;
+      }
+    }
+
+    // Resolve the provider/model for the new session.
+    const providers = await this.opts.facade.listCatalog();
+    const providerParam = params["provider"];
+    let provider;
+    if (typeof providerParam === "string" && providerParam.length > 0) {
+      provider = providers.find((p) => p.providerID === providerParam && p.activation !== "disabled");
+      if (provider === undefined) {
+        this.sendError(socketId, msg.id, ERROR_NO_PROVIDER, `No agent for provider ${providerParam}`);
+        return;
+      }
+    } else {
+      provider = providers.find((p) => p.activation !== "disabled");
+    }
+    const model = provider !== undefined ? firstEnabledModelRef(provider.models) : undefined;
+
+    // `activeClient` eagerly claims an active-client role; the spec requires
+    // the clientId to match the creating client.
+    let activeClients: SessionActiveClient[] = [];
+    const activeClientParam = params["activeClient"];
+    if (activeClientParam !== undefined) {
+      const socket = this.sockets.get(socketId);
+      const ac = activeClientParam as Record<string, unknown>;
+      if (
+        !isRecord(ac) ||
+        typeof ac["clientId"] !== "string" ||
+        ac["clientId"] !== socket?.clientId
+      ) {
+        this.sendError(socketId, msg.id, ERROR_INVALID_PARAMS, "activeClient.clientId must match the initializing clientId");
+        return;
+      }
+      activeClients = [normalizeActiveClient(ac)];
+    }
+
+    // opencode SessionIDs must start with "ses": pass the suffix through
+    // only when it already is one; otherwise let opencode mint an id and
+    // record the suffix→id mapping (the record key is the opencode id).
+    const passID = suffix.startsWith("ses") ? suffix : undefined;
+    const created = await this.opts.facade.createSession({ id: passID, model });
+
+    // Slow-create race: the pump may have registered this opencode session
+    // under its own id as an external session while `createSession` was in
+    // flight. Remap: drop the interim record (root/sessionRemoved) and
+    // re-register under the client-chosen channel below.
+    const interim = this.sessions.get(created.sessionID);
+    if (interim !== undefined && interim.channel !== channel) {
+      this.removeRecord(interim);
+    }
+
+    const agents = await this.opts.facade.listAgents();
+    const customizations =
+      mapAgentCustomizations(agents).length > 0 && this.opts.defaultDirectory !== undefined
+        ? [agentDirectoryCustomization(this.opts.defaultDirectory, agents)]
+        : undefined;
+    const now = new Date().toISOString();
+    const sessionStore = createSessionStateStore(
+      initialSessionState({
+        sessionID: created.sessionID,
+        provider: created.model?.providerID ?? provider?.providerID ?? "opencode",
+        title: created.title ?? "New Session",
+        activeClients,
+        customizations,
+      }),
+    );
+    const chatStore = createChatStateStore(
+      initialChatState({ resource: chatChannelURI(created.sessionID), title: "Chat 1", modifiedAt: now }),
+    );
+    const rec: SessionRecord = {
+      sessionID: created.sessionID,
+      channel,
+      provider: sessionStore.state.provider,
+      createdAt: new Date(created.time.created).toISOString(),
+      modifiedAt: new Date(created.time.updated).toISOString() > now
+        ? new Date(created.time.updated).toISOString()
+        : now,
+      sessionStore,
+      chatStore,
+      currentTurnId: null,
+      turnStartedAt: null,
+      turnModelRef: null,
+      parts: new Set(),
+      toolInput: new Map(),
+      toolName: new Map(),
+      toolReady: new Set(),
+      permissionForTool: new Map(),
+      toolForPermission: new Map(),
+      lastInbox: null,
+    };
+    this.sessions.set(created.sessionID, rec);
+    this.byChannel.set(channel, rec);
+    this.byChannel.set(chatChannelURI(created.sessionID), rec);
+    // The session channel carries the client-chosen suffix; the chat
+    // channel and the event pump carry the opencode id — both must
+    // resolve in the registry.
+    this.channels.addSession(suffix);
+    this.channels.addSession(created.sessionID);
+
+    // Session-channel lifecycle (server-side, no origin).
+    this.publish({ channel, action: { type: ActionType.SessionReady } });
+    this.publish({
+      channel,
+      action: { type: ActionType.SessionChatAdded, summary: chatSummaryOf(chatStore.state) },
+    });
+    this.publish({
+      channel,
+      action: { type: ActionType.SessionDefaultChatChanged, defaultChat: chatChannelURI(created.sessionID) },
+    });
+    // Root: active-session count (action, replayed) + sessionAdded (notification).
+    this.publish({
+      channel: ROOT_CHANNEL,
+      action: { type: ActionType.RootActiveSessionsChanged, activeSessions: this.sessions.size },
+    });
+    this.notifyRoot("root/sessionAdded", {
+      channel: ROOT_CHANNEL,
+      summary: this.sessionSummary(rec),
+    });
+
+    this.sendFrame(socketId, { jsonrpc: "2.0", id: msg.id ?? null, result: null });
+  }
+
+  /**
+   * `listSessions` (AHP 1.0.0 root command): all opencode sessions,
+   * most-recently-modified first, with in-memory cursor pagination.
+   * Unknown sessions are lazily registered (so their channels become
+   * subscribable); registration is idempotent per opencode session id.
+   */
+  private async handleListSessions(socketId: number, msg: RpcMessage): Promise<void> {
+    const params = isRecord(msg.params) ? msg.params : {};
+    const limit =
+      typeof params["limit"] === "number" && Number.isInteger(params["limit"]) && (params["limit"] as number) > 0
+        ? (params["limit"] as number)
+        : LIST_SESSIONS_DEFAULT_LIMIT;
+    let offset = 0;
+    if (typeof params["cursor"] === "string" && params["cursor"].length > 0) {
+      const parsed = Number.parseInt(params["cursor"], 10);
+      if (Number.isInteger(parsed) && parsed > 0) offset = parsed;
+    }
+    const listed = await this.opts.facade.listSessions();
+    const records: (SessionRecord | undefined)[] = [];
+    for (const fs of listed) {
+      records.push(this.registerExternal(fs) ?? this.sessions.get(fs.sessionID));
+    }
+    const sorted = records
+      .filter((r): r is SessionRecord => r !== undefined)
+      .sort((a, b) => {
+        const ta = this.sessions.get(a.sessionID)?.modifiedAt ?? a.modifiedAt;
+        const tb = this.sessions.get(b.sessionID)?.modifiedAt ?? b.modifiedAt;
+        return ta < tb ? 1 : ta > tb ? -1 : 0;
+      });
+    const page = sorted.slice(offset, offset + limit);
+    const nextOffset = offset + limit;
+    const result: { items: SessionSummary[]; nextCursor?: string } = {
+      items: page.map((rec) => this.sessionSummary(rec)),
+    };
+    if (nextOffset < sorted.length) result.nextCursor = String(nextOffset);
+    this.sendFrame(socketId, { jsonrpc: "2.0", id: msg.id ?? null, result });
+  }
+
+  // ── client-dispatchable actions (Phase 1) ──────────────────────────────
+
+  /**
+   * `dispatchAction` is a notification — the response is the `action`
+   * notification stream itself. Phase 1 routes the client-dispatchable
+   * actions VS Code sends; everything else is acknowledged with a
+   * rejection on that stream.
+   */
+  private async handleDispatchAction(socketId: number, msg: RpcMessage): Promise<void> {
+    const params = isRecord(msg.params) ? msg.params : {};
+    const channel = params["channel"];
+    const clientSeq = params["clientSeq"];
+    const action = params["action"];
+    if (
+      typeof channel !== "string" ||
+      channel.length === 0 ||
+      !Number.isInteger(clientSeq) ||
+      !isRecord(action) ||
+      typeof action["type"] !== "string"
+    ) {
+      this.log(`malformed dispatchAction on socket ${socketId} (dropped)`);
+      return;
+    }
+
+    const socket = this.sockets.get(socketId);
+    const clientId = socket?.clientId ?? null;
+    const origin: ActionOrigin | undefined =
+      clientId !== null ? { clientId, clientSeq: clientSeq as number } : undefined;
+
+    const stateAction = action as unknown as StateAction;
+    const rejectionReason = this.dispatchRejectionReason(channel, stateAction, clientId);
+    if (rejectionReason !== null) {
+      this.echo(channel, stateAction, origin, rejectionReason);
+      return;
+    }
+
+    const kind = channelKind(channel);
+    if (kind !== "session" && kind !== "chat") {
+      this.echo(channel, stateAction, origin, `unsupported action on ${channelKind(channel)} channel: ${String(action.type)}`);
+      return;
+    }
+    const rec = this.byChannel.get(channel);
+    if (rec === undefined) {
+      this.echo(channel, stateAction, origin, `no such session: ${channel}`);
+      return;
+    }
+
+    // From here on every branch either echoes (accepted or rejected).
+    switch (stateAction.type) {
+      case ActionType.ChatTurnStarted:
+        await this.dispatchTurnStarted(rec, stateAction, origin);
+        return;
+      case ActionType.ChatPendingMessageSet:
+        await this.dispatchPendingMessageSet(rec, stateAction, origin);
+        return;
+      case ActionType.ChatToolCallConfirmed:
+        await this.dispatchToolCallConfirmed(rec, stateAction, origin);
+        return;
+      case ActionType.ChatTurnCancelled:
+        await this.dispatchTurnCancelled(rec, stateAction, origin);
+        return;
+      case ActionType.SessionTitleChanged:
+        await this.dispatchTitleChanged(rec, stateAction, origin);
+        return;
+      case ActionType.SessionActiveClientSet:
+        this.dispatchActiveClientSet(rec, stateAction, origin, clientId);
+        return;
+      case ActionType.SessionActiveClientRemoved:
+        this.dispatchActiveClientRemoved(rec, stateAction, origin, clientId);
+        return;
+      case ActionType.ChatPendingMessageRemoved:
+        // Honest gap: the opencode plugin surface has no inbox cancel —
+        // a pending (steer/queue) message cannot be withdrawn once sent.
+        this.echo(channel, stateAction, origin, "cannot remove a pending message: opencode has no inbox cancel");
+        return;
+      case ActionType.ChatDraftChanged:
+      case ActionType.ChatIsReadChanged:
+      case ActionType.ChatIsArchivedChanged:
+      case ActionType.SessionIsReadChanged:
+      case ActionType.SessionIsArchivedChanged:
+        this.echo(channel, stateAction, origin);
+        return;
+      default:
+        this.echo(channel, stateAction, origin, `unsupported action (Phase 1): ${String(stateAction.type)}`);
+    }
+  }
+
+  /**
+   * Shared pre-checks for a dispatched action; null when the action may
+   * proceed to per-type handling.
+   */
+  private dispatchRejectionReason(channel: string, action: StateAction, clientId: string | null): string | null {
+    if (channelKind(channel) === "unknown") return `unknown channel: ${channel}`;
+    let dispatchable: boolean;
+    try {
+      dispatchable = isClientDispatchable(action as Parameters<typeof isClientDispatchable>[0]);
+    } catch {
+      dispatchable = false;
+    }
+    if (!dispatchable) return `action ${String(action.type)} is not client-dispatchable`;
+    if (clientId === null) return "client is not initialized";
+    return null;
+  }
+
+  /** Publish an accepted echo (or a rejection) on the action stream. */
+  private echo(
+    channel: string,
+    action: StateAction,
+    origin: ActionOrigin | undefined,
+    rejectionReason?: string,
+  ): void {
+    const envelope = this.publish({
+      channel,
+      action,
+      origin,
+      ...(rejectionReason !== undefined ? { rejectionReason } : {}),
+    });
+    if (rejectionReason !== undefined && origin !== undefined) {
+      // A rejection must reach the dispatching socket even when it is not
+      // subscribed to the channel (write-ahead dispatch: the client applied
+      // the action optimistically and needs the rejection to roll it back).
+      const socketId = this.socketIdForClient(origin.clientId);
+      if (socketId !== undefined && !this.channels.socketsSubscribedTo(channel).includes(socketId)) {
+        this.opts.send(socketId, { jsonrpc: "2.0", method: "action", params: envelope });
+      }
+    }
+  }
+
+  /** The socket currently bound to a clientId (rejection delivery target). */
+  private socketIdForClient(clientId: string): number | undefined {
+    for (const [socketId, socket] of this.sockets) {
+      if (socket.clientId === clientId) return socketId;
+    }
+    return undefined;
+  }
+
+  private async dispatchTurnStarted(rec: SessionRecord, action: StateAction, origin: ActionOrigin | undefined): Promise<void> {
+    const chatURI = chatChannelURI(rec.sessionID);
+    const a = action as ChatTurnStartedAction;
+    const turnId = typeof a.turnId === "string" && a.turnId.length > 0 ? a.turnId : null;
+    const message =
+      isRecord(a.message) && typeof a.message["text"] === "string"
+        ? (a.message as unknown as Message)
+        : null;
+    if (turnId === null || message === null) {
+      this.echo(chatURI, action, origin, "invalid chat/turnStarted params");
+      return;
+    }
+    // `startedAt` is required on the wire (the reducer uses it for the
+    // chat's `modifiedAt`); fall back to the host clock when the client
+    // did not supply a parseable one.
+    const normalized: ChatTurnStartedAction =
+      typeof a.startedAt === "string" && !Number.isNaN(Date.parse(a.startedAt))
+        ? a
+        : { ...a, startedAt: new Date().toISOString() };
+    if (rec.chatStore.state.activeTurn !== undefined) {
+      this.echo(
+        chatURI,
+        action,
+        origin,
+        "a turn is already active; follow-up messages go via chat/pendingMessageSet",
+      );
+      return;
+    }
+
+    // Apply the message's model/agent selection before the prompt
+    // (`SessionPromptInput` carries no model/agent fields).
+    try {
+      if (message.model?.id !== undefined && message.model.id.includes("/")) {
+        const sep = message.model.id.indexOf("/");
+        const providerID = message.model.id.slice(0, sep);
+        const modelID = message.model.id.slice(sep + 1);
+        if (providerID.length > 0 && modelID.length > 0) {
+          await this.opts.facade.switchModel({ sessionID: rec.sessionID, model: { providerID, modelID } });
+        }
+      }
+      if (message.agent?.uri !== undefined) {
+        const agentID = agentIDFromUri(message.agent.uri);
+        if (agentID !== null) {
+          await this.opts.facade.switchAgent({ sessionID: rec.sessionID, agent: agentID });
+        }
+      }
+    } catch (err) {
+      this.echo(chatURI, action, origin, `failed to apply model/agent selection: ${errorMessage(err)}`);
+      return;
+    }
+
+    // Write-ahead: claim the turn BEFORE the prompt so the
+    // `session.execution.started` event joins it even when it races the
+    // prompt's resolve; revert on failure.
+    rec.currentTurnId = turnId;
+    rec.turnStartedAt = Date.now();
+    try {
+      await this.opts.facade.prompt({ sessionID: rec.sessionID, text: message.text });
+    } catch (err) {
+      rec.currentTurnId = null;
+      rec.turnStartedAt = null;
+      this.echo(chatURI, action, origin, `prompt failed: ${errorMessage(err)}`);
+      return;
+    }
+    this.echo(chatURI, normalized, origin);
+  }
+
+  private async dispatchPendingMessageSet(rec: SessionRecord, action: StateAction, origin: ActionOrigin | undefined): Promise<void> {
+    const chatURI = chatChannelURI(rec.sessionID);
+    const a = action as { kind?: unknown; id?: unknown; message?: unknown };
+    const kind = a.kind === "steering" || a.kind === "queued" ? a.kind : null;
+    const id = typeof a.id === "string" && a.id.length > 0 ? a.id : null;
+    const message =
+      isRecord(a.message) && typeof a.message["text"] === "string"
+        ? (a.message as unknown as Message)
+        : null;
+    if (kind === null || id === null || message === null) {
+      this.echo(chatURI, action, origin, "invalid chat/pendingMessageSet params");
+      return;
+    }
+    const hasActiveTurn = rec.chatStore.state.activeTurn !== undefined;
+    // steer → delivery "steer" (only while a turn is active); queued →
+    // delivery "queue"; a steering message with no active turn falls back
+    // to a plain prompt (it becomes the next turn).
+    const delivery: FacadeDelivery | undefined = hasActiveTurn
+      ? kind === "steering"
+        ? "steer"
+        : "queue"
+      : undefined;
+    try {
+      await this.opts.facade.prompt({ sessionID: rec.sessionID, text: message.text, delivery });
+    } catch (err) {
+      this.echo(chatURI, action, origin, `prompt failed: ${errorMessage(err)}`);
+      return;
+    }
+    if (hasActiveTurn) {
+      this.echo(chatURI, action, origin);
+      return;
+    }
+    // No active turn: the message starts a turn right now. Echo the
+    // pending-message first, then a host-minted turnStarted carrying
+    // `queuedMessageId` — the reducer dequeues it.
+    this.echo(chatURI, action, origin);
+    const turnId = this.mintTurnId();
+    rec.currentTurnId = turnId;
+    rec.turnStartedAt = Date.now();
+    this.publish({
+      channel: chatURI,
+      action: {
+        type: ActionType.ChatTurnStarted,
+        turnId,
+        startedAt: new Date().toISOString(),
+        message,
+        queuedMessageId: id,
+      },
+    });
+  }
+
+  private async dispatchToolCallConfirmed(rec: SessionRecord, action: StateAction, origin: ActionOrigin | undefined): Promise<void> {
+    const chatURI = chatChannelURI(rec.sessionID);
+    const a = action as ChatToolCallConfirmedAction;
+    const toolCallId = typeof a.toolCallId === "string" ? a.toolCallId : null;
+    if (toolCallId === null) {
+      this.echo(chatURI, action, origin, "invalid chat/toolCallConfirmed params");
+      return;
+    }
+    const permissionID = rec.permissionForTool.get(toolCallId);
+    if (permissionID === undefined) {
+      this.echo(chatURI, action, origin, `no pending permission for tool call ${toolCallId}`);
+      return;
+    }
+    try {
+      await this.opts.facade.replyPermission({
+        sessionID: rec.sessionID,
+        requestID: permissionID,
+        decision: a.approved === true ? "once" : "reject",
+      });
+    } catch (err) {
+      this.echo(chatURI, action, origin, `permission reply failed: ${errorMessage(err)}`);
+      return;
+    }
+    // Echo the confirmation (reducer → running/cancelled), then clear the
+    // session-level input request. The `permission.replied` event is a
+    // safety net (its tracking is already gone → no-op).
+    this.echo(chatURI, action, origin);
+    this.publish({
+      channel: rec.channel,
+      action: { type: ActionType.SessionInputNeededRemoved, id: toolCallId },
+    });
+    rec.permissionForTool.delete(toolCallId);
+    rec.toolForPermission.delete(permissionID);
+  }
+
+  private async dispatchTurnCancelled(rec: SessionRecord, action: StateAction, origin: ActionOrigin | undefined): Promise<void> {
+    const chatURI = chatChannelURI(rec.sessionID);
+    const a = action as ChatTurnCancelledAction;
+    const turnId = typeof a.turnId === "string" && a.turnId.length > 0 ? a.turnId : null;
+    const active = rec.chatStore.state.activeTurn;
+    if (turnId === null || active === undefined || active.id !== turnId) {
+      this.echo(chatURI, action, origin, "no active turn to cancel");
+      return;
+    }
+    try {
+      await this.opts.facade.interrupt({ sessionID: rec.sessionID });
+    } catch (err) {
+      this.echo(chatURI, action, origin, `interrupt failed: ${errorMessage(err)}`);
+      return;
+    }
+    // `duration` is required on the wire (the reducer derives the final
+    // `modifiedAt` from it); the host clock is authoritative when the
+    // client did not supply one.
+    const duration =
+      typeof a.duration === "number" && Number.isFinite(a.duration) ? a.duration : this.turnDuration(rec);
+    this.echo(chatURI, { ...a, duration }, origin);
+    // The opencode `session.execution.interrupted` event finds no active
+    // turn after the echo finalized it (skipped); run the queued/steering
+    // handoff now, on the host side.
+    this.finishTurn(rec);
+  }
+
+  private async dispatchTitleChanged(rec: SessionRecord, action: StateAction, origin: ActionOrigin | undefined): Promise<void> {
+    const a = action as { title?: unknown };
+    const title = typeof a.title === "string" && a.title.length > 0 ? a.title : null;
+    if (title === null) {
+      this.echo(rec.channel, action, origin, "invalid session/titleChanged params");
+      return;
+    }
+    try {
+      await this.opts.facade.rename({ sessionID: rec.sessionID, title });
+    } catch (err) {
+      this.echo(rec.channel, action, origin, `rename failed: ${errorMessage(err)}`);
+      return;
+    }
+    this.echo(rec.channel, action, origin);
+  }
+
+  private dispatchActiveClientSet(
+    rec: SessionRecord,
+    action: StateAction,
+    origin: ActionOrigin | undefined,
+    clientId: string | null,
+  ): void {
+    const a = action as { activeClient?: unknown };
+    const ac = a.activeClient;
+    if (!isRecord(ac) || typeof ac["clientId"] !== "string" || (clientId !== null && ac["clientId"] !== clientId)) {
+      this.echo(rec.channel, action, origin, "activeClient.clientId must match the dispatching client");
+      return;
+    }
+    const tools = Array.isArray(ac["tools"]) ? (ac["tools"] as ToolDefinition[]) : [];
+    const normalized: SessionActiveClient = {
+      clientId: ac["clientId"] as string,
+      tools,
+      ...(typeof ac["displayName"] === "string" ? { displayName: ac["displayName"] as string } : {}),
+    };
+    this.publish({
+      channel: rec.channel,
+      action: { type: ActionType.SessionActiveClientSet, activeClient: normalized },
+      origin,
+    });
+  }
+
+  private dispatchActiveClientRemoved(
+    rec: SessionRecord,
+    action: StateAction,
+    origin: ActionOrigin | undefined,
+    clientId: string | null,
+  ): void {
+    const a = action as { clientId?: unknown };
+    if (typeof a.clientId !== "string" || (clientId !== null && a.clientId !== clientId)) {
+      this.echo(rec.channel, action, origin, "clientId must match the dispatching client");
+      return;
+    }
+    this.echo(rec.channel, action, origin);
+  }
+
+  // ── opencode event pump handlers ───────────────────────────────────────
+
+  private async handleEvent(ev: FacadeEvent): Promise<void> {
+    if (ev.type === "session.created") {
+      if (this.sessions.has(ev.sessionID)) return;
+      // Deferred registration: a concurrent `createSession` may still be
+      // resolving for this opencode session under a client-chosen channel;
+      // the grace + existence check avoids the double registration, and
+      // the delete+recreate remap in `handleCreateSession` heals the slow
+      // path.
+      const sessionID = ev.sessionID;
+      setTimeout(() => {
+        void this.registerExternalDeferred(sessionID).catch((err) =>
+          this.log(`external session registration failed: ${errorMessage(err)}`),
+        );
+      }, EXTERNAL_REGISTER_GRACE_MS);
+      return;
+    }
+
+    const rec = this.sessions.get(ev.sessionID);
+    if (rec === undefined) return; // only session.created registers sessions
+
+    const chatURI = chatChannelURI(rec.sessionID);
+    switch (ev.type) {
+      case "session.deleted":
+        this.removeRecord(rec);
+        return;
+      case "session.renamed":
+        this.publish({ channel: rec.channel, action: { type: ActionType.SessionTitleChanged, title: ev.title } });
+        return;
+      case "inbox.enqueued":
+        rec.lastInbox = { text: ev.text, delivery: ev.delivery };
+        return;
+      case "inbox.delivered":
+        // Steering consumption is handled at turn end (finishTurn).
+        return;
+      case "execution.started":
+        if (rec.currentTurnId !== null) return; // write-ahead already claimed the turn
+        // Orphan turn (an external TUI prompt, or a handoff this host did
+        // not initiate): start it with the last-seen inbox message.
+        this.startTurn(rec, rec.lastInbox !== null ? userMessage(rec.lastInbox.text) : userMessage(""));
+        return;
+      case "execution.succeeded":
+        if (rec.currentTurnId === null) return;
+        this.publish({
+          channel: chatURI,
+          action: { type: ActionType.ChatTurnComplete, turnId: rec.currentTurnId, duration: this.turnDuration(rec) },
+        });
+        this.finishTurn(rec);
+        return;
+      case "execution.failed":
+        if (rec.currentTurnId === null) return;
+        const part: ErrorResponsePart = {
+          kind: ResponsePartKind.Error,
+          error: { errorType: ev.error.type, message: ev.error.message },
+        };
+        this.publish({
+          channel: chatURI,
+          action: { type: ActionType.ChatError, turnId: rec.currentTurnId, duration: this.turnDuration(rec), part },
+        });
+        this.finishTurn(rec);
+        return;
+      case "execution.interrupted":
+        // Skipped when the client's own `chat/turnCancelled` echo already
+        // finalized the turn (currentTurnId is null).
+        if (rec.currentTurnId === null) return;
+        this.publish({
+          channel: chatURI,
+          action: { type: ActionType.ChatTurnCancelled, turnId: rec.currentTurnId, duration: this.turnDuration(rec) },
+        });
+        this.finishTurn(rec);
+        return;
+      case "step.started":
+        rec.turnModelRef = `${ev.model.providerID}/${ev.model.modelID}`;
+        return;
+      case "text.delta":
+      case "reasoning.delta": {
+        if (rec.currentTurnId === null) return;
+        const kind = ev.type === "text.delta" ? ResponsePartKind.Markdown : ResponsePartKind.Reasoning;
+        const key = `${ev.assistantMessageID}:${kind}:${ev.ordinal}`;
+        const first = !rec.parts.has(key);
+        rec.parts.add(key);
+        const partId = `part-${key}`;
+        if (first) {
+          // Lazily emit the part on the first delta; it carries the
+          // initial content.
+          this.publish({
+            channel: chatURI,
+            action: {
+              type: ActionType.ChatResponsePart,
+              turnId: rec.currentTurnId,
+              part: { kind, id: partId, content: ev.delta },
+            },
+          });
+        } else {
+          this.publish({
+            channel: chatURI,
+            action:
+              kind === ResponsePartKind.Markdown
+                ? { type: ActionType.ChatDelta, turnId: rec.currentTurnId, partId, content: ev.delta }
+                : { type: ActionType.ChatReasoning, turnId: rec.currentTurnId, partId, content: ev.delta },
+          });
+        }
+        return;
+      }
+      case "text.ended":
+      case "reasoning.ended": {
+        if (rec.currentTurnId === null) return;
+        // Fallback for non-streaming providers that emit only the final
+        // text: if no delta opened the part, emit it now with the full text.
+        const kind = ev.type === "text.ended" ? ResponsePartKind.Markdown : ResponsePartKind.Reasoning;
+        const key = `${ev.assistantMessageID}:${kind}:${ev.ordinal}`;
+        if (!rec.parts.has(key)) {
+          rec.parts.add(key);
+          this.publish({
+            channel: chatURI,
+            action: {
+              type: ActionType.ChatResponsePart,
+              turnId: rec.currentTurnId,
+              part: { kind, id: `part-${key}`, content: ev.text },
+            },
+          });
+        }
+        return;
+      }
+      case "tool.input.started":
+        if (rec.currentTurnId === null) {
+          this.log(`tool.input.started outside a turn (session ${rec.sessionID}, tool ${ev.name}); ignored`);
+          return;
+        }
+        rec.toolName.set(ev.id, ev.name);
+        this.publish({
+          channel: chatURI,
+          action: {
+            type: ActionType.ChatToolCallStart,
+            turnId: rec.currentTurnId,
+            toolCallId: ev.id,
+            toolName: ev.name,
+            displayName: displayNameFor(ev.name),
+          },
+        });
+        return;
+      case "tool.input.ended":
+        rec.toolInput.set(ev.id, ev.text);
+        return;
+      case "tool.progress":
+        // First sign the tool is actually running (opencode auto-approved):
+        // finalize the tool call as running.
+        this.ensureToolReady(rec, ev.id, false);
+        return;
+      case "tool.success": {
+        if (rec.currentTurnId === null) return;
+        this.ensureToolReady(rec, ev.id, false);
+        if (this.toolCallTerminal(rec, ev.id)) return; // e.g. denied → already cancelled
+        const name = rec.toolName.get(ev.id) ?? "tool";
+        const input = rec.toolInput.get(ev.id);
+        this.publish({
+          channel: chatURI,
+          action: {
+            type: ActionType.ChatToolCallComplete,
+            turnId: rec.currentTurnId,
+            toolCallId: ev.id,
+            result: {
+              success: true,
+              pastTenseMessage: pastTenseMessageFor(name, input),
+              content: mapToolResultContent(ev.content),
+            },
+          },
+        });
+        this.clearToolTracking(rec, ev.id);
+        return;
+      }
+      case "tool.failed": {
+        if (rec.currentTurnId === null) return;
+        this.ensureToolReady(rec, ev.id, false);
+        if (this.toolCallTerminal(rec, ev.id)) return;
+        const name = rec.toolName.get(ev.id) ?? "tool";
+        const input = rec.toolInput.get(ev.id);
+        this.publish({
+          channel: chatURI,
+          action: {
+            type: ActionType.ChatToolCallComplete,
+            turnId: rec.currentTurnId,
+            toolCallId: ev.id,
+            result: {
+              success: false,
+              pastTenseMessage: pastTenseMessageFor(name, input),
+              error: { message: ev.error.message },
+            },
+          },
+        });
+        this.clearToolTracking(rec, ev.id);
+        return;
+      }
+      case "usage.updated":
+        // Session-cumulative tokens; the chat reducer replaces the turn's
+        // usage, so the latest cumulative values are the turn's view.
+        if (rec.currentTurnId === null) return;
+        this.publish({
+          channel: chatURI,
+          action: {
+            type: ActionType.ChatUsage,
+            turnId: rec.currentTurnId,
+            usage: {
+              inputTokens: ev.tokens.input,
+              outputTokens: ev.tokens.output,
+              cacheReadTokens: ev.tokens.cache.read,
+              ...(rec.turnModelRef !== null ? { model: rec.turnModelRef } : {}),
+            },
+          },
+        });
+        return;
+      case "permission.asked":
+        // Only tool-sourced permissions map to a tool confirmation;
+        // anything else has no AHP counterpart in this MVP (gap).
+        if (ev.source === undefined) {
+          this.log(`ignoring non-tool permission.asked ${ev.id} (action: ${ev.action})`);
+          return;
+        }
+        const toolCallId = ev.source.id;
+        rec.permissionForTool.set(toolCallId, ev.id);
+        rec.toolForPermission.set(ev.id, toolCallId);
+        this.ensureToolReady(rec, toolCallId, true);
+        const pending = this.pendingToolCall(rec, toolCallId);
+        if (pending !== null && rec.currentTurnId !== null) {
+          const request: SessionToolConfirmationRequest = {
+            id: toolCallId,
+            chat: chatURI,
+            kind: SessionInputRequestKind.ToolConfirmation,
+            turnId: rec.currentTurnId,
+            toolCall: pending,
+          };
+          this.publish({
+            channel: rec.channel,
+            action: { type: ActionType.SessionInputNeededSet, request },
+          });
+        }
+        return;
+      case "permission.replied": {
+        const toolCallId = rec.toolForPermission.get(ev.requestID);
+        rec.toolForPermission.delete(ev.requestID);
+        if (toolCallId !== undefined) {
+          rec.permissionForTool.delete(toolCallId);
+          // Safety net: the client's `chat/toolCallConfirmed` normally
+          // removes the input request first; this covers the reply
+          // arriving without (or before) the echo.
+          this.publish({
+            channel: rec.channel,
+            action: { type: ActionType.SessionInputNeededRemoved, id: toolCallId },
+          });
+        }
+        return;
+      }
+      default:
+        return;
+    }
+  }
+
+  // ── turn helpers ───────────────────────────────────────────────────────
+
+  private mintTurnId(): string {
+    this.turnCounter += 1;
+    return `turn_${Date.now().toString(36)}_${this.turnCounter.toString(36)}`;
+  }
+
+  private turnDuration(rec: SessionRecord): number {
+    return Math.max(0, Date.now() - (rec.turnStartedAt ?? Date.now()));
+  }
+
+  /** Claim a turn (write-ahead) and publish `chat/turnStarted`. */
+  private startTurn(rec: SessionRecord, message: Message, queuedMessageId?: string): void {
+    const turnId = this.mintTurnId();
+    rec.currentTurnId = turnId;
+    rec.turnStartedAt = Date.now();
+    this.publish({
+      channel: chatChannelURI(rec.sessionID),
+      action: {
+        type: ActionType.ChatTurnStarted,
+        turnId,
+        startedAt: new Date().toISOString(),
+        message,
+        ...(queuedMessageId !== undefined ? { queuedMessageId } : {}),
+      },
+    });
+  }
+
+  /**
+   * After a turn terminal: clear the steering message opencode consumed
+   * during the turn, and auto-start the next turn from the queue (the
+   * queued prompt was already sent with `delivery: "queue"` — opencode
+   * starts it automatically; this only updates the AHP state).
+   */
+  private finishTurn(rec: SessionRecord): void {
+    rec.currentTurnId = null;
+    rec.turnStartedAt = null;
+    const state = rec.chatStore.state;
+    if (state.steeringMessage !== undefined) {
+      this.publish({
+        channel: chatChannelURI(rec.sessionID),
+        action: {
+          type: ActionType.ChatPendingMessageRemoved,
+          kind: PendingMessageKind.Steering,
+          id: state.steeringMessage.id,
+        },
+      });
+    }
+    const queued = state.queuedMessages;
+    if (queued !== undefined && queued.length > 0) {
+      const next = queued[0]!;
+      this.startTurn(rec, next.message, next.id);
+    } else if (rec.lastInbox !== null && rec.lastInbox.delivery === "queue") {
+      // A queued prompt from outside AHP (e.g. the TUI).
+      this.startTurn(rec, userMessage(rec.lastInbox.text));
+    }
+  }
+
+  /**
+   * Lazily publish `chat/toolCallReady` for a tool call (first of
+   * progress/success/failed/permission.asked):
+   *  - permission trigger → no `confirmed` → the reducer parks it in
+   *    `pending-confirmation` (the caller then raises `inputNeededSet`);
+   *  - otherwise → `confirmed: "not-needed"` → straight to `running`
+   *    (opencode auto-approved).
+   */
+  private ensureToolReady(rec: SessionRecord, toolCallId: string, permission: boolean): void {
+    if (rec.toolReady.has(toolCallId) || rec.currentTurnId === null) return;
+    rec.toolReady.add(toolCallId);
+    const name = rec.toolName.get(toolCallId) ?? "tool";
+    const input = rec.toolInput.get(toolCallId);
+    this.publish({
+      channel: chatChannelURI(rec.sessionID),
+      action: {
+        type: ActionType.ChatToolCallReady,
+        turnId: rec.currentTurnId,
+        toolCallId,
+        invocationMessage: invocationMessageFor(name, input),
+        toolInput: input,
+        ...(permission ? {} : { confirmed: ToolCallConfirmationReason.NotNeeded }),
+      },
+    });
+  }
+
+  /** The live tool-call state in the current turn, or null when absent. */
+  private toolCallState(rec: SessionRecord, toolCallId: string): ToolCallState | null {
+    const turn = rec.chatStore.state.activeTurn;
+    if (turn === undefined) return null;
+    for (const part of turn.responseParts) {
+      if (part.kind === ResponsePartKind.ToolCall && part.toolCall.toolCallId === toolCallId) {
+        return part.toolCall;
+      }
+    }
+    return null;
+  }
+
+  /**
+   * The tool call's state when it is awaiting confirmation (the
+   * `SessionToolConfirmationRequest.toolCall` shape), or null otherwise.
+   */
+  private pendingToolCall(rec: SessionRecord, toolCallId: string): ToolCallConfirmationState | null {
+    const tc = this.toolCallState(rec, toolCallId);
+    if (tc === null) return null;
+    if (tc.status === ToolCallStatus.PendingConfirmation || tc.status === ToolCallStatus.PendingResultConfirmation) {
+      return tc;
+    }
+    return null;
+  }
+
+  /** True when the tool call already left the ready states (completed/cancelled). */
+  private toolCallTerminal(rec: SessionRecord, toolCallId: string): boolean {
+    const tc = this.toolCallState(rec, toolCallId);
+    return tc !== null && (tc.status === ToolCallStatus.Completed || tc.status === ToolCallStatus.Cancelled);
+  }
+
+  private clearToolTracking(rec: SessionRecord, toolCallId: string): void {
+    rec.toolInput.delete(toolCallId);
+    rec.toolName.delete(toolCallId);
+    rec.toolReady.delete(toolCallId);
+  }
+
+  // ── session registration / removal ─────────────────────────────────────
+
+  /**
+   * Verify a `session.created` event via the session API and register the
+   * session under its own id as the channel suffix (the suffix starts
+   * with "ses" — opencode ids are valid suffixes). No-op when the session
+   * is gone, already registered, or a createSession remap is pending.
+   */
+  private async registerExternalDeferred(sessionID: string): Promise<void> {
+    if (this.sessions.has(sessionID)) return;
+    let fs: FacadeSession | null;
+    try {
+      fs = await this.opts.facade.getSession(sessionID);
+    } catch {
+      return;
+    }
+    if (fs === null || this.sessions.has(fs.sessionID)) return;
+    this.registerExternal(fs);
+  }
+
+  /**
+   * Register an opencode session the host did not create (TUI, another
+   * client). Applied directly to the fresh stores (no seq, no actions) —
+   * the registration is server-side bookkeeping, not a client-visible
+   * state transition; the root announcement carries the lifecycle.
+   */
+  private registerExternal(fs: FacadeSession): SessionRecord | undefined {
+    const existing = this.sessions.get(fs.sessionID);
+    if (existing !== undefined) return existing;
+    const channel = sessionChannelURI(fs.sessionID);
+    const modifiedAt = new Date(fs.time.updated).toISOString();
+    const sessionStore = createSessionStateStore(
+      initialSessionState({
+        sessionID: fs.sessionID,
+        provider: fs.model?.providerID ?? "opencode",
+        title: fs.title ?? "New Session",
+        status: fs.archived
+          ? ((SessionStatus.Idle | SessionStatus.IsRead | SessionStatus.IsArchived) as SessionStatus)
+          : undefined, // Idle | IsRead | IsArchived
+      }),
+    );
+    const chatStore = createChatStateStore(
+      initialChatState({ resource: chatChannelURI(fs.sessionID), title: "Chat 1", modifiedAt }),
+    );
+    sessionStore.apply({ type: ActionType.SessionReady });
+    sessionStore.apply({ type: ActionType.SessionChatAdded, summary: chatSummaryOf(chatStore.state) });
+    sessionStore.apply({ type: ActionType.SessionDefaultChatChanged, defaultChat: chatChannelURI(fs.sessionID) });
+    const rec: SessionRecord = {
+      sessionID: fs.sessionID,
+      channel,
+      provider: sessionStore.state.provider,
+      createdAt: new Date(fs.time.created).toISOString(),
+      modifiedAt,
+      sessionStore,
+      chatStore,
+      currentTurnId: null,
+      turnStartedAt: null,
+      turnModelRef: null,
+      parts: new Set(),
+      toolInput: new Map(),
+      toolName: new Map(),
+      toolReady: new Set(),
+      permissionForTool: new Map(),
+      toolForPermission: new Map(),
+      lastInbox: null,
+    };
+    this.sessions.set(fs.sessionID, rec);
+    this.byChannel.set(channel, rec);
+    this.byChannel.set(chatChannelURI(fs.sessionID), rec);
+    this.channels.addSession(fs.sessionID);
+    this.publish({
+      channel: ROOT_CHANNEL,
+      action: { type: ActionType.RootActiveSessionsChanged, activeSessions: this.sessions.size },
+    });
+    this.notifyRoot("root/sessionAdded", { channel: ROOT_CHANNEL, summary: this.sessionSummary(rec) });
+    return rec;
+  }
+
+  /** Drop a session record and announce the removal on the root channel. */
+  private removeRecord(rec: SessionRecord): void {
+    this.sessions.delete(rec.sessionID);
+    this.byChannel.delete(rec.channel);
+    this.byChannel.delete(chatChannelURI(rec.sessionID));
+    const id = sessionIDOf(rec.channel);
+    if (id !== null) this.channels.removeSession(id);
+    this.channels.removeSession(rec.sessionID);
+    this.publish({
+      channel: ROOT_CHANNEL,
+      action: { type: ActionType.RootActiveSessionsChanged, activeSessions: this.sessions.size },
+    });
+    this.notifyRoot("root/sessionRemoved", { channel: ROOT_CHANNEL, session: rec.channel });
+  }
+
+  // ── state / publishing ─────────────────────────────────────────────────
+
+  /**
+   * Snapshot for a channel URI, or null when the channel is not
+   * subscribable right now.
+   *
+   * Root snapshots re-derive the catalog from the facade on every call
+   * (registry reads reflect every registration so far; in-process reads
+   * are cheap). Session/chat snapshots read the official-reducer stores.
+   */
+  private async snapshotFor(uri: string): Promise<Snapshot | null> {
+    const kind = channelKind(uri);
+    if (kind === "unknown") return null;
+    if (kind !== "root") {
+      const rec = this.byChannel.get(uri);
+      if (rec === undefined) return null;
+      if (uri === rec.channel) {
+        return { resource: uri, state: rec.sessionStore.state, fromSeq: this.seq.seq };
+      }
+      if (uri === chatChannelURI(rec.sessionID)) {
+        return { resource: uri, state: rec.chatStore.state, fromSeq: this.seq.seq };
+      }
+      return null;
+    }
+    const [providers, agents] = await Promise.all([
+      this.opts.facade.listCatalog(),
+      this.opts.facade.listAgents(),
+    ]);
+    const catalog = mapCatalog(providers, agents, this.opts.defaultDirectory);
+    if (!sameAgents(this.state.state.agents, catalog)) {
+      this.state.apply({ type: ActionType.RootAgentsChanged, agents: catalog });
+    }
+    return { resource: ROOT_CHANNEL, state: this.state.state, fromSeq: this.seq.seq };
+  }
+
+  /** The denormalized `SessionSummary` view of a record. */
+  private sessionSummary(rec: SessionRecord): SessionSummary {
+    const s = rec.sessionStore.state;
+    const c = rec.chatStore.state;
+    const modifiedAt = c.modifiedAt > rec.modifiedAt ? c.modifiedAt : rec.modifiedAt;
+    return buildSessionSummary({
+      channel: rec.channel,
+      provider: rec.provider,
+      title: s.title,
+      status: s.status,
+      activity: s.activity,
+      createdAt: rec.createdAt,
+      modifiedAt,
+      chat: chatSummaryOf(c),
+      defaultChat: chatChannelURI(rec.sessionID),
+    });
+  }
+
+  /**
+   * Assign a global seq, update state for accepted actions, retain for
+   * replay. Session/chat actions apply to the per-session stores through
+   * the official reducers; a changed chat summary is propagated to the
+   * session store via `session/chatUpdated`, and any summary-level change
+   * is announced on the root channel (notification).
+   */
+  private publish(draft: {
+    channel: string;
+    action: StateAction;
+    origin?: ActionOrigin;
+    rejectionReason?: string;
+  }): ActionEnvelope {
+    const envelope = this.seq.publish(draft);
+    if (draft.rejectionReason === undefined) {
+      const kind = channelKind(draft.channel);
+      if (kind === "root") {
+        this.state.apply(draft.action as RootAction);
+      } else {
+        // byChannel, not sessions.get(sessionIDOf(…)): the channel suffix
+        // is not always the opencode session id (client-chosen suffixes).
+        const rec = this.byChannel.get(draft.channel);
+        if (rec !== undefined) {
+          const before = this.sessionSummary(rec);
+          if (kind === "session") rec.sessionStore.apply(draft.action as SessionAction);
+          else rec.chatStore.apply(draft.action as ChatAction);
+          if (kind === "chat") this.syncChatSummary(rec);
+          const after = this.sessionSummary(rec);
+          this.maybeNotifySummaryChanged(rec, before, after);
+        }
+      }
+    }
+    // Every published action — accepted and rejected alike — is an
+    // `action` notification on its channel to the subscribers.
+    this.notifyAction(envelope);
+    return envelope;
+  }
+
+  /**
+   * Propagate a changed chat summary into the session store's chat catalog
+   * (`session/chatUpdated`) — the session status itself is only
+   * reducer-reachable for read/archive/input-needed bits, so the chat
+   * summary is the activity source of truth.
+   */
+  private syncChatSummary(rec: SessionRecord): void {
+    const chat = rec.chatStore.state;
+    const entry = rec.sessionStore.state.chats.find((c) => c.resource === chat.resource);
+    if (entry === undefined) return;
+    const next = chatSummaryOf(chat);
+    const changes: Record<string, unknown> = {};
+    let changed = false;
+    for (const key of ["title", "status", "activity", "modifiedAt"] as const) {
+      if (entry[key] !== next[key]) {
+        changes[key] = next[key];
+        changed = true;
+      }
+    }
+    if (changed) {
+      this.publish({
+        channel: rec.channel,
+        action: { type: ActionType.SessionChatUpdated, chat: chat.resource, changes: changes as Partial<ChatSummary> },
+      });
+    }
+  }
+
+  /**
+   * Announce summary-level changes on the root channel (`root/
+   * sessionSummaryChanged` notification — ephemeral, not replayed).
+   * Identity fields (resource/provider/createdAt) never change.
+   */
+  private maybeNotifySummaryChanged(rec: SessionRecord, before: SessionSummary, after: SessionSummary): void {
+    const changes: Record<string, unknown> = {};
+    for (const key of ["title", "status", "activity", "modifiedAt", "chats", "defaultChat"] as const) {
+      if (JSON.stringify(before[key]) !== JSON.stringify(after[key])) {
+        changes[key] = after[key];
+      }
+    }
+    if (Object.keys(changes).length === 0) return;
+    if (after.modifiedAt > rec.modifiedAt) rec.modifiedAt = after.modifiedAt;
+    this.notifyRoot("root/sessionSummaryChanged", {
+      channel: ROOT_CHANNEL,
+      session: rec.channel,
+      changes,
+    });
+  }
+
+  /** Send a root-channel notification frame to every root subscriber. */
+  private notifyRoot(method: string, params: unknown): void {
+    const frame = { jsonrpc: "2.0", method, params };
+    for (const socketId of this.channels.socketsSubscribedTo(ROOT_CHANNEL)) {
+      this.opts.send(socketId, frame);
+    }
+  }
+
+  /** Send an `action` notification to every socket subscribed to the channel. */
+  private notifyAction(envelope: ActionEnvelope): void {
+    const frame = { jsonrpc: "2.0", method: "action", params: envelope };
+    for (const socketId of this.channels.socketsSubscribedTo(envelope.channel)) {
+      this.opts.send(socketId, frame);
+    }
+  }
+
+  private sendError(socketId: number, id: unknown, code: number, message: string): void {
+    this.sendFrame(socketId, { jsonrpc: "2.0", id: id ?? null, error: { code, message } });
+  }
+}
+
+function sameAgents(a: unknown, b: unknown): boolean {
+  return JSON.stringify(a) === JSON.stringify(b);
+}
+
+function errorMessage(e: unknown): string {
+  return e instanceof Error ? e.message : String(e);
+}
+
+/** Short, stable description of untrusted params for log lines. */
+function describeParams(params: unknown): string {
+  if (!isRecord(params)) return String(typeof params);
+  try {
+    const raw = JSON.stringify(Object.keys(params));
+    return raw.length > 120 ? raw.slice(0, 120) + "…" : raw;
+  } catch {
+    return "unserializable";
+  }
+}
+
+/** The first enabled model of a provider, as a FacadeModelRef. */
+function firstEnabledModelRef(models: readonly { providerID: string; modelID: string; enabled: boolean }[]): FacadeModelRef | undefined {
+  const m = models.find((x) => x.enabled);
+  return m !== undefined ? { providerID: m.providerID, modelID: m.modelID } : undefined;
+}
+
+/** Normalize an untrusted `activeClient` payload (untrusted JSON-RPC). */
+function normalizeActiveClient(ac: Record<string, unknown>): SessionActiveClient {
+  const tools = Array.isArray(ac["tools"]) ? (ac["tools"] as ToolDefinition[]) : [];
+  return {
+    clientId: ac["clientId"] as string,
+    tools,
+    ...(typeof ac["displayName"] === "string" ? { displayName: ac["displayName"] as string } : {}),
+  };
+}
+
+/**
+ * Map opencode tool result content blocks to AHP `ToolResultContent`
+ * (only text blocks are representable in this MVP; file/patch text is
+ * carried as text).
+ */
+function mapToolResultContent(content: readonly { type: string; text?: string }[]): ToolResultContent[] {
+  const out: ToolResultContent[] = [];
+  for (const c of content) {
+    if (c.type === "text" || c.type === "file" || c.type === "patch") {
+      out.push({ type: ToolResultContentType.Text, text: c.text ?? "" });
+    }
+  }
+  return out;
+}

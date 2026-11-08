@@ -1,0 +1,27 @@
+name: ci
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+
+      # Node 26 + pnpm (via packageManager) per mise.toml. No `version`
+      # input: the action defaults to the newest stable mise release at
+      # least 24 h old ("latest" is NOT a magic value — it would be
+      # interpolated literally into the release download URL).
+      - uses: jdx/mise-action@v5
+
+      - name: Install
+        run: pnpm install --frozen-lockfile
+
+      - name: Typecheck
+        run: pnpm typecheck
+
+      - name: Test
+        run: pnpm test

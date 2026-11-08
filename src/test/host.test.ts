@@ -1,0 +1,1189 @@
+/**
+ * Host tests (Phase 1): the JSON-RPC router over the fake facade —
+ * createSession/listSessions, the session/chat snapshots (the dropdown-fix
+ * invariant: session-state customizations carry the agent directory),
+ * client-dispatchable actions (turns, steering/queue, permissions, cancel,
+ * rename, echoes, rejections), and the opencode event pump (fixture replay,
+ * external registration/removal, the createSession race remap).
+ */
+import { readFileSync } from "node:fs";
+import { fileURLToPath } from "node:url";
+import { describe, expect, it } from "vitest";
+import {
+  CustomizationType,
+  SessionStatus,
+  ToolCallStatus,
+  TurnState,
+  type ActionEnvelope,
+  type AgentCustomization,
+  type ChatState,
+  type DirectoryCustomization,
+  type SessionState,
+} from "@microsoft/agent-host-protocol";
+import {
+  mapV2Event,
+  type FacadeAgent,
+  type FacadeEvent,
+  type FacadeProvider,
+  type FacadeSession,
+  type OpencodeFacade,
+} from "../bridge.js";
+import { ROOT_CHANNEL, sessionChannelURI, chatChannelURI } from "../channels.js";
+import { ERROR_INVALID_PARAMS } from "../handshake.js";
+import { ERROR_NO_PROVIDER, ERROR_SESSION_EXISTS, Host } from "../host.js";
+
+// ── fixtures / helpers ────────────────────────────────────────────────────
+
+const provider: FacadeProvider = {
+  providerID: "gpuz",
+  name: "gpuz",
+  activation: "auto",
+  models: [
+    {
+      providerID: "gpuz",
+      modelID: "qwen3.8-27b-q5xl",
+      name: "Qwen 3.8",
+      enabled: true,
+      limit: { context: 262144, output: 32768, input: 229376 },
+      inputModalities: ["text", "image"],
+    },
+  ],
+};
+
+const agents: FacadeAgent[] = [
+  { id: "build", name: "Build", description: "Default build agent", mode: "primary", hidden: false },
+  { id: "plan", name: "Plan", description: "Read-only planning", mode: "primary", hidden: false },
+  { id: "explore", name: "Explore", mode: "subagent", hidden: false },
+  { id: "title", name: "Title", mode: "all", hidden: true },
+];
+
+/** The 38-event captured turn (plan §14.6), header + one event per line. */
+function loadFixtureEvents(): { header: Record<string, unknown>; events: unknown[] } {
+  const raw = readFileSync(fileURLToPath(new URL("./fixtures/events.jsonl", import.meta.url)), "utf8");
+  const parts: string[] = [];
+  let depth = 0;
+  let inStr = false;
+  let esc = false;
+  let start = -1;
+  for (let i = 0; i < raw.length; i++) {
+    const ch = raw[i]!;
+    if (inStr) {
+      if (esc) esc = false;
+      else if (ch === "\\") esc = true;
+      else if (ch === '"') inStr = false;
+      continue;
+    }
+    if (ch === '"') inStr = true;
+    else if (ch === "{" || ch === "[") {
+      if (depth === 0) start = i;
+      depth++;
+    } else if (ch === "}" || ch === "]") {
+      depth--;
+      if (depth === 0 && start >= 0) {
+        parts.push(raw.slice(start, i + 1));
+        start = -1;
+      }
+    }
+  }
+  const parsed = parts.map((p) => JSON.parse(p));
+  return { header: parsed[0] as Record<string, unknown>, events: parsed.slice(1) };
+}
+
+/** Polls until cond() is true (host handlers are async; frames land on later ticks). */
+async function waitFor(cond: () => boolean, what: string, timeoutMs = 3000): Promise<void> {
+  const start = Date.now();
+  while (!cond()) {
+    if (Date.now() - start > timeoutMs) throw new Error(`timeout: ${what}`);
+    await new Promise((r) => setTimeout(r, 1));
+  }
+}
+
+interface Frame {
+  socketId: number;
+  message: Record<string, any>;
+}
+
+class FakeFacade implements OpencodeFacade {
+  providers: FacadeProvider[] = [provider];
+  agentList: FacadeAgent[] = agents;
+  sessions = new Map<string, FacadeSession>();
+  promptCalls: { sessionID: string; text: string; delivery?: "steer" | "queue" }[] = [];
+  switchModelCalls: { sessionID: string; model: { providerID: string; modelID: string; variant?: string } }[] = [];
+  switchAgentCalls: { sessionID: string; agent: string }[] = [];
+  interruptCalls: string[] = [];
+  renameCalls: { sessionID: string; title: string }[] = [];
+  permissionReplies: { sessionID: string; requestID: string; decision: "once" | "reject" }[] = [];
+  createCalls: ({ id?: string; model?: { providerID: string; modelID: string; variant?: string } } | undefined)[] = [];
+  getSessionsCalls: string[] = [];
+
+  private queue: FacadeEvent[] = [];
+  private waiters: Array<() => void> = [];
+
+  /** Push a mapped event into the pump's stream. */
+  push(ev: FacadeEvent): void {
+    this.queue.push(ev);
+    const w = this.waiters.shift();
+    if (w) w();
+  }
+
+  /** Push every fixture event that maps to a FacadeEvent, in order. */
+  pushFixtureEvents(events: unknown[]): number {
+    let n = 0;
+    for (const raw of events) {
+      const mapped = mapV2Event(raw);
+      if (mapped !== null) {
+        this.push(mapped);
+        n++;
+      }
+    }
+    return n;
+  }
+
+  async listCatalog(): Promise<readonly FacadeProvider[]> {
+    return this.providers;
+  }
+  async listAgents(): Promise<readonly FacadeAgent[]> {
+    return this.agentList;
+  }
+  async createSession(input?: { id?: string; title?: string; agent?: string; model?: { providerID: string; modelID: string; variant?: string } }) {
+    this.createCalls.push(input ?? undefined);
+    const id = input?.id ?? `ses_fake_${this.sessions.size + 1}`;
+    const now = Date.now();
+    const fs: FacadeSession = {
+      sessionID: id,
+      title: "New Session",
+      time: { created: now, updated: now },
+      ...(input?.model !== undefined ? { model: input.model } : {}),
+    };
+    this.sessions.set(id, fs);
+    // opencode fires session.created synchronously during create — the
+    // host's grace + remap must survive this.
+    this.push({ type: "session.created", sessionID: id });
+    return fs;
+  }
+  async listSessions(): Promise<readonly FacadeSession[]> {
+    return [...this.sessions.values()];
+  }
+  async getSession(sessionID: string): Promise<FacadeSession | null> {
+    this.getSessionsCalls.push(sessionID);
+    return this.sessions.get(sessionID) ?? null;
+  }
+  async prompt(input: { sessionID: string; text: string; delivery?: "steer" | "queue" }) {
+    this.promptCalls.push(input);
+    return { messageID: `msg_${this.promptCalls.length}` };
+  }
+  async switchModel(input: { sessionID: string; model: { providerID: string; modelID: string; variant?: string } }) {
+    this.switchModelCalls.push(input);
+  }
+  async switchAgent(input: { sessionID: string; agent: string }) {
+    this.switchAgentCalls.push(input);
+  }
+  async interrupt(input: { sessionID: string }) {
+    this.interruptCalls.push(input.sessionID);
+  }
+  async rename(input: { sessionID: string; title: string }) {
+    this.renameCalls.push(input);
+  }
+  async replyPermission(input: { sessionID: string; requestID: string; decision: "once" | "reject" }) {
+    this.permissionReplies.push(input);
+  }
+  async *events(signal: AbortSignal): AsyncIterable<FacadeEvent> {
+    const onAbort = () => {
+      const ws = this.waiters.splice(0);
+      for (const w of ws) w();
+    };
+    signal.addEventListener("abort", onAbort, { once: true });
+    try {
+      for (;;) {
+        while (this.queue.length === 0 && !signal.aborted) {
+          await new Promise<void>((resolve) => this.waiters.push(resolve));
+        }
+        if (signal.aborted) return;
+        yield this.queue.shift()!;
+      }
+    } finally {
+      signal.removeEventListener("abort", onAbort);
+    }
+  }
+}
+
+interface Harness {
+  host: Host;
+  facade: FakeFacade;
+  frames: Frame[];
+  send: (socketId: number, method: string, params: unknown, id?: unknown) => void;
+  init: (socketId: number, clientId: string, subs?: string[]) => void;
+  /** Published action envelopes on a channel (action typed as any — the AHP
+   * StateAction union needs no narrowing for test assertions). */
+  actionsOn: (channel: string) => any[];
+  notification: (method: string, socketId?: number) => Record<string, any> | undefined;
+  stop: () => void;
+}
+
+function makeHarness(): Harness {
+  const facade = new FakeFacade();
+  const frames: Frame[] = [];
+  const host = new Host({
+    serverInfo: { name: "opencode-ahp-test", version: "0.1.0" },
+    facade,
+    replayWindow: 100,
+    defaultDirectory: "/tmp/opencode/ahp-scratch/project-lan",
+    send: (socketId, message) => frames.push({ socketId, message: message as Record<string, any> }),
+    log: () => {},
+  });
+  host.startEventPump();
+  return {
+    host,
+    facade,
+    frames,
+    send: (socketId, method, params, id) => {
+      host.onMessage(socketId, JSON.stringify(id === undefined ? { jsonrpc: "2.0", method, params } : { jsonrpc: "2.0", method, params, id }));
+    },
+    init: (socketId, clientId, subs = [ROOT_CHANNEL]) => {
+      host.onOpen(socketId);
+      host.onMessage(
+        socketId,
+        JSON.stringify({
+          jsonrpc: "2.0",
+          method: "initialize",
+          id: 1,
+          params: {
+            channel: ROOT_CHANNEL,
+            clientId,
+            protocolVersions: ["1.0.0"],
+            initialSubscriptions: subs,
+          },
+        }),
+      );
+    },
+    actionsOn: (channel) =>
+      frames
+        .filter((f) => f.message.method === "action" && f.message.params?.channel === channel)
+        .map((f) => f.message.params as any),
+    notification: (method, socketId) =>
+      frames.find((f) => f.message.method === method && (socketId === undefined || f.socketId === socketId))
+        ?.message as Record<string, any> | undefined,
+    stop: () => host.stopEventPump(),
+  };
+}
+
+/** Wait for the initialize result and return it. */
+async function waitInit(h: Harness, socketId: number): Promise<Record<string, any>> {
+  await waitFor(() => h.frames.some((f) => f.socketId === socketId && f.message.id === 1 && f.message.result), `initialize result (${socketId})`);
+  return h.frames.find((f) => f.socketId === socketId && f.message.id === 1 && f.message.result)!.message["result"];
+}
+
+async function createSession(h: Harness, socketId: number, channel: string, params: Record<string, unknown> = {}, id = 100): Promise<Record<string, any>> {
+  h.send(socketId, "createSession", { channel, ...params }, id);
+  await waitFor(
+    () => h.frames.some((f) => f.socketId === socketId && f.message.id === id && (f.message.result !== undefined || f.message.error)),
+    `createSession response (${channel})`,
+  );
+  return h.frames.find((f) => f.socketId === socketId && f.message.id === id)!.message;
+}
+
+async function subscribe(h: Harness, socketId: number, channel: string, id: number): Promise<Record<string, any>> {
+  h.send(socketId, "subscribe", { channel }, id);
+  await waitFor(() => h.frames.some((f) => f.socketId === socketId && f.message.id === id), `subscribe response (${channel})`);
+  return h.frames.find((f) => f.socketId === socketId && f.message.id === id)!.message;
+}
+
+function sessionSnapshotState(h: Harness, socketId: number, channel: string, id: number): Promise<SessionState> {
+  return subscribe(h, socketId, channel, id).then((res) => res["result"]["snapshot"]["state"] as SessionState);
+}
+
+function chatSnapshotState(h: Harness, socketId: number, channel: string, id: number): Promise<ChatState> {
+  return subscribe(h, socketId, channel, id).then((res) => res["result"]["snapshot"]["state"] as ChatState);
+}
+
+/** The session-state customizations → the directory container with agent children. */
+function agentDirectoryOf(state: SessionState): { container: DirectoryCustomization; children: AgentCustomization[] } {
+  const container = state.customizations?.find((c) => c.type === CustomizationType.Directory) as DirectoryCustomization;
+  return { container, children: container.children as AgentCustomization[] };
+}
+
+// ── handshake / catalog (Phase 0 regression through the host) ─────────────
+
+describe("initialize", () => {
+  it("negotiates 1.0.0, reports defaultDirectory, and snapshots the root catalog", async () => {
+    const h = makeHarness();
+    h.init(1, "c1");
+    const result = await waitInit(h, 1);
+    expect(result.protocolVersion).toBe("1.0.0");
+    expect(result.serverInfo).toEqual({ name: "opencode-ahp-test", version: "0.1.0" });
+    expect(result.defaultDirectory).toBe("/tmp/opencode/ahp-scratch/project-lan");
+    const root = result.snapshots.find((s: Record<string, any>) => s.resource === ROOT_CHANNEL);
+    expect(root).toBeDefined();
+    const gpuz = root.state.agents.find((a: Record<string, any>) => a.provider === "gpuz");
+    expect(gpuz.models).toHaveLength(1);
+    expect(gpuz.customizations).toHaveLength(1);
+    const children = gpuz.customizations[0].children as AgentCustomization[];
+    expect(children.map((c: AgentCustomization) => c.name)).toEqual(["Build", "Plan", "Explore"]);
+    h.stop();
+  });
+
+  it("answers ping before initialize", async () => {
+    const h = makeHarness();
+    h.host.onOpen(1);
+    h.send(1, "ping", {}, 7);
+    await waitFor(() => h.frames.some((f) => f.message.id === 7), "ping response");
+    expect(h.frames.find((f) => f.message.id === 7)!.message.result).toBeNull();
+    h.stop();
+  });
+});
+
+// ── createSession ─────────────────────────────────────────────────────────
+
+describe("createSession", () => {
+  it("creates a session, announces it on root, and seeds session/chat state with the agent picker", async () => {
+    const h = makeHarness();
+    h.init(1, "c1");
+    await waitInit(h, 1);
+
+    const res = await createSession(h, 1, sessionChannelURI("my-project-sess"), { provider: "gpuz" });
+    expect(res.error).toBeUndefined();
+    expect(res.result).toBeNull();
+
+    // The facade got the first enabled model of the requested provider.
+    expect(h.facade.createCalls).toHaveLength(1);
+    expect(h.facade.createCalls[0]!.model).toEqual({ providerID: "gpuz", modelID: "qwen3.8-27b-q5xl" });
+
+    // Root: count action + sessionAdded notification (to the root subscriber).
+    const rootChannel = ROOT_CHANNEL;
+    const rootActions = h.actionsOn(rootChannel);
+    expect(rootActions.map((a) => a.action.type)).toContain("root/activeSessionsChanged");
+    expect(rootActions.find((a) => a.action.type === "root/activeSessionsChanged")!.action.activeSessions).toBe(1);
+    const added = h.notification("root/sessionAdded", 1);
+    expect(added).toBeDefined();
+    expect(added!.params.channel).toBe(ROOT_CHANNEL);
+    expect(added!.params.summary.resource).toBe(sessionChannelURI("my-project-sess"));
+    expect(added!.params.summary.provider).toBe("gpuz");
+    expect(added!.params.summary.defaultChat).toBe(chatChannelURI("ses_fake_1"));
+
+    // Session snapshot: lifecycle ready, the chat catalog, default chat, and —
+    // the dropdown-fix invariant — session-state customizations carry the
+    // agent directory (Build/Plan/Explore; hidden "Title" omitted).
+    const sess = await sessionSnapshotState(h, 1, sessionChannelURI("my-project-sess"), 101);
+    expect(sess.lifecycle).toBe("ready");
+    expect(sess.provider).toBe("gpuz");
+    expect(sess.defaultChat).toBe(chatChannelURI("ses_fake_1"));
+    expect(sess.chats).toHaveLength(1);
+    expect(sess.chats[0]!.title).toBe("Chat 1");
+    const { container, children } = agentDirectoryOf(sess);
+    expect(container.name).toBe("project-lan");
+    expect(container.writable).toBe(false);
+    expect(children.map((c) => c.name)).toEqual(["Build", "Plan", "Explore"]);
+    expect(children.find((c) => c.name === "Explore")!.disableUserInvocation).toBe(true);
+
+    // Chat snapshot: the same chat, idle + read.
+    const chat = await chatSnapshotState(h, 1, chatChannelURI("ses_fake_1"), 102);
+    expect(chat.resource).toBe(chatChannelURI("ses_fake_1"));
+    expect(chat.status).toBe(SessionStatus.Idle | SessionStatus.IsRead);
+    expect(chat.turns).toEqual([]);
+
+    // The session.created the fake fired during create must not double-register.
+    await waitFor(() => h.facade.getSessionsCalls.length >= 1 || true, "grace");
+    await new Promise((r) => setTimeout(r, 320));
+    expect(h.notification("root/sessionAdded", 1)).toBe(added); // still the first one
+    const counts = h.actionsOn(rootChannel).filter((a) => a.action.type === "root/activeSessionsChanged");
+    expect(counts[counts.length - 1]!.action.activeSessions).toBe(1);
+    h.stop();
+  });
+
+  it("passes the channel suffix through as the opencode id when it starts with 'ses'", async () => {
+    const h = makeHarness();
+    h.init(1, "c1");
+    await waitInit(h, 1);
+    await createSession(h, 1, sessionChannelURI("ses_chosen_id"));
+    expect(h.facade.createCalls[0]!.id).toBe("ses_chosen_id");
+    h.stop();
+  });
+
+  it("rejects a duplicate channel with -32003", async () => {
+    const h = makeHarness();
+    h.init(1, "c1");
+    await waitInit(h, 1);
+    await createSession(h, 1, sessionChannelURI("dup"), {}, 100);
+    const second = await createSession(h, 1, sessionChannelURI("dup"), {}, 101);
+    expect(second.error?.code).toBe(ERROR_SESSION_EXISTS);
+    h.stop();
+  });
+
+  it("rejects an unknown/disabled provider with -32002", async () => {
+    const h = makeHarness();
+    h.init(1, "c1");
+    await waitInit(h, 1);
+    const unknown = await createSession(h, 1, sessionChannelURI("a"), { provider: "nope" }, 100);
+    expect(unknown.error?.code).toBe(ERROR_NO_PROVIDER);
+    h.facade.providers = [provider];
+    h.facade.providers[0] = { ...provider, activation: "disabled" };
+    const disabled = await createSession(h, 1, sessionChannelURI("b"), { provider: "gpuz" }, 101);
+    expect(disabled.error?.code).toBe(ERROR_NO_PROVIDER);
+    h.stop();
+  });
+
+  it("rejects an activeClient whose clientId does not match with -32602", async () => {
+    const h = makeHarness();
+    h.init(1, "c1");
+    await waitInit(h, 1);
+    const res = await createSession(h, 1, sessionChannelURI("ac"), {
+      activeClient: { clientId: "someone-else" },
+    });
+    expect(res.error?.code).toBe(ERROR_INVALID_PARAMS);
+    h.stop();
+  });
+
+  it("normalizes a matching activeClient into the initial session state", async () => {
+    const h = makeHarness();
+    h.init(1, "c1");
+    await waitInit(h, 1);
+    const res = await createSession(h, 1, sessionChannelURI("ac2"), {
+      activeClient: { clientId: "c1", displayName: "VS Code", tools: [] },
+    });
+    expect(res.error).toBeUndefined();
+    const sess = await sessionSnapshotState(h, 1, sessionChannelURI("ac2"), 101);
+    expect(sess.activeClients).toEqual([
+      { clientId: "c1", displayName: "VS Code", tools: [] },
+    ]);
+    h.stop();
+  });
+});
+
+// ── listSessions ──────────────────────────────────────────────────────────
+
+describe("listSessions", () => {
+  it("lists opencode sessions newest-first with opaque cursor pagination and registers them", async () => {
+    const h = makeHarness();
+    h.init(1, "c1");
+    await waitInit(h, 1);
+    const t0 = Date.now() - 3000;
+    h.facade.sessions.set("ses_old", { sessionID: "ses_old", title: "Old", time: { created: t0, updated: t0 } });
+    h.facade.sessions.set("ses_mid", { sessionID: "ses_mid", title: "Mid", time: { created: t0, updated: t0 + 1000 } });
+    h.facade.sessions.set("ses_new", { sessionID: "ses_new", title: "New", time: { created: t0, updated: t0 + 2000 } });
+
+    h.send(1, "listSessions", { limit: 2 }, 200);
+    await waitFor(() => h.frames.some((f) => f.message.id === 200), "page 1");
+    const page1 = h.frames.find((f) => f.message.id === 200)!.message.result;
+    expect(page1.items.map((s: Record<string, any>) => s.resource)).toEqual([
+      sessionChannelURI("ses_new"),
+      sessionChannelURI("ses_mid"),
+    ]);
+    expect(page1.items[0].title).toBe("New");
+    expect(page1.items[0].chats).toHaveLength(1);
+    expect(page1.nextCursor).toBe("2");
+
+    h.send(1, "listSessions", { limit: 2, cursor: page1.nextCursor }, 201);
+    await waitFor(() => h.frames.some((f) => f.message.id === 201), "page 2");
+    const page2 = h.frames.find((f) => f.message.id === 201)!.message.result;
+    expect(page2.items.map((s: Record<string, any>) => s.resource)).toEqual([sessionChannelURI("ses_old")]);
+    expect(page2.nextCursor).toBeUndefined();
+
+    // Lazy registration: the channels are now subscribable.
+    const sess = await sessionSnapshotState(h, 1, sessionChannelURI("ses_new"), 202);
+    expect(sess.title).toBe("New");
+    expect(sess.chats).toHaveLength(1);
+    h.stop();
+  });
+
+  it("keeps a host-created session ahead of older opencode sessions", async () => {
+    const h = makeHarness();
+    h.init(1, "c1");
+    await waitInit(h, 1);
+    const old = Date.now() - 60_000;
+    h.facade.sessions.set("ses_old", { sessionID: "ses_old", time: { created: old, updated: old } });
+    await createSession(h, 1, sessionChannelURI("mine"));
+
+    h.send(1, "listSessions", {}, 210);
+    await waitFor(() => h.frames.some((f) => f.message.id === 210), "list");
+    const page = h.frames.find((f) => f.message.id === 210)!.message.result;
+    expect(page.items[0].resource).toBe(sessionChannelURI("mine"));
+    h.stop();
+  });
+});
+
+// ── turn lifecycle (fixture replay) ───────────────────────────────────────
+
+describe("turn lifecycle", () => {
+  const FIX = loadFixtureEvents();
+  const FIX_SES = FIX.header["sessionID"] as string;
+  const FIX_PROMPT = FIX.header["prompt"] as string;
+
+  it("replays the captured turn: reasoning, tool call, markdown, usage, completion", async () => {
+    const h = makeHarness();
+    h.init(1, "c1");
+    await waitInit(h, 1);
+    await createSession(h, 1, sessionChannelURI(FIX_SES), { provider: "gpuz" });
+    const chatURI = chatChannelURI(FIX_SES);
+    await subscribe(h, 1, sessionChannelURI(FIX_SES), 110);
+    await subscribe(h, 1, chatURI, 111);
+
+    // The client dispatches chat/turnStarted (client-dispatchable) with the
+    // model/agent selection; the host applies them and prompts.
+    h.send(1, "dispatchAction", {
+      channel: chatURI,
+      clientSeq: 1,
+      action: {
+        type: "chat/turnStarted",
+        turnId: "t1",
+        startedAt: "2026-11-08T00:39:05.694Z",
+        message: {
+          text: FIX_PROMPT,
+          origin: { kind: "user" },
+          model: { id: "gpuz/qwen3.8-27b-q5xl" },
+          agent: { uri: "opencode:agent/build" },
+        },
+      },
+    });
+    await waitFor(() => h.facade.promptCalls.length === 1, "prompt");
+    expect(h.facade.switchModelCalls).toEqual([{ sessionID: FIX_SES, model: { providerID: "gpuz", modelID: "qwen3.8-27b-q5xl" } }]);
+    expect(h.facade.switchAgentCalls).toEqual([{ sessionID: FIX_SES, agent: "build" }]);
+    expect(h.facade.promptCalls[0]).toEqual({ sessionID: FIX_SES, text: FIX_PROMPT });
+    // Accepted echo on the chat channel (no rejectionReason).
+    const echo = await waitForAction(h, chatURI, "chat/turnStarted");
+    expect(echo.rejectionReason).toBeUndefined();
+    expect(echo.origin).toEqual({ clientId: "c1", clientSeq: 1 });
+
+    // Feed the captured turn through the pump.
+    const n = h.facade.pushFixtureEvents(FIX.events);
+    expect(n).toBeGreaterThanOrEqual(20);
+    const complete = await waitForAction(h, chatURI, "chat/turnComplete");
+    expect(complete.action.turnId).toBe("t1");
+    expect(typeof complete.action.duration).toBe("number");
+
+    // Final chat state.
+    const chat = await chatSnapshotState(h, 1, chatURI, 112);
+    expect(chat.activeTurn).toBeUndefined();
+    expect(chat.status & (SessionStatus.InProgress | SessionStatus.InputNeeded)).toBe(0);
+    expect(chat.turns).toHaveLength(1);
+    const turn = chat.turns[0]!;
+    expect(turn.id).toBe("t1");
+    expect(turn.state).toBe(TurnState.Complete);
+    expect(turn.message.text).toBe(FIX_PROMPT);
+    expect(turn.usage).toMatchObject({
+      inputTokens: 6482,
+      outputTokens: 83,
+      cacheReadTokens: 6516,
+      model: "gpuz/qwen3.8-27b-q5xl",
+    });
+
+    const parts = turn.responseParts;
+    const kinds = parts.map((p) => p.kind);
+    expect(kinds).toEqual(["reasoning", "toolCall", "reasoning", "markdown"]);
+
+    const reasoning1 = parts[0] as any;
+    expect(reasoning1.content).toBe("The user wants me to execute a bash command and reply with the output. Let's run it.");
+
+    const tool = (parts[1] as any).toolCall;
+    expect(tool.toolCallId).toBe("kQyOlzLLY5Qv6hmXaEnuK1EA4CEvrlfv");
+    expect(tool.toolName).toBe("shell");
+    expect(tool.displayName).toBe("Shell");
+    expect(tool.status).toBe(ToolCallStatus.Completed);
+    expect(tool.invocationMessage).toBe("Run `echo hello-ahp`");
+    expect(tool.toolInput).toBe('{"command":"echo hello-ahp"}');
+    expect(tool.confirmed).toBe("not-needed");
+    // The completed tool call inlines the result fields (AHP 1.0.0 state).
+    expect(tool.success).toBe(true);
+    expect(tool.pastTenseMessage).toBe("Ran `echo hello-ahp`");
+    expect(tool.content).toEqual([{ type: "text", text: "hello-ahp\n" }]);
+
+    const reasoning2 = parts[2] as any;
+    expect(reasoning2.content).toBe('The command executed successfully, and the output is "hello-ahp". Let me reply with that output.');
+
+    const markdown = parts[3] as any;
+    expect(markdown.content).toBe("hello-ahp");
+
+    // The session summary reflects the finished turn (chat synced up).
+    const sess = await sessionSnapshotState(h, 1, sessionChannelURI(FIX_SES), 113);
+    expect(sess.chats[0]!.status & SessionStatus.InProgress).toBe(0);
+    h.stop();
+  }, 15000);
+
+  it("rejects a second turnStarted while a turn is active; accepts it after the turn ends", async () => {
+    const h = makeHarness();
+    h.init(1, "c1");
+    await waitInit(h, 1);
+    const ses = "ses_t2";
+    await createSession(h, 1, sessionChannelURI(ses), { provider: "gpuz" });
+    const chatURI = chatChannelURI(ses);
+    await subscribe(h, 1, chatURI, 101);
+
+    const dispatch = (seq: number, turnId: string) =>
+      h.send(1, "dispatchAction", {
+        channel: chatURI,
+        clientSeq: seq,
+        action: { type: "chat/turnStarted", turnId, startedAt: new Date().toISOString(), message: { text: `hello ${seq}`, origin: { kind: "user" } } },
+      });
+
+    dispatch(1, "tA");
+    await waitFor(() => h.facade.promptCalls.length === 1, "prompt 1");
+    dispatch(2, "tB");
+    const rejected = await waitForAction(h, chatURI, "chat/turnStarted", (a) => a.rejectionReason !== undefined);
+    expect(rejected.rejectionReason).toMatch(/already active/);
+    expect(h.facade.promptCalls).toHaveLength(1);
+
+    // Turn ends → the next turnStarted is accepted.
+    h.facade.push({ type: "execution.succeeded", sessionID: ses });
+    await waitForAction(h, chatURI, "chat/turnComplete");
+    dispatch(3, "tC");
+    const accepted = await waitForAction(h, chatURI, "chat/turnStarted", (a) => a.rejectionReason === undefined && a.action.turnId === "tC");
+    expect(accepted.action.turnId).toBe("tC");
+    expect(h.facade.promptCalls).toHaveLength(2);
+    h.stop();
+  });
+
+  it("orphan execution.started (external TUI prompt) starts a host-minted turn", async () => {
+    const h = makeHarness();
+    h.init(1, "c1");
+    await waitInit(h, 1);
+    const ses = "ses_t3";
+    await createSession(h, 1, sessionChannelURI(ses), { provider: "gpuz" });
+    const chatURI = chatChannelURI(ses);
+    await subscribe(h, 1, chatURI, 101);
+
+    h.facade.push({ type: "inbox.enqueued", sessionID: ses, inboxID: "m1", text: "from the TUI", delivery: "default" });
+    h.facade.push({ type: "execution.started", sessionID: ses });
+    const started = await waitForAction(h, chatURI, "chat/turnStarted");
+    expect(started.origin).toBeUndefined();
+    expect(started.action.message.text).toBe("from the TUI");
+    h.stop();
+  });
+});
+
+// ── permissions ───────────────────────────────────────────────────────────
+
+describe("permissions", () => {
+  const SES = "ses_perm";
+
+  /** Start a turn and run the tool up to the permission prompt. */
+  async function startTurnToPermission(h: Harness, socketId: number) {
+    const chatURI = chatChannelURI(SES);
+    await subscribe(h, socketId, chatURI, 901);
+    await subscribe(h, socketId, sessionChannelURI(SES), 902);
+    h.send(socketId, "dispatchAction", {
+      channel: chatURI,
+      clientSeq: 1,
+      action: { type: "chat/turnStarted", turnId: "tP", startedAt: new Date().toISOString(), message: { text: "run it", origin: { kind: "user" } } },
+    });
+    await waitFor(() => h.facade.promptCalls.length === 1, "prompt");
+    const TOOL = "tool_1";
+    h.facade.push({ type: "tool.input.started", sessionID: SES, assistantMessageID: "msg_1", id: TOOL, name: "shell" });
+    h.facade.push({ type: "tool.input.ended", sessionID: SES, assistantMessageID: "msg_1", id: TOOL, text: '{"command":"ls -la"}' });
+    h.facade.push({ type: "permission.asked", sessionID: SES, id: "perm_1", action: "shell", source: { type: "tool", messageID: "msg_1", id: TOOL } });
+    const set = await waitForAction(h, sessionChannelURI(SES), "session/inputNeededSet");
+    return { chatURI, TOOL, set };
+  }
+
+  it("surfaces a tool permission as pending-confirmation + inputNeededSet, and approves via toolCallConfirmed", async () => {
+    const h = makeHarness();
+    h.init(1, "c1");
+    await waitInit(h, 1);
+    await createSession(h, 1, sessionChannelURI(SES), { provider: "gpuz" });
+    const { chatURI, TOOL, set } = await startTurnToPermission(h, 1);
+
+    // toolCallReady was published without `confirmed` → pending-confirmation.
+    const ready = await waitForAction(h, chatURI, "chat/toolCallReady");
+    expect(ready.action.confirmed).toBeUndefined();
+    const req = set.action.request;
+    expect(req.id).toBe(TOOL);
+    expect(req.kind).toBe("toolConfirmation");
+    expect(req.turnId).toBe("tP");
+    expect(req.toolCall.status).toBe("pending-confirmation");
+    expect(req.toolCall.invocationMessage).toBe("Run `ls -la`");
+
+    // Approve.
+    h.send(1, "dispatchAction", {
+      channel: chatURI,
+      clientSeq: 2,
+      action: { type: "chat/toolCallConfirmed", turnId: "tP", toolCallId: TOOL, approved: true, confirmed: "user-action" },
+    });
+    await waitFor(() => h.facade.permissionReplies.length === 1, "reply");
+    expect(h.facade.permissionReplies[0]).toEqual({ sessionID: SES, requestID: "perm_1", decision: "once" });
+    const confirmed = await waitForAction(h, chatURI, "chat/toolCallConfirmed");
+    expect(confirmed.rejectionReason).toBeUndefined();
+    const removed = await waitForAction(h, sessionChannelURI(SES), "session/inputNeededRemoved");
+    expect(removed.action.id).toBe(TOOL);
+
+    // The tool runs; the success completes it.
+    h.facade.push({ type: "tool.progress", sessionID: SES, id: TOOL });
+    h.facade.push({ type: "tool.success", sessionID: SES, id: TOOL, content: [{ type: "text", text: "ok\n" }] });
+    const complete = await waitForAction(h, chatURI, "chat/toolCallComplete");
+    expect(complete.action.result.success).toBe(true);
+    h.stop();
+  });
+
+  it("denies via toolCallConfirmed (reject) and skips the tool result", async () => {
+    const h = makeHarness();
+    h.init(1, "c1");
+    await waitInit(h, 1);
+    await createSession(h, 1, sessionChannelURI(SES), { provider: "gpuz" });
+    const { chatURI, TOOL } = await startTurnToPermission(h, 1);
+
+    h.send(1, "dispatchAction", {
+      channel: chatURI,
+      clientSeq: 2,
+      action: { type: "chat/toolCallConfirmed", turnId: "tP", toolCallId: TOOL, approved: false, reason: "user-declined" },
+    });
+    await waitFor(() => h.facade.permissionReplies.length === 1, "reply");
+    expect(h.facade.permissionReplies[0]!.decision).toBe("reject");
+    await waitForAction(h, sessionChannelURI(SES), "session/inputNeededRemoved");
+
+    // opencode still reports the (skipped) tool outcome; the host must not
+    // complete an already-cancelled tool call.
+    h.facade.push({ type: "tool.failed", sessionID: SES, id: TOOL, error: { type: "cancelled", message: "denied" } });
+    await new Promise((r) => setTimeout(r, 30));
+    expect(h.actionsOn(chatURI).some((a) => a.action.type === "chat/toolCallComplete")).toBe(false);
+
+    const chat = await chatSnapshotState(h, 1, chatURI, 120);
+    const tool = chat.activeTurn!.responseParts.find((p) => p.kind === "toolCall") as any;
+    expect(tool.toolCall.status).toBe(ToolCallStatus.Cancelled);
+    h.stop();
+  });
+
+  it("ignores non-tool permission.asked (logged, no inputNeeded)", async () => {
+    const h = makeHarness();
+    h.init(1, "c1");
+    await waitInit(h, 1);
+    await createSession(h, 1, sessionChannelURI(SES), { provider: "gpuz" });
+    h.facade.push({ type: "permission.asked", sessionID: SES, id: "perm_x", action: "webfetch" });
+    await new Promise((r) => setTimeout(r, 30));
+    expect(h.actionsOn(sessionChannelURI(SES)).some((a) => a.action.type === "session/inputNeededSet")).toBe(false);
+    h.stop();
+  });
+
+  it("safety-net: permission.replied without a client confirmation still clears the input request", async () => {
+    const h = makeHarness();
+    h.init(1, "c1");
+    await waitInit(h, 1);
+    await createSession(h, 1, sessionChannelURI(SES), { provider: "gpuz" });
+    const { TOOL } = await startTurnToPermission(h, 1);
+    h.facade.push({ type: "permission.replied", sessionID: SES, requestID: "perm_1", reply: "once" });
+    const removed = await waitForAction(h, sessionChannelURI(SES), "session/inputNeededRemoved");
+    expect(removed.action.id).toBe(TOOL);
+    h.stop();
+  });
+});
+
+// ── steering / queue ──────────────────────────────────────────────────────
+
+describe("steering and queue", () => {
+  const SES = "ses_steer";
+
+  it("steers an active turn (delivery:steer) and clears the steering message at turn end", async () => {
+    const h = makeHarness();
+    h.init(1, "c1");
+    await waitInit(h, 1);
+    await createSession(h, 1, sessionChannelURI(SES), { provider: "gpuz" });
+    const chatURI = chatChannelURI(SES);
+    await subscribe(h, 1, chatURI, 101);
+    h.send(1, "dispatchAction", {
+      channel: chatURI,
+      clientSeq: 1,
+      action: { type: "chat/turnStarted", turnId: "t1", startedAt: new Date().toISOString(), message: { text: "go", origin: { kind: "user" } } },
+    });
+    await waitFor(() => h.facade.promptCalls.length === 1, "prompt");
+
+    h.send(1, "dispatchAction", {
+      channel: chatURI,
+      clientSeq: 2,
+      action: { type: "chat/pendingMessageSet", kind: "steering", id: "s1", message: { text: "steer me", origin: { kind: "user" } } },
+    });
+    await waitFor(() => h.facade.promptCalls.length === 2, "steer prompt");
+    expect(h.facade.promptCalls[1]).toEqual({ sessionID: SES, text: "steer me", delivery: "steer" });
+    const set = await waitForAction(h, chatURI, "chat/pendingMessageSet");
+    expect(set.rejectionReason).toBeUndefined();
+
+    // Turn ends → the steering message opencode consumed is cleared.
+    h.facade.push({ type: "execution.succeeded", sessionID: SES });
+    const removed = await waitForAction(h, chatURI, "chat/pendingMessageRemoved");
+    expect(removed.action).toMatchObject({ type: "chat/pendingMessageRemoved", kind: "steering", id: "s1" });
+    const chat = await chatSnapshotState(h, 1, chatURI, 130);
+    expect(chat.steeringMessage).toBeUndefined();
+    expect(chat.activeTurn).toBeUndefined();
+    h.stop();
+  });
+
+  it("queues for the next turn (delivery:queue) and auto-starts it from the queue at turn end", async () => {
+    const h = makeHarness();
+    h.init(1, "c1");
+    await waitInit(h, 1);
+    await createSession(h, 1, sessionChannelURI(SES), { provider: "gpuz" });
+    const chatURI = chatChannelURI(SES);
+    await subscribe(h, 1, chatURI, 101);
+    h.send(1, "dispatchAction", {
+      channel: chatURI,
+      clientSeq: 1,
+      action: { type: "chat/turnStarted", turnId: "t1", startedAt: new Date().toISOString(), message: { text: "go", origin: { kind: "user" } } },
+    });
+    await waitFor(() => h.facade.promptCalls.length === 1, "prompt");
+
+    h.send(1, "dispatchAction", {
+      channel: chatURI,
+      clientSeq: 2,
+      action: { type: "chat/pendingMessageSet", kind: "queued", id: "q1", message: { text: "next up", origin: { kind: "user" } } },
+    });
+    await waitFor(() => h.facade.promptCalls.length === 2, "queue prompt");
+    expect(h.facade.promptCalls[1]).toEqual({ sessionID: SES, text: "next up", delivery: "queue" });
+
+    // No new prompt call — the queued turn is state-only: at turn end the
+    // host mints a turnStarted carrying queuedMessageId and the reducer dequeues.
+    h.facade.push({ type: "execution.succeeded", sessionID: SES });
+    const started = await waitForAction(h, chatURI, "chat/turnStarted", (a) => a.action.queuedMessageId === "q1");
+    expect(started.origin).toBeUndefined();
+    expect(started.action.message.text).toBe("next up");
+    const chat = await chatSnapshotState(h, 1, chatURI, 131);
+    expect(chat.activeTurn!.message.text).toBe("next up");
+    expect(chat.queuedMessages).toBeUndefined();
+    expect(h.facade.promptCalls).toHaveLength(2); // still no third prompt
+    h.stop();
+  });
+
+  it("pendingMessageSet without an active turn prompts immediately and starts a host-minted turn", async () => {
+    const h = makeHarness();
+    h.init(1, "c1");
+    await waitInit(h, 1);
+    await createSession(h, 1, sessionChannelURI(SES), { provider: "gpuz" });
+    const chatURI = chatChannelURI(SES);
+    await subscribe(h, 1, chatURI, 101);
+
+    h.send(1, "dispatchAction", {
+      channel: chatURI,
+      clientSeq: 1,
+      action: { type: "chat/pendingMessageSet", kind: "queued", id: "q2", message: { text: "first message", origin: { kind: "user" } } },
+    });
+    await waitFor(() => h.facade.promptCalls.length === 1, "prompt");
+    expect(h.facade.promptCalls[0]).toEqual({ sessionID: SES, text: "first message" });
+    const started = await waitForAction(h, chatURI, "chat/turnStarted", (a) => a.action.queuedMessageId === "q2");
+    expect(started.action.message.text).toBe("first message");
+    const chat = await chatSnapshotState(h, 1, chatURI, 132);
+    expect(chat.activeTurn!.message.text).toBe("first message");
+    h.stop();
+  });
+
+  it("rejects chat/pendingMessageRemoved (no inbox cancel in the plugin surface)", async () => {
+    const h = makeHarness();
+    h.init(1, "c1");
+    await waitInit(h, 1);
+    await createSession(h, 1, sessionChannelURI(SES), { provider: "gpuz" });
+    const chatURI = chatChannelURI(SES);
+    await subscribe(h, 1, chatURI, 101);
+    h.send(1, "dispatchAction", {
+      channel: chatURI,
+      clientSeq: 1,
+      action: { type: "chat/pendingMessageRemoved", kind: "queued", id: "q9" },
+    });
+    const rejected = await waitForAction(h, chatURI, "chat/pendingMessageRemoved", (a) => a.rejectionReason !== undefined);
+    expect(rejected.rejectionReason).toMatch(/no inbox cancel/);
+    h.stop();
+  });
+});
+
+// ── cancel / terminal events ──────────────────────────────────────────────
+
+describe("cancel and terminal events", () => {
+  const SES = "ses_cancel";
+
+  it("chat/turnCancelled interrupts the session, finalizes the turn, and ignores the late interrupted event", async () => {
+    const h = makeHarness();
+    h.init(1, "c1");
+    await waitInit(h, 1);
+    await createSession(h, 1, sessionChannelURI(SES), { provider: "gpuz" });
+    const chatURI = chatChannelURI(SES);
+    await subscribe(h, 1, chatURI, 101);
+    h.send(1, "dispatchAction", {
+      channel: chatURI,
+      clientSeq: 1,
+      action: { type: "chat/turnStarted", turnId: "t1", startedAt: new Date().toISOString(), message: { text: "go", origin: { kind: "user" } } },
+    });
+    await waitFor(() => h.facade.promptCalls.length === 1, "prompt");
+
+    h.send(1, "dispatchAction", {
+      channel: chatURI,
+      clientSeq: 2,
+      action: { type: "chat/turnCancelled", turnId: "t1" },
+    });
+    await waitFor(() => h.facade.interruptCalls.length === 1, "interrupt");
+    expect(h.facade.interruptCalls).toEqual([SES]);
+    const cancelled = await waitForAction(h, chatURI, "chat/turnCancelled");
+    expect(cancelled.rejectionReason).toBeUndefined();
+
+    // The opencode interrupted event finds no active turn → skipped.
+    h.facade.push({ type: "execution.interrupted", sessionID: SES, reason: "user" });
+    await new Promise((r) => setTimeout(r, 30));
+    expect(h.actionsOn(chatURI).filter((a) => a.action.type === "chat/turnCancelled")).toHaveLength(1);
+    const chat = await chatSnapshotState(h, 1, chatURI, 140);
+    expect(chat.activeTurn).toBeUndefined();
+    expect(chat.turns).toHaveLength(1);
+    expect(chat.turns[0]!.state).toBe(TurnState.Cancelled);
+    h.stop();
+  });
+
+  it("rejects turnCancelled for a turn that is not active", async () => {
+    const h = makeHarness();
+    h.init(1, "c1");
+    await waitInit(h, 1);
+    await createSession(h, 1, sessionChannelURI(SES), { provider: "gpuz" });
+    const chatURI = chatChannelURI(SES);
+    await subscribe(h, 1, chatURI, 101);
+    h.send(1, "dispatchAction", {
+      channel: chatURI,
+      clientSeq: 1,
+      action: { type: "chat/turnCancelled", turnId: "nope" },
+    });
+    const rejected = await waitForAction(h, chatURI, "chat/turnCancelled", (a) => a.rejectionReason !== undefined);
+    expect(rejected.rejectionReason).toMatch(/no active turn/);
+    h.stop();
+  });
+
+  it("execution.failed produces chat/error with the error part", async () => {
+    const h = makeHarness();
+    h.init(1, "c1");
+    await waitInit(h, 1);
+    await createSession(h, 1, sessionChannelURI(SES), { provider: "gpuz" });
+    const chatURI = chatChannelURI(SES);
+    await subscribe(h, 1, chatURI, 101);
+    h.send(1, "dispatchAction", {
+      channel: chatURI,
+      clientSeq: 1,
+      action: { type: "chat/turnStarted", turnId: "t1", startedAt: new Date().toISOString(), message: { text: "boom", origin: { kind: "user" } } },
+    });
+    await waitFor(() => h.facade.promptCalls.length === 1, "prompt");
+    h.facade.push({ type: "execution.failed", sessionID: SES, error: { type: "provider_error", message: "rate limited" } });
+    const error = await waitForAction(h, chatURI, "chat/error");
+    expect(error.action.part).toMatchObject({ kind: "error", error: { errorType: "provider_error", message: "rate limited" } });
+    const chat = await chatSnapshotState(h, 1, chatURI, 141);
+    expect(chat.turns[0]!.state).toBe(TurnState.Error);
+    const errPart = chat.turns[0]!.responseParts.find((p) => p.kind === "error") as any;
+    expect(errPart.error.message).toBe("rate limited");
+    h.stop();
+  });
+});
+
+// ── session-level actions ─────────────────────────────────────────────────
+
+describe("session-level actions", () => {
+  const SES = "ses_title";
+
+  it("session/titleChanged renames the opencode session and notifies root", async () => {
+    const h = makeHarness();
+    h.init(1, "c1");
+    await waitInit(h, 1);
+    await createSession(h, 1, sessionChannelURI(SES), { provider: "gpuz" });
+    await subscribe(h, 1, sessionChannelURI(SES), 140);
+    const before = h.notification("root/sessionSummaryChanged", 1);
+    expect(before === undefined || before.params.session !== sessionChannelURI(SES)).toBe(true);
+
+    h.send(1, "dispatchAction", {
+      channel: sessionChannelURI(SES),
+      clientSeq: 1,
+      action: { type: "session/titleChanged", title: "My renamed session" },
+    });
+    await waitFor(() => h.facade.renameCalls.length === 1, "rename");
+    expect(h.facade.renameCalls[0]).toEqual({ sessionID: SES, title: "My renamed session" });
+    const echo = await waitForAction(h, sessionChannelURI(SES), "session/titleChanged");
+    expect(echo.rejectionReason).toBeUndefined();
+    const changed = await waitFor(
+      () => {
+        const n = h.notification("root/sessionSummaryChanged", 1);
+        return n !== undefined && n.params.session === sessionChannelURI(SES) && n.params.changes.title === "My renamed session";
+      },
+      "root/sessionSummaryChanged",
+    );
+    const sess = await sessionSnapshotState(h, 1, sessionChannelURI(SES), 150);
+    expect(sess.title).toBe("My renamed session");
+    void changed;
+    h.stop();
+  });
+
+  it("echoes draft/read/archive actions without side effects", async () => {
+    const h = makeHarness();
+    h.init(1, "c1");
+    await waitInit(h, 1);
+    await createSession(h, 1, sessionChannelURI(SES), { provider: "gpuz" });
+    const chatURI = chatChannelURI(SES);
+    await subscribe(h, 1, chatURI, 141);
+    await subscribe(h, 1, sessionChannelURI(SES), 142);
+    const cases: Array<[string, { type: string } & Record<string, unknown>]> = [
+      [chatURI, { type: "chat/draftChanged", draft: { text: "typing…", origin: { kind: "user" } } }],
+      [chatURI, { type: "chat/isReadChanged", isRead: true }],
+      [chatURI, { type: "chat/isArchivedChanged", isArchived: true }],
+      [sessionChannelURI(SES), { type: "session/isReadChanged", isRead: true }],
+      [sessionChannelURI(SES), { type: "session/isArchivedChanged", isArchived: true }],
+    ];
+    let seq = 1;
+    for (const [channel, action] of cases) {
+      h.send(1, "dispatchAction", { channel, clientSeq: seq++, action });
+      const echoed = await waitForAction(h, channel, action.type);
+      expect(echoed.rejectionReason).toBeUndefined();
+    }
+    const sess = await sessionSnapshotState(h, 1, sessionChannelURI(SES), 151);
+    expect(sess.status & SessionStatus.IsRead).toBe(SessionStatus.IsRead);
+    expect(sess.status & SessionStatus.IsArchived).toBe(SessionStatus.IsArchived);
+    h.stop();
+  });
+
+  it("validates activeClient identity on session/activeClientSet", async () => {
+    const h = makeHarness();
+    h.init(1, "c1");
+    await waitInit(h, 1);
+    await createSession(h, 1, sessionChannelURI(SES), { provider: "gpuz" });
+    await subscribe(h, 1, sessionChannelURI(SES), 143);
+    h.send(1, "dispatchAction", {
+      channel: sessionChannelURI(SES),
+      clientSeq: 1,
+      action: { type: "session/activeClientSet", activeClient: { clientId: "c2" } },
+    });
+    const rejected = await waitForAction(h, sessionChannelURI(SES), "session/activeClientSet", (a) => a.rejectionReason !== undefined);
+    expect(rejected.rejectionReason).toMatch(/must match/);
+    h.send(1, "dispatchAction", {
+      channel: sessionChannelURI(SES),
+      clientSeq: 2,
+      action: { type: "session/activeClientSet", activeClient: { clientId: "c1", displayName: "VS Code" } },
+    });
+    const set = await waitForAction(h, sessionChannelURI(SES), "session/activeClientSet", (a) => a.rejectionReason === undefined);
+    expect(set.action.activeClient).toEqual({ clientId: "c1", displayName: "VS Code", tools: [] });
+    h.stop();
+  });
+
+  it("rejects actions that are not client-dispatchable with a reason", async () => {
+    const h = makeHarness();
+    h.init(1, "c1");
+    await waitInit(h, 1);
+    await createSession(h, 1, sessionChannelURI(SES), { provider: "gpuz" });
+    const chatURI = chatChannelURI(SES);
+    await subscribe(h, 1, chatURI, 144);
+    h.send(1, "dispatchAction", {
+      channel: chatURI,
+      clientSeq: 1,
+      action: { type: "chat/turnComplete", turnId: "t1", duration: 10 },
+    });
+    const rejected = await waitForAction(h, chatURI, "chat/turnComplete", (a) => a.rejectionReason !== undefined);
+    expect(rejected.rejectionReason).toMatch(/not client-dispatchable/);
+    // The store must be untouched.
+    const chat = await chatSnapshotState(h, 1, chatURI, 152);
+    expect(chat.activeTurn).toBeUndefined();
+    h.stop();
+  });
+
+  it("rejects dispatches for unknown channels and unknown sessions", async () => {
+    const h = makeHarness();
+    h.init(1, "c1");
+    await waitInit(h, 1);
+    h.send(1, "dispatchAction", { channel: "ahp-bogus:/x", clientSeq: 1, action: { type: "chat/draftChanged" } });
+    const rejected = await waitForAction(h, "ahp-bogus:/x", "chat/draftChanged", (a) => a.rejectionReason !== undefined);
+    expect(rejected.rejectionReason).toMatch(/unknown channel/);
+
+    h.send(1, "dispatchAction", { channel: sessionChannelURI("ghost"), clientSeq: 2, action: { type: "session/titleChanged", title: "x" } });
+    const rejected2 = await waitForAction(h, sessionChannelURI("ghost"), "session/titleChanged", (a) => a.rejectionReason !== undefined);
+    expect(rejected2.rejectionReason).toMatch(/no such session/);
+    h.stop();
+  });
+
+  it("accepts setClientManagedSettingsPermissions as a no-op notification", async () => {
+    const h = makeHarness();
+    h.init(1, "c1");
+    await waitInit(h, 1);
+    h.send(1, "setClientManagedSettingsPermissions", { permissions: ["chat"] });
+    await new Promise((r) => setTimeout(r, 20));
+    // No error frame on the connection (the socket stays usable).
+    expect(h.frames.some((f) => f.message.error !== undefined)).toBe(false);
+    h.send(1, "ping", {}, 9);
+    await waitFor(() => h.frames.some((f) => f.message.id === 9), "ping after settings notification");
+    h.stop();
+  });
+});
+
+// ── external sessions (event pump registration) ───────────────────────────
+
+describe("external sessions", () => {
+  it("registers a TUI-created session after the grace period and announces it on root", async () => {
+    const h = makeHarness();
+    h.init(1, "c1");
+    await waitInit(h, 1);
+    const t0 = Date.now() - 5000;
+    h.facade.sessions.set("ses_tui_1", { sessionID: "ses_tui_1", title: "TUI session", time: { created: t0, updated: t0 } });
+
+    h.facade.push({ type: "session.created", sessionID: "ses_tui_1", title: "TUI session" });
+    // Before the grace: not registered yet.
+    await new Promise((r) => setTimeout(r, 50));
+    const early = await subscribe(h, 1, sessionChannelURI("ses_tui_1"), 160);
+    expect(early.error?.code).toBe(-32001);
+
+    await waitFor(
+      () => h.notification("root/sessionAdded", 1) !== undefined,
+      "root/sessionAdded for the external session",
+      3000,
+    );
+    const added = h.notification("root/sessionAdded", 1)!;
+    expect(added.params.summary.resource).toBe(sessionChannelURI("ses_tui_1"));
+    expect(added.params.summary.title).toBe("TUI session");
+    const counts = h.actionsOn(ROOT_CHANNEL).filter((a) => a.action.type === "root/activeSessionsChanged");
+    expect(counts[counts.length - 1]!.action.activeSessions).toBe(1);
+
+    const sess = await sessionSnapshotState(h, 1, sessionChannelURI("ses_tui_1"), 161);
+    expect(sess.title).toBe("TUI session");
+    h.stop();
+  }, 10000);
+
+  it("skips registration when the session is already gone by the grace deadline", async () => {
+    const h = makeHarness();
+    h.init(1, "c1");
+    await waitInit(h, 1);
+    h.facade.sessions.set("ses_gone", { sessionID: "ses_gone", time: { created: Date.now(), updated: Date.now() } });
+    h.facade.push({ type: "session.created", sessionID: "ses_gone" });
+    // The session is removed before the 250 ms deadline.
+    h.facade.sessions.delete("ses_gone");
+    await new Promise((r) => setTimeout(r, 320));
+    expect(h.facade.getSessionsCalls).toContain("ses_gone");
+    expect(h.notification("root/sessionAdded", 1)).toBeUndefined();
+    h.stop();
+  }, 10000);
+
+  it("removes the session on session.deleted and announces it on root", async () => {
+    const h = makeHarness();
+    h.init(1, "c1");
+    await waitInit(h, 1);
+    await createSession(h, 1, sessionChannelURI("ses_del"), { provider: "gpuz" });
+    expect(h.notification("root/sessionAdded", 1)).toBeDefined();
+
+    h.facade.push({ type: "session.deleted", sessionID: "ses_del" });
+    const removed = await waitFor(() => h.notification("root/sessionRemoved", 1) !== undefined, "root/sessionRemoved");
+    const frame = h.notification("root/sessionRemoved", 1)!;
+    expect(frame.params.session).toBe(sessionChannelURI("ses_del"));
+    const counts = h.actionsOn(ROOT_CHANNEL).filter((a) => a.action.type === "root/activeSessionsChanged");
+    expect(counts[counts.length - 1]!.action.activeSessions).toBe(0);
+    const sub = await subscribe(h, 1, sessionChannelURI("ses_del"), 162);
+    expect(sub.error?.code).toBe(-32001);
+    void removed;
+    h.stop();
+  });
+
+  it("survives the createSession race: the pump's session.created does not double-register", async () => {
+    const h = makeHarness();
+    h.init(1, "c1");
+    await waitInit(h, 1);
+    // The fake pushes session.created synchronously inside createSession.
+    await createSession(h, 1, sessionChannelURI("ses_race_1"), { provider: "gpuz" });
+    await new Promise((r) => setTimeout(r, 320));
+    const added = h.frames.filter((f) => f.message.method === "root/sessionAdded");
+    expect(added).toHaveLength(1);
+    const counts = h.actionsOn(ROOT_CHANNEL).filter((a) => a.action.type === "root/activeSessionsChanged");
+    expect(counts[counts.length - 1]!.action.activeSessions).toBe(1);
+    h.stop();
+  }, 10000);
+});
+
+// ── action-stream helpers ─────────────────────────────────────────────────
+
+async function waitForAction(
+  h: Harness,
+  channel: string,
+  type: string,
+  match?: (a: any) => boolean,
+): Promise<any> {
+  await waitFor(() => {
+    const actions = h.actionsOn(channel);
+    return actions.some((a) => a.action.type === type && (match === undefined || match(a)));
+  }, `action ${type} on ${channel}`);
+  const actions = h.actionsOn(channel);
+  return actions.find((a) => a.action.type === type && (match === undefined || match(a)))!;
+}

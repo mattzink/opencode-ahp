@@ -1,0 +1,64 @@
+name: publish
+
+on:
+  push:
+    branches: [main]
+
+# Publishes must land in commit order: `latest` tracks the highest
+# published version, and a stale build that finishes after a newer one
+# must not win the tag. Queue concurrent runs (never cancel them).
+concurrency:
+  group: publish
+  cancel-in-progress: false
+
+# Trusted publishing (OIDC): the npm CLI exchanges the OIDC token GitHub
+# mints for this specific run of this specific workflow file for a
+# short-lived publish credential — no npm token or repo secret is stored.
+# The publisher is registered on npmjs.com (opencode-ahp → Package
+# settings → Trusted publishers: GitHub Actions, mattzink/opencode-ahp,
+# publish.yml, allow `npm publish`). Requires npm CLI >= 11.5.1 /
+# Node >= 22.14 (both satisfied by the mise-managed toolchain).
+permissions:
+  id-token: write
+  contents: read
+
+jobs:
+  publish:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+
+      # Node 26 + pnpm (via packageManager) per mise.toml. No `version`
+      # input: the action defaults to the newest stable mise release at
+      # least 24 h old ("latest" is NOT a magic value — it would be
+      # interpolated literally into the release download URL).
+      - uses: jdx/mise-action@v5
+
+      - name: Install
+        run: pnpm install --frozen-lockfile
+
+      - name: Typecheck
+        run: pnpm typecheck
+
+      - name: Test
+        run: pnpm test
+
+      - name: Compute version
+        id: version
+        # major.minor from package.json (the in-repo base) plus this
+        # workflow's build number, e.g. base 0.1.0 + run 7 -> 0.1.7.
+        # Failed runs consume a build number, so the sequence may have
+        # gaps; each published version is unique either way.
+        run: |
+          BASE=$(node -p "require('./package.json').version" | cut -d. -f1,2)
+          echo "version=${BASE}.${GITHUB_RUN_NUMBER}" >> "$GITHUB_OUTPUT"
+
+      - name: Set version
+        run: pnpm version "${{ steps.version.outputs.version }}" --no-git-tag-version
+
+      - name: Publish
+        # `npm publish` (not `pnpm publish`): the npm CLI is what detects
+        # the OIDC environment and performs the token exchange. Unscoped
+        # name: public by default, no --access flag needed. prepublishOnly
+        # re-runs typecheck and tests as a final gate.
+        run: npm publish

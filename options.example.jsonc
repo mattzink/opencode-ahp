@@ -1,0 +1,44 @@
+{
+  // Documented option set for opencode-ahp (plan §8.2).
+  //
+  // How to use: copy this file to `options.jsonc` next to src/index.ts when
+  // running from a checkout, or — the usual case — put the values you want
+  // in the plugin entry's `options` object in opencode.jsonc (that takes
+  // precedence per key). npm installs ship no sibling options file.
+
+  // Master switch; false → no listener, the plugin is fully inert.
+  // "enabled": true,
+
+  // WS listen port.
+  // "port": 8765,
+
+  // Bind address. Binding a non-loopback address REQUIRES a token (the
+  // listener refuses to start without one — plan R4).
+  // "host": "127.0.0.1",
+
+  // WS path — VS Code's remoteAgentHosts URL carries it verbatim.
+  // "path": "/ahp",
+
+  // Auth token. Omit to auto-generate one on first start (persisted in
+  // opencode's plugin storage, printed once to the service log). Accepted
+  // via the `?token=` query param and `Authorization: Bearer <token>`.
+  // "token": "…",
+
+  // Origin allowlist: "*" (default) or an exact list, e.g.
+  // ["vscode://vscode"]. The token is always required regardless (R5).
+  // "allowedOrigins": "*",
+
+  // Native TLS via Bun.serve → wss:// (post-MVP; only needed for off-LAN
+  // transports, D3). Paths to a key and a cert file.
+  // "tls": { "keyPath": "/path/key.pem", "certPath": "/path/cert.pem" },
+
+  // Plain-HTTP health endpoint (no auth).
+  // "healthPath": "/healthz",
+
+  // Global actions kept for reconnect replay; older gaps → fresh snapshot.
+  // "replayWindow": 1000,
+
+  // What initialize advertises — never advertise what we don't implement.
+  // changesets flips to true in Phase 2 (D2).
+  // "capabilities": { "changesets": false, "terminals": false, "automations": false }
+}

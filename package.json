@@ -1,0 +1,52 @@
+{
+  "name": "opencode-ahp",
+  "version": "0.1.0",
+  "description": "OpenCode V2 plugin: hosts Agent Host Protocol (AHP) 1.0.0 in-process so opencode is a native agent in the VS Code Agents window",
+  "type": "module",
+  "exports": {
+    ".": "./src/index.ts"
+  },
+  "files": [
+    "src",
+    "!src/test",
+    "README.md",
+    "LICENSE",
+    "options.example.jsonc"
+  ],
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/mattzink/opencode-ahp.git"
+  },
+  "homepage": "https://github.com/mattzink/opencode-ahp#readme",
+  "bugs": {
+    "url": "https://github.com/mattzink/opencode-ahp/issues"
+  },
+  "keywords": [
+    "opencode",
+    "opencode-plugin",
+    "plugin",
+    "agent-host-protocol",
+    "ahp",
+    "vscode",
+    "agents"
+  ],
+  "engines": {
+    "node": ">=20"
+  },
+  "packageManager": "pnpm@12.4.2",
+  "scripts": {
+    "typecheck": "tsc --noEmit",
+    "test": "vitest run",
+    "prepublishOnly": "pnpm typecheck && pnpm test"
+  },
+  "dependencies": {
+    "@microsoft/agent-host-protocol": "1.0.0",
+    "@opencode/plugin": "^2.2.6"
+  },
+  "devDependencies": {
+    "@types/node": "^26.6.3",
+    "typescript": "^7.0.2",
+    "vitest": "^5.0.3"
+  },
+  "license": "MIT"
+}
