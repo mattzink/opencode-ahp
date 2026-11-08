@@ -727,12 +727,32 @@ catalog increment of §14.7 shipped as a Phase 0 add-on, 2026-11-07).
 dropdown), session/chat stores on the official reducers, full event pump
 (turns, streaming, tool lifecycle, permissions, steering/queue, usage,
 summary sync), client-dispatchable actions with echo/rejection
-semantics. 146/146 tests green, typecheck clean; live end-to-end
+semantics. 156/156 tests green, typecheck clean; live end-to-end
 verification passed on the LAN host (`scripts/ahp-phase1.mjs` —
 §14.9). **PC B confirmation received** (user screenshot): the Agents
 window dropdown lists Agent/Build/Plan + "Configure Custom Agents…" —
 General/Explore correctly absent (subagents), gpuz pill + Qwen 3.8 DFlash2
-model intact. Remaining: E2E checklist §9.4 walk-through, first publish.
+model intact. **First publish done (2026-11-08):** npm
+`opencode-ahp` registered (0.0.0-stage placeholder) + trusted publisher
+(GitHub Actions, `publish.yml`, allow `npm publish`); the workflow
+publishes `0.1.<run>` (gaps in the run numbers are expected) —
+`latest` was `0.1.1` when the keep-alive work started. The LAN host
+config is flipped to the npm spec (`"package": "opencode-ahp"`),
+location reloaded via `POST /api/location/reload`, and the live probe
+confirms it runs the published artifact (`serverInfo.version` 0.1.1) —
+the full Phase 1 lifecycle (`scripts/ahp-phase1.mjs`) passes against
+it. **Keep-alive shipped (2026-11-08, §15):** the idle-timeout
+workaround (`location_idle_timeout: false`) is gone — the plugin keeps
+its own location loaded; both friction steps are reduced to the
+one-time cold boot (an opencode limit, README step 3). Live-verified on
+the LAN host without the flag (keep-alive active, anchor hidden from
+`listSessions`, `keepAliveAt` advancing, full lifecycle green).
+Remaining: publish the keep-alive version and re-flip the LAN host to
+it; E2E checklist §9.4 items 5/6/7/11 from PC B; optional AHP entry in
+the daily `:80` global config (that service currently has no AHP
+plugin entry — same-machine VS Code use would need one); upstream
+feature request (auto-boot / server-scoped plugin hook + the
+`session.update` `archived` gap, §15).
 
 Working order (house pattern: pure modules + tests first, wiring last):
 
@@ -794,14 +814,17 @@ conformance suite, with no extra service to run beyond one
 
 ---
 
-## 12. Decisions (resolved 2026-11-07)
+## 12. Decisions (resolved 2026-11-07/08)
 
 | # | Question | Decision |
 | --- | --- | --- |
 | D1 | maxious plugin: reuse its code? | **No code reuse** — fresh build against AHP 1.0; the repo is used only as a source of good test cases (§4.2) |
 | D2 | MVP scope: steering / changesets? | **Steering in Phase 1**; changesets deferred to Phase 2 |
 | D3 | Stopgap via `ahp-acp-gateway` while we build? | **No stopgap** — MVP only needs to work over the **local LAN** |
-| D4 | Standalone bin (non-plugin host)? | **No standalone bin for now** |
+| D4 | Standalone bin (non-plugin host)? | **No standalone bin for now** (2026-11-08: an `opencode acp` sidecar proposal was re-rejected on the same grounds — plugin interface only) |
+| D5 | Idle-timeout workaround: how to remove? | **In-plugin keep-alive** (2026-11-08, §15): periodic durable `session.metadata.updated` on a deterministic anchor session — no separate process, no user config; cold boot is an architectural limit (plugins load per location) |
+| D6 | Cold-boot residual | **"Investigate upstream later"** (user, 2026-11-08): ship keep-alive now; README keeps the one-time boot step; file an opencode feature request (auto-boot config / server-scoped plugin hook) later |
+| D7 | Anchor session visibility | **Unarchived by design** (discovered live, 2026-11-08, §15): the plugin surface cannot archive (`session.update` drops `archived` — upstream gap, v2.2.6 ≡ dev); the anchor is a real session visible in the TUI session list as "opencode-ahp (keep-alive)" and filtered from all AHP surfaces by its ID |
 
 ---
 
@@ -1148,9 +1171,11 @@ the `opencode serve` process was alive and healthy on :4098. Diagnosis:
 
 - **Host project config** (required for every AHP deployment; goes in
   the README's runbook):
+
   ```jsonc
   { "experimental": { "location_idle_timeout": false } }
   ```
+
   Applied to `/tmp/opencode/ahp-scratch/project-lan/.opencode/opencode.jsonc`;
   accepted cleanly by 2.2.6 (location reload 204, no validation errors).
   The daily `:80` service config was **not** touched.
@@ -1316,7 +1341,107 @@ to the 1.1.0 draft — the installed 1.0.0 dist is the only ground truth).
   `createSession` with an explicit `provider` fails -32002 in that
   window (correct behavior per the error-code contract).
 
-**Test status:** `pnpm typecheck` clean; `pnpm test` 146/146 green
-(7 files — the 38-event fixture replay in `host.test.ts` covers the
+**Test status:** `pnpm typecheck` clean; `pnpm test` 156/156 green
+(8 files — the 38-event fixture replay in `host.test.ts` covers the
 reasoning/tool/markdown/usage/terminal path end-to-end through the real
-reducers).
+reducers; `keep-alive.test.ts` covers the §15 keep-alive module).
+
+---
+
+## 15. Keep-alive: surviving the idle-location eviction (implemented 2026-11-08)
+
+**Problem.** Two deployment frictions (D5, 2026-11-08): opencode v2
+unloads idle locations after `experimental.location_idle_timeout`
+(default 60 minutes) and AHP WebSocket connections do **not** count as
+location activity — so the AHP listener silently stops overnight. The
+workaround forced users to set `experimental.location_idle_timeout:
+false` **and** to boot the location manually after every server start.
+Goal: remove both frictions using only the existing plugin interface
+(no separate process, no upstream changes — D4 stands).
+
+**Findings (v2.2.6 ≡ dev `1284450a03`; 88 commits since v2.2.6):**
+- Eviction (`packages/core/src/location-activity.ts`): a one-minute
+  sweep touches a location on every **durable** session event (only
+  while the location is active in the RcMap) and evicts only when it
+  is past TTL **and** unoccupied (no active executions / background
+  jobs) **and** unretained. `retain` is called only from
+  `packages/server/src/handlers/pty-socket.ts` — unreachable from a
+  plugin.
+- `Session.setMetadata` (`packages/core/src/session/session.ts`)
+  publishes the durable `session.metadata.updated` event
+  **unconditionally** (after a `get` guard) → a periodic metadata
+  update of any session in the location keeps it loaded.
+- **No auto-boot (cold boot is an architectural limit):** locations
+  boot only on an HTTP request to the opencode API
+  (`packages/server/src/location.ts` `requestRef`) or a TUI/IDE
+  opening the project. Plugins load per location
+  (`Node.makeLocationNode`) and cannot run before the location boots;
+  the AHP client never hits the opencode API (it dials the AHP WS),
+  so it cannot trigger a boot. No autoboot/initialLocation/
+  defaultLocation config exists — re-verified on **dev**:
+  `location-activity.ts`, `location-lifecycle.ts`,
+  `location-services.ts`, `plugin.ts`, `effect/plugin.ts`,
+  `promise/plugin.ts`, `server-process.ts`, `server/location.ts` are
+  unchanged since v2.2.6; `session.metadata.updated` is still
+  durable; the only plugin-surface delta is plumbing for the new
+  provider-watch feature (`App.Metadata`→`App.Service`,
+  `Flag.Service`, `opencode-watches.ts`).
+
+**Design (D6, user-approved).** In-plugin keep-alive:
+- **Anchor session** — deterministic ID `ses_ahp_keepalive`
+  (`Session.ID` is any `ses`-prefixed string, per
+  `packages/schema/src/session-id.ts`). Get-or-create; deterministic
+  so reloads reuse the same session (no DB accumulation) and the AHP
+  facade filters it by a constant (no metadata reads, no list scans).
+- **Touch** — every `keepAliveIntervalMinutes` (default 10):
+  `ctx.session.update({sessionID, metadata: {"opencode-ahp":
+  "keep-alive", keepAliveAt}})` → durable `session.metadata.updated`
+  → location touch → TTL reset. 10 minutes leaves sixfold headroom
+  under the 60-minute default TTL.
+- **Filtering** — the facade hides the anchor from all three AHP
+  surfaces: `listSessions` (ID filter), `getSession` (→ null), and
+  the event stream (raw v2 envelope `data.sessionID` filter — covers
+  `session.created`, the only session event the bridge maps;
+  `session.metadata.updated`/`session.archived` are not mapped
+  (null → skipped)).
+- **Options** — `keepAlive` (default `true`),
+  `keepAliveIntervalMinutes` (default `10`, positive integer).
+- **Failure semantics (R2)** — `KeepAlive` is a pure module
+  (`src/keep-alive.ts`; injected session access + timers, 9 unit
+  tests). `start()` never throws: anchor-setup failure → keep-alive
+  stays off (one log line; opencode's idle timeout applies as
+  before); touch failure → logged, retried on the next tick; ticks
+  are overlap-guarded (no concurrent touches); `stop()` idempotent
+  (location teardown and the listener-failure path both call it).
+  Started **before** the host is constructed, so the anchor's
+  `session.created` fires before the event pump subscribes and never
+  reaches AHP clients.
+
+**Upstream gap found while implementing (D7):** `SessionUpdateInput`
+advertises `archived`, but the plugin host's `session.update`
+(`packages/core/src/plugin/host.ts:594-601`) forwards only
+title/metadata/permissions and **silently drops `input.archived`** —
+in v2.2.6 *and* current dev. HTTP `PATCH /api/session/{id}` accepts
+`{archived}` (verified live against the LAN server); no other
+archive path exists in the plugin surface. **Resolution:** the anchor
+is unarchived by design — visible in the opencode TUI session list as
+"opencode-ahp (keep-alive)" (self-explanatory), hidden from every
+AHP client by the ID filter. README + `options.example.jsonc` say so.
+
+**Status (2026-11-08):** implemented — 156/156 tests (8 files),
+typecheck clean. **Live-verified on the LAN host** with a
+dev-checkout config, 1-minute touch interval, and **no**
+`location_idle_timeout` flag: "keep-alive active" log; anchor created
+and touched (`keepAliveAt` advancing in the metadata); the
+`listSessions` probe (ws handshake → initialize → listSessions)
+returns the 7 real sessions and **not** the anchor; the full
+`scripts/ahp-phase1.mjs` lifecycle passes with keep-alive running.
+
+**Residual (D6: "Investigate upstream later"):** the **cold boot**
+remains a one-time-per-server-process step (README step 3: open the
+project once, or the headless `GET /api/location` curl, after a fresh
+server start). A zero-touch boot needs upstream support — an
+auto-boot config or a server-scoped plugin hook. Two follow-ups are
+queued for an opencode feature request: (a) auto-boot / server-scoped
+plugin hook; (b) the plugin-host `session.update` dropping
+`archived`.

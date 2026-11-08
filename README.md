@@ -86,6 +86,8 @@ sibling of `src/index.ts` (checkouts only — copy
 | `allowedOrigins` | `"*"` | `"*"` or an exact list, e.g. `["vscode://vscode"]`. The token is still always required regardless |
 | `tls` | `null` | `{ keyPath, certPath }` — native TLS → `wss://` (post-MVP; only needed for off-LAN transports) |
 | `healthPath` | `"/healthz"` | Plain-HTTP health endpoint (no auth): `curl …:8765/healthz` → `ok` |
+| `keepAlive` | `true` | Keep the opencode location loaded against its idle timeout (`experimental.location_idle_timeout`, default 60 min) by periodically touching an internal anchor session — with this on, **no `location_idle_timeout` config entry is needed**. The anchor (`opencode-ahp (keep-alive)`) is a real opencode session: it shows in the TUI session list but is hidden from AHP clients (opencode's plugin surface cannot archive it) |
+| `keepAliveIntervalMinutes` | `10` | Minutes between keep-alive touches; keep well below the effective idle timeout |
 | `replayWindow` | `1000` | Per-channel actions kept for reconnect replay; older gaps → fresh snapshot |
 | `capabilities` | `{ changesets: false, terminals: false, automations: false }` | Advertised in `initialize` — never advertise what we don't implement |
 
@@ -105,10 +107,6 @@ port forward, any `wss://` proxy) are post-MVP; the host accepts any
 
    ```jsonc
    {
-     // Required: opencode v2 unloads idle locations after 60 minutes, and
-     // AHP WebSocket connections do NOT count as location activity —
-     // without this the listener silently stops overnight.
-     "experimental": { "location_idle_timeout": false },
      "plugins": [{
        "package": "opencode-ahp",
        "options": {
@@ -120,17 +118,28 @@ port forward, any `wss://` proxy) are post-MVP; the host accepts any
    }
    ```
 
+   No `experimental.location_idle_timeout` entry needed: by default the
+   plugin keeps its own location loaded (`keepAlive`, see Options) by
+   periodically touching an internal anchor session (visible in the TUI
+   session list as "opencode-ahp (keep-alive)", hidden from AHP clients)
+   — opencode's idle sweep never fires.
+
 3. **Boot the location once** — the AHP listener exists only while the
-   location is up. Open the project once (run the `opencode` TUI in it, or
-   open it in an IDE), or headless:
+   location is up, and a location boots on first use. After a fresh server
+   start (e.g. machine reboot), open the project once (run the `opencode`
+   TUI in it, or open it in an IDE), or headless:
 
    ```sh
    curl -g -u opencode:<server-password> \
      'http://127.0.0.1:<port>/api/location?location[directory]=<project-dir>'
    ```
 
-   With `location_idle_timeout: false` the listener then stays up
-   indefinitely.
+   This is a one-time step per server process: the keep-alive then holds
+   the location (and the listener) indefinitely, and reloading the
+   location (config change, `opencode service restart`) re-boots it
+   automatically. (The one-time boot itself is an opencode limitation —
+   plugins cannot run before their location has booted; a zero-touch boot
+   needs an upstream auto-boot option.)
 4. Verify: `curl -s http://<host-lan-ip>:<port>/healthz` → `ok`.
 
 Full two-machine walkthrough:
@@ -182,7 +191,7 @@ repo secret is stored (one-time setup: npmjs.com → package → *Package
 settings* → *Trusted publishers* → this workflow).
 
 Installed copies don't auto-update: `opencode plugin update opencode-ahp`
-+ `opencode service restart`.
+- `opencode service restart`.
 
 ## License
 

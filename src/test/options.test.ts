@@ -55,6 +55,8 @@ describe("resolveOptions: precedence ctx ▸ file ▸ built-in", () => {
       token: "t",
       allowedOrigins: ["x"],
       healthPath: "/h",
+      keepAlive: false,
+      keepAliveIntervalMinutes: 2,
       replayWindow: 7,
     };
     const o = resolveOptions(ctx, FILE);
@@ -65,7 +67,14 @@ describe("resolveOptions: precedence ctx ▸ file ▸ built-in", () => {
     expect(o.token).toBe("t");
     expect(o.allowedOrigins).toEqual(["x"]);
     expect(o.healthPath).toBe("/h");
+    expect(o.keepAlive).toBe(false);
+    expect(o.keepAliveIntervalMinutes).toBe(2);
     expect(o.replayWindow).toBe(7);
+  });
+
+  it("keep-alive defaults to on with a 10-minute interval", () => {
+    expect(resolveOptions(undefined, null).keepAlive).toBe(true);
+    expect(resolveOptions(undefined, null).keepAliveIntervalMinutes).toBe(10);
   });
 });
 
@@ -80,6 +89,13 @@ describe("resolveOptions: validation and fallback (no throw)", () => {
   it("invalid ctx and file values fall back to built-in", () => {
     expect(resolveOptions({ replayWindow: 0 }, JSON.stringify({ replayWindow: -1 })).replayWindow).toBe(
       BUILTIN_OPTIONS.replayWindow,
+    );
+    expect(resolveOptions({ keepAlive: "yes" }, null).keepAlive).toBe(BUILTIN_OPTIONS.keepAlive);
+    expect(resolveOptions({ keepAliveIntervalMinutes: 0 }, JSON.stringify({ keepAliveIntervalMinutes: -1 })).keepAliveIntervalMinutes).toBe(
+      BUILTIN_OPTIONS.keepAliveIntervalMinutes,
+    );
+    expect(resolveOptions({ keepAliveIntervalMinutes: "soon" }, null).keepAliveIntervalMinutes).toBe(
+      BUILTIN_OPTIONS.keepAliveIntervalMinutes,
     );
   });
 

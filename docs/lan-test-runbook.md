@@ -49,11 +49,12 @@ Notes:
   explicit token for a non-loopback bind.
 - `allowedOrigins: "*"` in the same file — test mode; production setups should
   list exact VS Code Origins.
-- **`experimental.location_idle_timeout: false`** in the same file —
-  **required**. opencode v2 unloads idle locations after 60 minutes by
-  default, and AHP WebSocket connections do not count as location activity:
-  without the opt-out the plugin (and the AHP listener) is torn down
-  overnight while the server process keeps running (plan §14.8).
+- **No `experimental.location_idle_timeout` entry** — not needed. The plugin's
+  keep-alive (on by default; plan §15) periodically touches an internal
+  anchor session, which opencode counts as location activity, so the idle
+  eviction (60-minute default) never fires. (Before keep-alive, the flag was
+  required — AHP WebSocket connections do not count as location activity;
+  plan §14.8.)
 
 ### 2. Boot the location
 
@@ -79,9 +80,11 @@ If the LAN IP is not `10.0.1.107`: `hostname -I | awk '{print $1}'`.
 (If the firewall blocks the port: `sudo ufw allow 8767/tcp` or equivalent.)
 
 **Troubleshooting — AHP port dead but the server is up** (`healthz` →
-connection refused, :4098 still 200): the location was idle-evicted and the
-plugin's cleanup stopped the listener (plan §14.8). The plugin setup re-runs
-and the listener comes back when you re-boot the location:
+connection refused, :4098 still 200): with keep-alive active (check the
+server log for `keep-alive active`) this should not happen; if it does,
+the location was evicted or the plugin failed to start, and the same
+re-boot fixes it — the plugin setup re-runs and the listener comes
+back:
 
 ```sh
 curl -g -u "opencode:<PASSWORD>" \

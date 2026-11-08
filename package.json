@@ -1,6 +1,6 @@
 {
   "name": "opencode-ahp",
-  "version": "0.1.0",
+  "version": "0.1.1",
   "description": "OpenCode V2 plugin: hosts Agent Host Protocol (AHP) 1.0.0 in-process so opencode is a native agent in the VS Code Agents window",
   "type": "module",
   "exports": {

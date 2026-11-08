@@ -10,14 +10,17 @@
  *
  * Lifecycle:
  *   1. resolve options (ctx.options ▸ options.jsonc sibling ▸ built-ins;
- *      a malformed sibling file → one error log + re-resolve without it)
- *   2. `enabled: false` → the plugin is fully inert (no listener)
- *   3. token: explicit option, else persisted in ctx.storage (generated
+ *      a malformed sibling file → one error log + re-resolve without it);
+ *      `enabled: false` → the plugin is fully inert (no listener)
+ *   2. token: explicit option, else persisted in ctx.storage (generated
  *      once, printed once to the server log)
+ *   3. keep-alive (plan §15): get-or-create the anchor session and start
+ *      touching it periodically so the location survives the idle timeout
+ *      without any user config
  *   4. wire the Host (JSON-RPC router) to the transport (Bun.serve)
  *   5. start the opencode event pump (maps `ctx.event.subscribe` into
  *      the host's AHP action stream — plan §6.1/§11)
- *   6. return cleanup that stops the pump and the listener
+ *   6. return cleanup that stops the keep-alive, the pump, and the listener
  *
  * Every failure path logs and stays up: a bad client connection or a
  * bridge error must never take down the opencode server (R2).
@@ -41,6 +44,8 @@ type SessionInfo = Awaited<ReturnType<SessionDomain["get"]>>;
 import { isRecord, resolveOptions, type Options } from "./options.js";
 import { createListener, type Listener } from "./transport.js";
 import { Host } from "./host.js";
+import { KeepAlive, KEEPALIVE_SESSION_ID } from "./keep-alive.js";
+import { errorMessage } from "./error.js";
 import {
   mapV2Event,
   type FacadeAgent,
@@ -54,10 +59,6 @@ const TAG = "[opencode-ahp]";
 
 /** ctx.storage key for the persisted auto-generated token. */
 const TOKEN_STORAGE_KEY = "ahp.token";
-
-function errorMessage(e: unknown): string {
-  return e instanceof Error ? e.message : String(e);
-}
 
 /** Raw text of the `options.jsonc` sibling of this file, or null when absent. */
 function readOptionsFile(): string | null {
@@ -81,7 +82,7 @@ function pluginVersion(): string {
   } catch {
     // fall through to the fallback
   }
-  return "0.1.0";
+  return "0.1.1";
 }
 
 /** 32 random bytes, base64url — 43 chars, comfortably over the 16-char floor. */
@@ -132,6 +133,13 @@ function mapSessionInfo(info: SessionInfo): FacadeSession {
   };
 }
 
+/** True when a raw V2 event envelope (`{id, type, data}`) belongs to a session. */
+function isHiddenSessionEvent(event: unknown, hiddenSessionID: string): boolean {
+  if (!isRecord(event)) return false;
+  const data = event["data"];
+  return isRecord(data) && data["sessionID"] === hiddenSessionID;
+}
+
 /**
  * The narrow opencode surface the bridge needs (plan §3.2, §14.7, §11).
  *
@@ -147,8 +155,14 @@ function mapSessionInfo(info: SessionInfo): FacadeSession {
  * Phase 1 adds the session surface: create/list/get, prompt with
  * `delivery` (steer|queue), switchModel/switchAgent, interrupt, update
  * (rename), permission reply, and the mapped event stream.
+ *
+ * `hiddenSessionID` (the keep-alive anchor, plan §15) is filtered from all
+ * three session surfaces so the AHP client never sees it: `list`/snapshots
+ * (by ID), `get` (null = not found), and the event stream (by
+ * `data.sessionID` — covers `session.created` and anything a future bridge
+ * version may map).
  */
-function implementFacade(ctx: Context): OpencodeFacade {
+function implementFacade(ctx: Context, hiddenSessionID: string | null): OpencodeFacade {
   return {
     async listCatalog() {
       const [providers, models] = await Promise.all([ctx.provider.list(), ctx.model.list()]);
@@ -213,9 +227,12 @@ function implementFacade(ctx: Context): OpencodeFacade {
     },
     async listSessions() {
       const { data } = await ctx.session.list();
-      return data.map(mapSessionInfo);
+      return data
+        .filter((s) => String(s.id) !== hiddenSessionID)
+        .map(mapSessionInfo);
     },
     async getSession(sessionID: string) {
+      if (sessionID === hiddenSessionID) return null;
       try {
         return mapSessionInfo(await ctx.session.get({ sessionID }));
       } catch {
@@ -263,6 +280,7 @@ function implementFacade(ctx: Context): OpencodeFacade {
      */
     async *events(signal: AbortSignal) {
       for await (const event of ctx.event.subscribe({ signal })) {
+        if (hiddenSessionID !== null && isHiddenSessionEvent(event, hiddenSessionID)) continue;
         const mapped = mapV2Event(event);
         if (mapped !== null) yield mapped;
       }
@@ -295,7 +313,47 @@ export default Plugin.define({
       return; // R2: the opencode server stays up without AHP
     }
 
-    // 3. Host + transport. The host's send/close callbacks close over the
+    // 3. Keep-alive (plan §15). Before the host exists, so the anchor
+    //    session's `session.created` fires before the event pump subscribesbscribes
+    //    and never reaches AHP clients (the facade filters it from the
+    //    snapshot/list surfaces regardless). A deterministic session ID means
+    //    reloads reuse the same session — no accumulation in the DB.
+    //    start() never throws: on failure the keep-alive stays off and
+    //    opencode's idle timeout applies as before (R2).
+    const hiddenSessionID = opts.keepAlive ? KEEPALIVE_SESSION_ID : null;
+    let keepAlive: KeepAlive | null = null;
+    if (opts.keepAlive) {
+      keepAlive = new KeepAlive({
+        // Get-or-create. (Upstream gap, plan §15: `SessionUpdateInput`
+        // advertises `archived`, but the plugin host's `session.update`
+        // drops it — `packages/core/src/plugin/host.ts` forwards only
+        // title/metadata/permissions, in v2.2.6 and current dev. So the
+        // anchor cannot be archived from a plugin; it is visible in the
+        // opencode TUI session list as "opencode-ahp (keep-alive)" and is
+        // filtered out of every AHP surface by ID instead.)
+        ensureSession: async () => {
+          try {
+            await ctx.session.get({ sessionID: KEEPALIVE_SESSION_ID });
+          } catch {
+            await ctx.session.create({
+              id: KEEPALIVE_SESSION_ID,
+              title: "opencode-ahp (keep-alive)",
+              metadata: { "opencode-ahp": "keep-alive" },
+            });
+          }
+        },
+        touch: () =>
+          ctx.session.update({
+            sessionID: KEEPALIVE_SESSION_ID,
+            metadata: { "opencode-ahp": "keep-alive", keepAliveAt: Date.now() },
+          }),
+        intervalMs: opts.keepAliveIntervalMinutes * 60_000,
+        log: (msg) => console.warn(`${TAG} ${msg}`),
+      });
+      await keepAlive.start();
+    }
+
+    // 4. Host + transport. The host's send/close callbacks close over the
     // listener variable, which is assigned immediately after the host is
     // constructed (the listener's socket ids are the host's socket ids).
     let listener: Listener | null = null;
@@ -303,7 +361,7 @@ export default Plugin.define({
     try {
       const host = new Host({
         serverInfo: { name: "opencode-ahp", version: pluginVersion(), title: "OpenCode" },
-        facade: implementFacade(ctx),
+        facade: implementFacade(ctx, hiddenSessionID),
         replayWindow: opts.replayWindow,
         defaultDirectory: ctx.location.directory,
         send: (socketId, message) => {
@@ -341,19 +399,19 @@ export default Plugin.define({
       );
     } catch (e) {
       console.error(`${TAG} failed to start the AHP listener: ${errorMessage(e)}`);
+      keepAlive?.stop(); // don't hold the location for a dead AHP host
       listener?.stop();
       listener = null;
       return; // R2: the opencode server stays up without AHP
     }
 
-    // 4. Cleanup: stop the pump (aborts the event subscription) and stop
-    //    the listener, dropping every client connection. Logged because
-    //    opencode silently unloads idle locations
-    //    (`experimental.location_idle_timeout`, default 60 minutes) and a
-    //    torn-down listener with no log line is otherwise undiagnosable
-    //    (plan §14.8).
+    // 6. Cleanup: stop the keep-alive timer, stop the pump (aborts the
+    //    event subscription), and stop the listener, dropping every client
+    //    connection. Logged because a torn-down listener with no log line
+    //    is otherwise undiagnosable (plan §14.8).
     return () => {
       console.log(`${TAG} location teardown — stopping the AHP host (location unloaded by opencode)`);
+      keepAlive?.stop();
       cleanupHost?.();
       listener?.stop();
     };
