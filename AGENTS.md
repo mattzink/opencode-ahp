@@ -33,9 +33,11 @@ truth for *why* the code is shaped the way it is.
   (full Phase 1 lifecycle).
 - **Publishing**: CI only — push to GitHub and the trusted-publisher
   workflow (`.github/workflows/publish.yml`) publishes
-  `0.1.<GITHUB_RUN_NUMBER>` (gaps in run numbers are expected). `prepublishOnly`
-  runs typecheck + tests as a guard. Do not run `npm publish` from a shell
-  (interactive 2FA blocks it; the user's terminal is the only other path).
+  `0.1.<GITHUB_RUN_NUMBER>` (gaps in run numbers are expected) and creates
+  a tagged GitHub release (`v<version>`) with a short install pointer +
+  the push's commit list. `prepublishOnly` runs typecheck + tests as a
+  guard. Do not run `npm publish` from a shell (interactive 2FA blocks it;
+  the user's terminal is the only other path).
 
 ## Critical Patterns
 

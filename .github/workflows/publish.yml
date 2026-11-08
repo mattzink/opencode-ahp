@@ -20,13 +20,19 @@ concurrency:
 # Node >= 22.14 (both satisfied by the mise-managed toolchain).
 permissions:
   id-token: write
-  contents: read
+  # contents: write — the release step tags + creates a GitHub release for
+  # every published build (softprops/action-gh-release).
+  contents: write
 
 jobs:
   publish:
     runs-on: ubuntu-latest
     steps:
+      # Full clone: the release-notes step needs the push's before-commit
+      # (event.before) to compute the commit range.
       - uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
 
       # Node 26 + pnpm (via packageManager) per mise.toml. No `version`
       # input: the action defaults to the newest stable mise release at
@@ -62,3 +68,43 @@ jobs:
         # name: public by default, no --access flag needed. prepublishOnly
         # re-runs typecheck and tests as a final gate.
         run: npm publish
+
+      - name: Write release notes
+        env:
+          VERSION: ${{ steps.version.outputs.version }}
+        run: |
+          # One release per published build: a short pointer to the install
+          # instructions plus the commits in this push (event.before..
+          # GITHUB_SHA, read from the event payload JSON — GitHub's
+          # generate_release_notes only lists merged PRs, which is useless
+          # for a project that commits directly to main).
+          BEFORE=$(jq -r '.before // empty' "$GITHUB_EVENT_PATH")
+          # event.after == GITHUB_SHA for push events. A zero/missing
+          # `before` (branch-creating push) has no usable range: list the
+          # release commit alone.
+          if [ -z "$BEFORE" ] || [ "$BEFORE" = "0000000000000000000000000000000000000000" ]; then
+            RANGE="${GITHUB_SHA}~1..${GITHUB_SHA}"
+          else
+            RANGE="${BEFORE}..${GITHUB_SHA}"
+          fi
+          {
+            echo "opencode-ahp \`${VERSION}\` — AHP 1.0.0 host for opencode v2, published to npm."
+            echo
+            echo "**Install** ([README — Install](${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}/blob/main/README.md#install)):"
+            echo
+            echo '```bash'
+            echo "opencode plugin add opencode-ahp"
+            echo '```'
+            echo
+            echo "or pin this build: \`opencode plugin add opencode-ahp@${VERSION}\`"
+            echo
+            echo "## Commits"
+            git log --no-merges --pretty=format:"- [%h](${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}/commit/%H) %s (%an)" "$RANGE"
+            echo
+          } > release-notes.md
+
+      - name: Create release
+        uses: softprops/action-gh-release@v3
+        with:
+          tag_name: v${{ steps.version.outputs.version }}
+          body_path: release-notes.md

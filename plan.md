@@ -646,18 +646,27 @@ Push to `main`; publishes must land in commit order, so
 a running publish — a stale build finishing after a newer one must not win
 the `latest` tag).
 
-- `permissions: { id-token: write, contents: read }` — **npm trusted
+- `permissions: { id-token: write, contents: write }` — **npm trusted
   publishing (OIDC)**: the npm CLI exchanges the OIDC token GitHub mints
   for this specific run of this specific workflow file for a short-lived
   publish credential — no npm token or repo secret stored anywhere.
-- Steps: checkout → `jdx/mise-action@v5` → install → typecheck → test →
-  **compute version** (base `major.minor` from `package.json` +
-  `GITHUB_RUN_NUMBER`, e.g. base `0.1.0` + run 7 → `0.1.7`; failed runs
-  consume a number, so the sequence may have gaps — each published version
-  is unique either way) → `pnpm version <v> --no-git-tag-version` →
-  **`npm publish`** (the *npm* CLI — not pnpm — detects the OIDC
-  environment and performs the token exchange; unscoped name is public by
-  default; `prepublishOnly` re-runs typecheck + tests as a final gate).
+  `contents: write` backs the per-build GitHub release.
+- Steps: **full-clone** checkout (`fetch-depth: 0` — the release-notes step
+  resolves the push's `event.before` commit) → `jdx/mise-action@v5` →
+  install → typecheck → test → **compute version** (base `major.minor`
+  from `package.json` + `GITHUB_RUN_NUMBER`, e.g. base `0.1.0` + run 7 →
+  `0.1.7`; failed runs consume a number, so the sequence may have gaps —
+  each published version is unique either way) →
+  `pnpm version <v> --no-git-tag-version` → **`npm publish`** (the *npm*
+  CLI — not pnpm — detects the OIDC environment and performs the token
+  exchange; unscoped name is public by default; `prepublishOnly` re-runs
+  typecheck + tests as a final gate) → **write release notes** (short
+  pointer to the README install instructions + `opencode plugin add
+  opencode-ahp@<v>` pin + the commits in `event.before..GITHUB_SHA` —
+  GitHub's `generate_release_notes` only lists merged PRs, which is useless
+  for a project that commits directly to main) → **create release**
+  (`softprops/action-gh-release@v3`, tag `v<v>`; creates the tag when
+  missing, updates the release when the tag exists).
 
 **One-time trusted-publisher setup** (house pattern):
 
