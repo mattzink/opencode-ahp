@@ -584,7 +584,7 @@ tests; `pnpm test` = `vitest run`. Toolchain (node 26 + pnpm) from
 `pnpm install --frozen-lockfile`, then typecheck + vitest on push/PR
 (§10).
 
-### 9.3 Conformance (Phase 3)
+### 9.3 Conformance (Phase 5 — last phase)
 
 The official AHP conformance fixtures
 (`microsoft/agent-host-protocol` → `types/test-cases`) run against our
@@ -625,7 +625,7 @@ host over WebSocket. Exit criterion: green for every capability in
     diffs appear; `discard-changes` works.
 
 **Exit criteria:** MVP = items 1–11 (Phase 1); parity = item 12
-(Phase 2); §9.3 conformance green = Phase 3.
+(Phase 2); §9.3 conformance green = Phase 5 (last phase).
 
 ---
 
@@ -815,13 +815,26 @@ once). 208/208 tests green, typecheck clean. Findings in §14.10.
 Remaining: user commit/push → CI publish; flip the LAN host config back
 to the npm spec and re-verify.
 
-### Phase 3 — Conformance & transport (carved out of Phase 2, 2026-11-08)
+### Phase 3 — Transport (wss://) (carved out of Phase 2, 2026-11-08)
 
-- **Run the official conformance suite** (§9.3) and fix gaps.
-- Native `wss://` termination (only needed for off-LAN transports — D3).
+- Native `wss://` termination via `Bun.serve` TLS — the `tls:
+  { keyPath, certPath }` option (R4/D3: only needed for off-LAN
+  transports). Token enforcement and the Origin policy are unchanged
+  (the upgrade handler runs inside the same `fetch` path).
 
-**Exit criteria:** conformance green for all advertised capabilities; a
-`wss://` endpoint usable for an off-LAN transport.
+**Exit criteria:** a `wss://` endpoint usable for an off-LAN transport —
+live-verified: TLS termination + full AHP lifecycle + reconnect over
+wss.
+
+**Status (2026-11-08): exit criteria MET, live-verified** (LAN host
+10.0.1.107:8767, self-signed test cert). `tls: { keyPath, certPath }` →
+`Bun.serve` TLS termination: the port becomes TLS-only (plain-HTTP
+requests fail), `curl -k https://…/healthz` → `ok`, and both live probes
+pass over `wss://` — `scripts/ahp-phase2.mjs` (full changeset lifecycle +
+mid-turn reconnect → replay, all 30 checks) and the Phase 1 regression
+probe. Token/Origin enforcement unchanged (same `fetch`/upgrade path).
+209/209 tests green, typecheck clean. Findings in §14.11. Remaining:
+user commit/push → CI publish.
 
 ### Phase 4 — Extensions
 
@@ -830,6 +843,16 @@ to the npm spec and re-verify.
 - Elicitation completion; terminal channel (if opencode ever exposes a PTY
   surface).
 - Automations / AHP 1.1 features once they stabilize.
+
+### Phase 5 — Conformance (last phase, carved out of Phase 3, 2026-11-08)
+
+- **Run the official conformance suite** (§9.3) and fix gaps.
+- Deliberately last: the suite runs after the extensions land, so it
+  validates the full advertised capability surface (and any capability
+  flipped on by Phase 4).
+
+**Exit criteria:** conformance green for all advertised capabilities
+(§9.3).
 
 ### Overall definition of done
 
@@ -1543,6 +1566,68 @@ suites incl. a `driveTurn` before-capture race fixed with a
 before any pump microtask, so the disk mutation to the AFTER content
 must be ordered *after* the awaited before-capture via the captured
 event's `chat/usage` action).
+
+---
+
+### 14.11 Phase 3 transport findings — native wss:// (2026-11-08)
+
+**`Bun.serve` TLS takes contents, not paths** (verified against the
+official Bun docs — `oven-sh/bun`, `docs/runtime/http/tls.mdx`):
+`Bun.serve({ tls: { key, cert } })` requires *both* fields; `key`/
+`cert` each accept `string | Buffer | BunFile | array of those` and are
+the **PEM contents**. (The pre-Phase 3 transport code passed the
+`keyPath`/`certPath` *strings* as the contents — a latent bug; the
+`tls` option parsed fine in `options.ts` but would have failed at
+bind time.) Fix: the transport's `ListenerOptions.tls` is now
+`{ key: string; cert: string }` (contents, passed through verbatim);
+`src/index.ts` reads the `keyPath`/`certPath` files (`node:fs/promises`)
+before binding, so a missing/unreadable file fails in the plugin
+entry's try/catch → R2 degrade (AHP off, opencode stays up) with the
+filesystem error in the log, never a mid-handshake TLS crash. The
+transport stays filesystem-free, so its unit test asserts the pass-
+through with a **stubbed `Bun.serve` on `globalThis`** (the module
+already reads `Bun` from there — no `@types/bun` dependency).
+
+**Port semantics with `tls` set.** The single `Bun.serve` listener is
+TLS-terminated, so the port is **TLS-only**: plain-HTTP requests to it
+fail the handshake (verified: `curl http://…/healthz` → connection
+error, `curl -k https://…/healthz` → `ok [200]`). The health endpoint
+is *the same* route in the same `fetch` handler — it simply rides the
+TLS termination; there is no second plain-HTTP listener. The listener
+log line already emits `wss://` when `tls` is set.
+
+**Auth is transport-agnostic.** Token (`?token=` / Bearer) and Origin
+enforcement happen in the `fetch` handler before `server.upgrade`,
+which runs identically over TLS — nothing in the handshake or the AHP
+surface changes. (R4: a non-loopback bind still requires a token; the
+TLS option adds nothing to that rule.)
+
+**Live verification (2026-11-08, LAN host 10.0.1.107:8767).**
+Self-signed test cert (`openssl req -x509 -newkey rsa:2048 -nodes`,
+`/tmp/opencode/ahp-scratch/ahp-tls/`, CN=ahp-lan-test):
+
+- `https://127.0.0.1:8767/healthz` → `ok [200]`; plain HTTP on the same
+  port fails (TLS-only confirmed).
+- `scripts/ahp-phase2.mjs --base https://127.0.0.1:8767` → **all 30
+  checks pass** over `wss://`: initialize, catalogues, the full
+  changeset lifecycle (contentChanged with live/HEAD/snap refs,
+  resourceRead all ref kinds + error codes, discard running→idle with
+  the file restored from HEAD) and the mid-turn drop → **replay**
+  (turn 2 completed during the gap, `turnComplete` via replay, exactly
+  one turn). Node's client-side cert verification is bypassed for the
+  self-signed cert via `NODE_TLS_REJECT_UNAUTHORIZED=0` — a real
+  off-LAN deployment uses a CA-trusted cert (mkcert / any client-
+  trusted CA); VS Code's Agents window performs normal certificate
+  verification.
+- `scripts/ahp-phase1.mjs --base https://127.0.0.1:8767` → regression
+  green (agent picker + full turn lifecycle over wss).
+- Config flip back to `ws://` (drop the `tls` key) + location reload →
+  plain `healthz` green again; the option is purely per-location
+  config.
+
+**Test status:** `pnpm typecheck` clean; `pnpm test` 209/209 green
+(208 + 1 new: the stubbed-`Bun.serve` TLS pass-through in
+`transport.test.ts`).
 
 ---
 

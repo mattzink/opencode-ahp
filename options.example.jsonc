@@ -28,8 +28,10 @@
   // ["vscode://vscode"]. The token is always required regardless (R5).
   // "allowedOrigins": "*",
 
-  // Native TLS via Bun.serve → wss:// (post-MVP; only needed for off-LAN
-  // transports, D3). Paths to a key and a cert file.
+  // Native TLS termination via Bun.serve → wss:// (off-LAN transports,
+  // D3). Paths to the PEM key and certificate files; with this set the
+  // port is TLS-only (health endpoint → `curl -k https://…/healthz`).
+  // The cert must be trusted by client machines for the URL hostname.
   // "tls": { "keyPath": "/path/key.pem", "certPath": "/path/cert.pem" },
 
   // Plain-HTTP health endpoint (no auth).

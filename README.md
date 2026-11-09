@@ -4,12 +4,13 @@ OpenCode v2 plugin that hosts the **Agent Host Protocol (AHP) 1.0.0**
 in-process so opencode is a native agent in the **VS Code Agents window** —
 on this machine and (MVP scope) on other machines over the local LAN.
 
-> **Status: Phase 2 — parity complete.** Sessions, model + agent pickers,
-> streaming, tool calls, permission prompts, steering/queue, usage,
-> **changesets (uncommitted / session / per-turn diffs with
-> `discard-changes`)**, and reconnect replay are live-verified over the
-> LAN with VS Code 1.145.2 (real Agents window ↔ host). The full plan and
-> wire findings live in [`plan.md`](plan.md).
+> **Status: Phase 3 — wss:// transport complete.** Sessions, model +
+> agent pickers, streaming, tool calls, permission prompts,
+> steering/queue, usage, **changesets (uncommitted / session / per-turn
+> diffs with `discard-changes`)**, and reconnect replay are
+> live-verified over the LAN with VS Code 1.145.2 (real Agents window ↔
+> host), over plain `ws://` **and native `wss://`** (TLS-terminated).
+> The full plan and wire findings live in [`plan.md`](plan.md).
 
 ## What you get
 
@@ -37,8 +38,9 @@ In the Agents window, an `opencode` host with:
   directory to be a git repository (otherwise the changesets are empty);
   opt out with `capabilities.changesets: false`.
 
-Not yet (Phase 3+): native `wss://` TLS (off-LAN transports), cancelling
-a queued message, the `always` permission reply.
+Not yet: cancelling a queued message and the `always` permission reply
+(Phase 4 extensions); official conformance-suite coverage (Phase 5,
+last — after the extensions land).
 
 ## Requirements
 
@@ -91,8 +93,8 @@ sibling of `src/index.ts` (checkouts only — copy
 | `path` | `"/ahp"` | WS path — VS Code's URL carries it verbatim |
 | `token` | auto | Omit → generated on first start, persisted in opencode's plugin storage, printed once to the service log. Accepted via the `?token=` query param and `Authorization: Bearer <token>`. **Always enforced**, loopback or not |
 | `allowedOrigins` | `"*"` | `"*"` or an exact list, e.g. `["vscode://vscode"]`. The token is still always required regardless |
-| `tls` | `null` | `{ keyPath, certPath }` — native TLS → `wss://` (post-MVP; only needed for off-LAN transports) |
-| `healthPath` | `"/healthz"` | Plain-HTTP health endpoint (no auth): `curl …:8765/healthz` → `ok` |
+| `tls` | `null` | `{ keyPath, certPath }` — native TLS termination → `wss://` (off-LAN transports, D3). PEM **file paths**; the port becomes TLS-only (plain-HTTP requests to it fail) and the health endpoint is then HTTPS: `curl -k https://…:8765/healthz`. A missing/unreadable file disables the AHP listener — the opencode server keeps running |
+| `healthPath` | `"/healthz"` | Health endpoint (no auth): `curl …:8765/healthz` → `ok` (over the same TLS termination when `tls` is set) |
 | `keepAlive` | `true` | Keep the opencode location loaded against its idle timeout (`experimental.location_idle_timeout`, default 60 min) by periodically touching an internal anchor session — with this on, **no `location_idle_timeout` config entry is needed**. The anchor (`opencode-ahp (keep-alive)`) is a real opencode session: it shows in the TUI session list but is hidden from AHP clients (opencode's plugin surface cannot archive it) |
 | `keepAliveIntervalMinutes` | `10` | Minutes between keep-alive touches; keep well below the effective idle timeout |
 | `replayWindow` | `1000` | Per-channel actions kept for reconnect replay; older gaps → fresh snapshot |
@@ -172,6 +174,33 @@ Note: the Agents window's built-in **SSH** and **Dev tunnels** flows run
 For a third-party host, only raw network reachability of the `ws(s)://`
 URL matters.
 
+### Off-LAN: native `wss://` (Phase 3)
+
+When plain LAN `ws://` doesn't fit (host on another network, or
+token-in-URL on a shared network you don't want), set `tls` and the same
+listener serves `wss://` — native termination in `Bun.serve`, no proxy in
+the middle:
+
+```jsonc
+"options": {
+  "host": "0.0.0.0",
+  "token": "change-me-to-a-long-random-string",
+  "tls": {
+    "keyPath": "/path/tls-key.pem",
+    "certPath": "/path/tls-cert.pem"
+  }
+}
+```
+
+The client URL becomes `wss://<host>:8767/ahp?token=<token>` and the
+token/Origin policy is unchanged. The certificate must be trusted by the
+client machine for the URL's hostname: VS Code expects a real chain
+(mkcert on a dev network, or any CA the client trusts); self-signed
+certs only work for script-based checks
+(`NODE_TLS_REJECT_UNAUTHORIZED=0`). With `tls` set the port is
+**TLS-only** — plain-HTTP requests to it fail, and the health check
+becomes `curl -k https://<host>:<port>/healthz` → `ok`.
+
 ## Development
 
 ```sh
@@ -187,6 +216,10 @@ Dependency-free live probes (Node ≥ 20 global WebSocket):
 node scripts/ahp-client.mjs --token <token> [--base http://127.0.0.1:8765]
 # Phase 1 end-to-end: createSession → agent-picker snapshot → full turn lifecycle
 node scripts/ahp-phase1.mjs --token <token> --base http://127.0.0.1:8765 --provider opencode
+# Phase 2 end-to-end: changesets (edit → diffs → discard) + mid-turn reconnect/replay
+node scripts/ahp-phase2.mjs --token <token> --base http://127.0.0.1:8765
+# the same probes over native wss:// (self-signed test cert):
+NODE_TLS_REJECT_UNAUTHORIZED=0 node scripts/ahp-phase2.mjs --token <token> --base https://127.0.0.1:8765
 ```
 
 ## Publishing

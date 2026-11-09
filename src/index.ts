@@ -492,6 +492,16 @@ export default Plugin.define({
         },
         log: (msg) => console.warn(`${TAG} ${msg}`),
       });
+      // TLS material (Phase 3): read the key/cert files here so a
+      // missing/unreadable file fails before binding and takes the R2
+      // degrade path below — the transport itself stays
+      // filesystem-free (it receives the PEM contents).
+      const tls = opts.tls
+        ? {
+            key: await fsReadFile(opts.tls.keyPath, "utf8"),
+            cert: await fsReadFile(opts.tls.certPath, "utf8"),
+          }
+        : null;
       listener = createListener(
         {
           host: opts.host,
@@ -500,7 +510,7 @@ export default Plugin.define({
           healthPath: opts.healthPath,
           token,
           allowedOrigins: opts.allowedOrigins,
-          tls: opts.tls,
+          tls,
         },
         {
           onOpen: (info) => host.onOpen(info.id),

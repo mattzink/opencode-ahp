@@ -135,4 +135,46 @@ describe("createListener", () => {
       createListener({ host: "0.0.0.0", port: 1, path: "/ahp", healthPath: "/healthz", token: "x", allowedOrigins: "*" }, noop),
     ).toThrow(/Bun\.serve/);
   });
+
+  it("passes the PEM contents to Bun.serve when tls is set, and omits tls otherwise (Phase 3)", () => {
+    // The transport reads Bun from globalThis (no @types/bun dependency),
+    // so a stubbed serve() is enough to observe the options it receives —
+    // no network, no disk.
+    interface Served {
+      tls?: { key: string; cert: string };
+    }
+    const seen: Served[] = [];
+    const fakeBun = {
+      serve: (options: Served) => {
+        seen.push(options);
+        return { port: 1, stop: () => {}, upgrade: () => ({ success: true }) };
+      },
+    };
+    const g = globalThis as { Bun?: unknown };
+    const prev = g.Bun;
+    g.Bun = fakeBun;
+    try {
+      createListener(
+        {
+          host: "127.0.0.1",
+          port: 1,
+          path: "/ahp",
+          healthPath: "/healthz",
+          token: "t",
+          allowedOrigins: "*",
+          tls: { key: "KEY-PEM", cert: "CERT-PEM" },
+        },
+        noop,
+      );
+      createListener(
+        { host: "127.0.0.1", port: 1, path: "/ahp", healthPath: "/healthz", token: "t", allowedOrigins: "*" },
+        noop,
+      );
+    } finally {
+      g.Bun = prev;
+    }
+    const [withTls, withoutTls] = seen;
+    expect(withTls?.tls).toEqual({ key: "KEY-PEM", cert: "CERT-PEM" });
+    expect("tls" in (withoutTls ?? {})).toBe(false);
+  });
 });

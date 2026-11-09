@@ -104,7 +104,14 @@ export interface ListenerOptions {
   /** When null, a non-loopback bind refuses to start (R4). */
   token: string | null;
   allowedOrigins: string[] | "*";
-  tls?: { keyPath: string; certPath: string } | null;
+  /**
+   * Native TLS termination → `wss://` (off-LAN transports, D3). The PEM
+   * **contents** of the key and certificate — not paths: `Bun.serve`'s
+   * `tls.key`/`tls.cert` take contents (string/Buffer/BunFile), and the
+   * plugin entry reads the files (the transport stays filesystem-free so
+   * its unit tests never touch the disk).
+   */
+  tls?: { key: string; cert: string } | null;
 }
 
 /** Transport-local connection identity. */
@@ -198,7 +205,7 @@ export function createListener(opts: ListenerOptions, callbacks: TransportCallba
   const server = bun.serve({
     hostname: opts.host,
     port: opts.port,
-    ...(opts.tls ? { tls: { key: opts.tls.keyPath, cert: opts.tls.certPath } } : {}),
+    ...(opts.tls ? { tls: { key: opts.tls.key, cert: opts.tls.cert } } : {}),
     fetch(req, srv) {
       const url = new URL(req.url);
       switch (routePath(url, { ahp: opts.path, health: opts.healthPath })) {
