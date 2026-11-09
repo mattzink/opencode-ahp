@@ -223,7 +223,46 @@ export interface OpencodeFacade {
    * (fallback delete), untracked → delete.
    */
   discardFile(absPath: string): Promise<void>;
+  // ── Phase 4 extension 1: client-provided tools ─────────────────────────
+  /**
+   * Replace the location's registered client tools with `tools` (the
+   * cross-session union of every AHP session's active-client tools;
+   * `[]` when none). The implementation applies them to the opencode
+   * tool registry (`ctx.tool.transform` + `ctx.tool.reload`) — the
+   * registered tools' `execute` routes back to the host (plan §14.12).
+   */
+  syncClientTools(tools: readonly FacadeClientTool[]): Promise<void>;
 }
+
+/**
+ * A client-provided tool in its opencode-registration form (the host
+ * derives it from the AHP `ToolDefinition`s — `inputSchema` already
+ * normalized to an object JSON Schema, `description` already defaulted).
+ */
+export interface FacadeClientTool {
+  name: string;
+  description: string;
+  /** Object JSON Schema for the tool input (raw — opencode passes it through). */
+  inputSchema: Record<string, unknown>;
+}
+
+/**
+ * The settled result of a client-executed tool call, as the opencode
+ * `execute` bridge consumes it: `ok` → a `Tool.Result` (the client's
+ * `toolCallComplete` content, text blocks joined), not-ok → a thrown
+ * `Tool.Error`.
+ */
+export type FacadeClientToolResult =
+  | {
+      ok: true;
+      /** The client's past-tense message (`ToolCallResult.pastTenseMessage`). */
+      pastTenseMessage: string;
+      /** The client's text content blocks, joined (absent when none). */
+      content?: string;
+      /** The client's structured content, verbatim. */
+      structuredContent?: Record<string, unknown>;
+    }
+  | { ok: false; error: string };
 
 /**
  * One entry of a VCS working-tree diff (the facade's shape — absolute

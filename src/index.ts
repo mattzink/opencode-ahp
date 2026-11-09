@@ -53,11 +53,25 @@ import { errorMessage } from "./error.js";
 import {
   mapV2Event,
   type FacadeAgent,
+  type FacadeClientTool,
   type FacadeModel,
   type FacadeModelRef,
   type FacadeSession,
   type OpencodeFacade,
 } from "./bridge.js";
+import { normalizedName } from "./client-tools.js";
+/**
+ * The opencode tool surface for client-provided tools (Phase 4
+ * extension 1, plan §14.12). `ToolError` is the schema `Error` class
+ * (thrown from the `execute` bridge); `ToolInfo` is the promise-flavored
+ * tool registration; `ToolContext` carries the tool-call context
+ * (sessionID, the tool-call `id`, the abort `signal`).
+ */
+import {
+  Error as ToolError,
+  type Info as ToolInfo,
+  type ToolContext,
+} from "@opencode/plugin/promise/tool";
 
 const TAG = "[opencode-ahp]";
 
@@ -203,9 +217,24 @@ function isEnoent(err: unknown): boolean {
  * (by ID), `get` (null = not found), and the event stream (by
  * `data.sessionID` — covers `session.created` and anything a future bridge
  * version may map).
+ *
+ * `hostRef` (Phase 4 extension 1, plan §14.12): the client-tool
+ * `execute` bridge needs the host, but the facade is constructed as part
+ * of the host's own options — a mutable holder assigned right after
+ * `new Host(...)` returns (the `listener` closure pattern).
  */
-function implementFacade(ctx: Context, hiddenSessionID: string | null): OpencodeFacade {
+type HostRef = { current: Host | null };
+
+function implementFacade(ctx: Context, hiddenSessionID: string | null, hostRef: HostRef): OpencodeFacade {
   const locationDir = ctx.location.directory;
+
+  // Phase 4 extension 1: the cross-session client-tool set (plan §14.12).
+  // The single `ctx.tool.transform` registration is applied on every
+  // registry rebuild (opencode rebuilds from scratch, re-running all
+  // transforms over a fresh base — verified in core `State.create`), so
+  // the sync is: replace the set, (register the transform once), reload.
+  let clientTools: FacadeClientTool[] = [];
+  let clientToolsTransformRegistered = false;
 
   const readTextFile = async (absPath: string): Promise<string | null> => {
     try {
@@ -404,6 +433,67 @@ function implementFacade(ctx: Context, hiddenSessionID: string | null): Opencode
         await removeFile(absPath); // in the index but not in HEAD → delete
       }
     },
+    // ── Phase 4 extension 1: client-provided tools (plan §14.12) ───────
+    async syncClientTools(tools: readonly FacadeClientTool[]) {
+      clientTools = [...tools];
+      if (!clientToolsTransformRegistered) {
+        clientToolsTransformRegistered = true;
+        // Registered once for the location lifetime (scoped: disposed on
+        // location teardown). The callback is synchronous and reads the
+        // closure `clientTools` at rebuild time; each rebuild is a fresh
+        // registry, so only (re-)adding the current set is needed.
+        await ctx.tool.transform((editor) => {
+          const added = new Set<string>();
+          for (const tool of clientTools) {
+            const id = normalizedName(tool.name);
+            if (added.has(id)) continue; // normalized-name collision → first wins
+            added.add(id);
+            editor.add({
+              name: tool.name,
+              // The AHP `inputSchema` is a raw object JSON Schema —
+              // opencode's `inputJsonSchema` passes it through verbatim
+              // and validates model inputs against it (plan §14.12).
+              input: tool.inputSchema,
+              description: tool.description,
+              // A client tool must be a DIRECT tool: under Code Mode a
+              // tool in the `execute` catalog is invoked as nested JS
+              // (`tools.ping(...)`) that emits no tool events of its own
+              // (only the outer `execute` call does), so the host could
+              // never see the call to track + relay to the client.
+              // `codemode: false` keeps it out of the catalog and in
+              // the direct list (plan §14.12, live finding 2026-11-08).
+              options: { codemode: false },
+              execute: async (_input: unknown, context: ToolContext) => {
+                const host = hostRef.current;
+                if (host === null) {
+                  throw new ToolError({ message: "the AHP host is not running" });
+                }
+                const result = await host.executeClientTool({
+                  sessionID: String(context.sessionID),
+                  toolCallId: String(context.id),
+                  name: tool.name,
+                  signal: context.signal,
+                });
+                if (!result.ok) throw new ToolError({ message: result.error });
+                const text = [result.pastTenseMessage, result.content]
+                  .filter((part): part is string => typeof part === "string" && part.length > 0)
+                  .join("\n\n");
+                return {
+                  ...(text.length > 0 ? { content: text } : {}),
+                  // No `output` (no output schema is declared — the
+                  // runtime rejects one); structured content rides in
+                  // the tool part's metadata.
+                  ...(result.structuredContent !== undefined
+                    ? { metadata: { structured: result.structuredContent } }
+                    : {}),
+                };
+              },
+            } as unknown as ToolInfo);
+          }
+        });
+      }
+      await ctx.tool.reload();
+    },
   };
 }
 
@@ -477,10 +567,14 @@ export default Plugin.define({
     // constructed (the listener's socket ids are the host's socket ids).
     let listener: Listener | null = null;
     let cleanupHost: (() => void) | null = null;
+    // Phase 4 extension 1: the host back-reference for the client-tool
+    // `execute` bridge (the facade is built from the host's options, so
+    // the reference lands one statement later — the `listener` pattern).
+    const hostRef: HostRef = { current: null };
     try {
       const host = new Host({
         serverInfo: { name: "opencode-ahp", version: pluginVersion(), title: "OpenCode" },
-        facade: implementFacade(ctx, hiddenSessionID),
+        facade: implementFacade(ctx, hiddenSessionID, hostRef),
         replayWindow: opts.replayWindow,
         defaultDirectory: ctx.location.directory,
         changesets: opts.capabilities.changesets,
@@ -492,6 +586,7 @@ export default Plugin.define({
         },
         log: (msg) => console.warn(`${TAG} ${msg}`),
       });
+      hostRef.current = host; // the client-tool execute bridge can route now
       // TLS material (Phase 3): read the key/cert files here so a
       // missing/unreadable file fails before binding and takes the R2
       // degrade path below — the transport itself stays

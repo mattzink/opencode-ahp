@@ -844,6 +844,25 @@ user commit/push → CI publish.
   surface).
 - Automations / AHP 1.1 features once they stabilize.
 
+**Status (2026-11-08): extension 1 (client-provided tools) done,
+live-verified** (`scripts/ahp-client-tools.mjs` against the LAN host,
+provider `opencode`). Three turns: a direct happy path (the model calls
+the client `ping` by name, the start carries the client contributor, the
+execution request leaves the session in progress — status 33 — and the
+client's result lands in the snapshot), a client failure result
+(`success: false` + error text), and the full
+`requiresResultConfirmation` cycle (the confirmation request *replaces*
+the execution request under the same id, session 33 → 56 while the
+result awaits approval, approval → 40, held content in the snapshot).
+Disconnect eviction live-verified mid-confirmation: the in-flight call
+settles with a disconnect error, the stale session input request is
+cleared, the model replies, and the turn completes. 232/232 tests
+green, typecheck clean. Findings in §14.12 (the `codemode: false`
+registration gotcha, the upsert/`awaitsUser` session-reducer
+semantics, and the eviction state-hygiene fix). Remaining: user
+commit/push → CI publish; extensions 2–4 (multi-chat,
+elicitation/terminal, automations / AHP 1.1).
+
 ### Phase 5 — Conformance (last phase, carved out of Phase 3, 2026-11-08)
 
 - **Run the official conformance suite** (§9.3) and fix gaps.
@@ -1628,6 +1647,184 @@ Self-signed test cert (`openssl req -x509 -newkey rsa:2048 -nodes`,
 **Test status:** `pnpm typecheck` clean; `pnpm test` 209/209 green
 (208 + 1 new: the stubbed-`Bun.serve` TLS pass-through in
 `transport.test.ts`).
+
+### 14.12 Phase 4 extension 1 — client-provided tools (2026-11-08)
+
+**Wire contract (verified against the installed AHP 1.0.0 dist).** Client
+tools are registered per session by the client — via the
+`createSession` `activeClient` param (already handled: seeds
+`activeClients`) or `session/activeClientSet` (upsert by `clientId`,
+official session reducer L214). `SessionActiveClient.tools` is
+`ToolDefinition[]` = `{ name, title?, description?, inputSchema?,
+outputSchema?, annotations?, _meta? }` — the `inputSchema` is an MCP-style
+JSON Schema (`{ type: "object", properties?, required? }`), *optional* on
+the wire (a client may omit it). There is **no capability gate**:
+`InitializeResult` (1.0.0) carries no client-tools field (only `_meta`
+for non-standard extensions), so nothing is advertised in `initialize`.
+
+The execution flow and its reducer transitions
+(`types/channels-chat/reducer.js`):
+
+- `chat/toolCallStart` — the client `contributor`
+  (`{ kind: "client", clientId }`) **must be set at start**:
+  `refineToolCallContributor` (L32–48) ignores a late client contributor —
+  "client execution ownership must be established at tool call start".
+  So the pump injects it at `tool.input.started`.
+- `chat/toolCallReady` with `confirmed: "not-needed"` → `running` (client
+  tools clear the confirmation gate up front — the
+  `SessionToolClientExecutionRequest` docs: "the call has already cleared
+  its confirmation gate").
+- The owning client executes, optionally streams
+  `chat/toolCallContentChanged` (`@clientDispatchable`; the reducer
+  *replaces* the running `content`; "the server SHOULD reject this action
+  if the dispatching client does not match the contributor's `clientId`"),
+  then dispatches `chat/toolCallComplete` (`@clientDispatchable`,
+  `result: ToolCallResult`, optional `requiresResultConfirmation` — the
+  *client* decides at completion time, not the `ToolDefinition`).
+- `complete` from `running`: → `completed`, or →
+  `pending-result-confirmation` (the result is preserved on the state)
+  when `requiresResultConfirmation`; then
+  `chat/toolCallResultConfirmed` (`@clientDispatchable`, `approved`) →
+  `completed` (result copied) / `cancelled` with reason `result-denied`.
+- Session level: `session/inputNeededSet` with
+  `SessionToolClientExecutionRequest { id, chat, kind: "toolClientExecution",
+  turnId, clientId, toolCall }`. Per the official session reducer
+  (`awaitsUser`, L26–33) this does **not** raise
+  `SessionStatus.InputNeeded` — the session stays `InProgress` while the
+  client runs. A `pending-result-confirmation` is surfaced as a
+  `SessionToolConfirmationRequest` (kind `toolConfirmation`), which
+  *does* raise `InputNeeded` (it is user-facing approval).
+  `inputNeededSet` **upserts by `request.id`** (the
+  `SessionInputNeededSet` case, L279: replace in place) — so the
+  confirmation path *replaces* the execution request under the same id
+  (the `toolCallId`) with no `inputNeededRemoved` in between, and
+  `inputNeededRemoved` (L288) is a no-op when the id is absent. Both
+  verified live by the probe (single request of kind `toolConfirmation`
+  after the upsert; removal safe on the eviction path).
+- Chat summary status is the official chat reducer's `summaryStatus`
+  (L98, via `hasBlockingToolCall`, L61, and the
+  `STATUS_ACTIVITY_MASK`, L92): blocking tool-call states (pending
+  confirmation / result-confirmation / auth-required) raise the chat's
+  `InputNeeded` activity bits with orthogonal flags preserved — the
+  `24`/`56` values seen in the probe logs are that mask arithmetic.
+  And the snapshot's tool-call wire field is `toolCallId`
+  (`ToolCallBase`, `state.d.ts` L1235), not `id`.
+- `ToolCallResult = { success, pastTenseMessage, content?,
+  structuredContent?, error? }`; `ToolCallStatus`: streaming /
+  pending-confirmation / running / auth-required /
+  pending-result-confirmation / completed / cancelled.
+- Spec: "the server SHOULD automatically remove an active client when
+  that client disconnects" (`SessionActiveClient` docs).
+
+**opencode tool surface (dev checkout + installed
+`@opencode/plugin` / `@opencode/schema` 2.2.6).**
+
+- `ctx.tool.transform(callback)` — `Transform<T> = (callback: (input: T) =>
+  void) => Promise<Registration>`; the callback is **synchronous** and
+  receives a `ToolEditor` (`list/get/namespace/add/update/remove`);
+  `ctx.tool.reload()` rebuilds; `add` keys by `effectiveName(tool)` (no
+  namespace → `normalizedName` = `name.replace(/[^a-zA-Z0-9_-]/g, "_")`);
+  invalid registrations are logged, not thrown.
+- `Tool.Info = { name, input: ValueSchema, description, execute, output?,
+  options? }`; `ValueSchema` accepts a **raw JSON Schema object** —
+  `inputJsonSchema` (core `tool/runtime.ts` L159–163) returns it verbatim
+  (no `~standard` / effect-Schema marker → pass-through), so an AHP
+  `inputSchema` maps straight onto it (absent → `{ type: "object" }`).
+- The plugin `execute` gets a `ToolContext` with `sessionID`, `id`
+  (the tool-call part id — the same id the `session.tool.input.started`
+  event carries; the join key for the host's waiter), `input`, and
+  `signal: AbortSignal`; it returns `Promise<Tool.Result>`
+  (`{ output?, content?: string | (text|file)[], metadata? }`) or throws
+  `Tool.Error({ message })`.
+- **Tool state is location-global** (core `Tool.Service`: one
+  `State.create` per location; `session/context.ts` L139 takes
+  `registry.snapshot(permissions)` per model request). Consequence:
+  client tools are visible to the model in *every* session of the
+  location (TUI included), not just the AHP session that registered
+  them. Per-session scoping is enforced at execution time: the
+  `execute` bridge routes through the host, which only resolves when the
+  calling session is an AHP session with an active client providing that
+  tool name — otherwise a `Tool.Error`.
+- **No opencode permission prompt for client tools**: the runner never
+  auto-asserts tool permission; opencode tools self-assert inside
+  `execute` (`read.ts`/`glob.ts`/`webfetch.ts`/…). Our `execute` never
+  asserts → no `permission.asked` → no `toolConfirmation` — the AHP
+  confirmation contract is satisfied by construction (the ready is
+  always `confirmed: "not-needed"`).
+- **Code Mode (live finding, 2026-11-08 — corrected):** `codemode` is on
+  by default, so a tool registered without `options` lands in the Code
+  Mode `execute` catalog, not the direct list (core `tool.ts` snapshot:
+  `direct = codeModeEnabled ? active.filter(codemode === false) : active`;
+  the catalog is `codemode !== false`). A catalog tool is invoked as
+  nested JS — the model calls the single `execute` tool with
+  `{ code: "await tools.ping({…})" }` — and **the inner call emits no
+  tool events of its own**: the raw capture (SSE `/api/event`, one
+  `tools.ping` turn) shows exactly five events, all under the *outer*
+  `execute` id (`input.started name=execute` → `input.ended
+  text={"code":…}` → `called` → `progress` → `success`); the inner
+  call id (`call_{messageID}_{n}`) never reaches the bus. Consequences
+  for client tools: (a) the host could never see the call to track +
+  relay (the `executeClientTool` guard rejects the untracked inner id —
+  the model's first live attempt failed exactly this way, with the
+  guard's error text surfacing as the `execute` result), and (b) a
+  `Tool.Error` thrown under Code Mode is masked — the runtime
+  converts it to text content of a *successful* `execute` result
+  (`tool.success`, `success: true`). Fix: register client tools with
+  `options: { codemode: false }` — excluded from the catalog, exposed
+  as a **direct** tool the model calls by name, which emits its own
+  `session.tool.*` events (the Phase 1/2 "inner name" belief was
+  unverified: those probes checked turn end + disk state, never the
+  tool name).
+- Tool events (`session.tool.input.started/ended/progress/success/failed`)
+  fire for plugin-registered tools exactly as for core tools (same
+  `Tool.Service` execution pipeline), so the existing pump join works
+  unchanged — the extension adds the contributor at start, the
+  ready+inputNeeded at `input.ended`, the waiter behind `execute`, three
+  client-dispatchable tool-action cases, and the disconnect eviction.
+
+**Disconnect eviction (self-healing).** On socket close the host
+publishes `session/activeClientRemoved` (server-side, no origin) for
+every session whose `activeClients` includes that client, settles that
+client's in-flight tool-call waiters with a failure (opencode's tool
+then fails → the pump's normal `tool.failed` path emits
+`chat/toolCallComplete` — the AHP state is still `running`, so the
+terminal suppression does not apply), **clears each settled call's
+session input request** (`session/inputNeededRemoved` for the
+`toolCallId` — no-op when already absent), and re-syncs the opencode
+tool union. The request clearing was a live finding: disconnecting
+while a `requiresResultConfirmation` result was held left the stale
+`toolConfirmation` request in `inputNeeded` with the session stuck in
+`InputNeeded` (status 56) after the call was already `cancelled` and
+the turn `complete` — it now unblocks on eviction. Safe against the
+official client: VS Code 1.145.2 re-dispatches `activeClientSet` on
+(re)subscribe — an autorun compares the snapshot `activeClients` to its
+local state and re-dispatches on mismatch
+(`vscode-baseAgentHostSessionsProvider.ts` L4280–4330, L5480–5530), so
+an evicted client restores its contribution on reconnect.
+
+**Accepted limitations (documented, Phase 4 scope).**
+
+- Location-global tool *definitions* (above): the model sees the
+  cross-session union (first-registered wins per name); execution always
+  routes to the calling session's own active client.
+- No host-side *parameter* confirmation for client tools (they clear the
+  gate at ready; any prompt is the client's own UI).
+- Client-tool file edits are captured by the uncommitted/session
+  changeset (git diff at turn end) but not by turn changesets (no
+  before-snapshot — the host cannot know which files the client's tool
+  will touch).
+
+**Module layout (house pattern).** `src/client-tools.ts` — pure wire
+validation (ToolDefinition normalization), the cross-session union, the
+per-session provider lookup, and the invocation/waiter record types.
+`bridge.ts` — `FacadeClientTool` / `FacadeClientToolResult` + the
+`OpencodeFacade.syncClientTools` method. `host.ts` — contributor
+injection in the pump, ready+inputNeeded at `input.ended`,
+`executeClientTool` + per-session waiters, the three
+client-dispatchable tool-action cases, `onClose` eviction, union
+re-sync on every active-client change. `index.ts` — the
+`ctx.tool.transform` registration (the host back-reference assigned
+immediately after host construction, the `listener` closure pattern).
 
 ---
 

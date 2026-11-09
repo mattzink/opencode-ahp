@@ -29,6 +29,14 @@ In the Agents window, an `opencode` host with:
   (started → ready → confirmed → complete), and usage totals.
 - **Permissions** — opencode's `permission.asked` becomes an in-window
   approval prompt; approve runs the tool, deny blocks it.
+- **Client tools** — a client can register its own tools per session
+  (`createSession` or `session/activeClientSet`): the model calls them
+  directly, the host delegates execution to the owning client
+  (`toolClientExecution` request — the session stays in progress while the
+  client runs), and the client's result flows back into the turn, including
+  `requiresResultConfirmation` approval. Client tools bypass opencode's
+  permission prompt; only the client that provided the tool may execute it
+  or confirm its result.
 - **Steering + queue** — a message sent mid-turn steers the active turn or
   queues for the next one (AHP `pendingMessageSet`).
 - **Changesets** — per-session diff channels (uncommitted, session, and

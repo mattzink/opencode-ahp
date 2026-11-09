@@ -48,6 +48,7 @@ import {
   SessionInputRequestKind,
   SessionStatus,
   ToolCallConfirmationReason,
+  ToolCallContributorKind,
   ToolCallStatus,
   ToolResultContentType,
   isClientDispatchable,
@@ -56,7 +57,10 @@ import {
   type ChatAction,
   type ChatSummary,
   type ChatState,
+  type ChatToolCallCompleteAction,
   type ChatToolCallConfirmedAction,
+  type ChatToolCallContentChangedAction,
+  type ChatToolCallResultConfirmedAction,
   type ChatTurnCancelledAction,
   type ChatTurnStartedAction,
   type ChangesetAction,
@@ -70,10 +74,13 @@ import {
   type SessionActiveClient,
   type SessionState,
   type SessionSummary,
+  type SessionToolClientExecutionRequest,
   type SessionToolConfirmationRequest,
   type Snapshot,
   type StateAction,
+  type StringOrMarkdown,
   type ToolCallConfirmationState,
+  type ToolCallResult,
   type ToolCallState,
   type ToolDefinition,
   type ToolResultContent,
@@ -98,12 +105,22 @@ import {
   pastTenseMessageFor,
   sessionChangesetCatalog,
   userMessage,
+  type FacadeClientTool,
+  type FacadeClientToolResult,
   type FacadeDelivery,
   type FacadeEvent,
   type FacadeModelRef,
   type FacadeSession,
   type OpencodeFacade,
 } from "./bridge.js";
+import {
+  descriptionFor,
+  findProvider,
+  inputSchemaFor,
+  normalizeToolDefinitions,
+  toolUnion,
+  type ClientToolInvocation,
+} from "./client-tools.js";
 import {
   ChannelRegistry,
   ROOT_CHANNEL,
@@ -204,6 +221,12 @@ interface SessionRecord {
   permissionForTool: Map<string, string>;
   /** opencode permission request id → toolCallId. */
   toolForPermission: Map<string, string>;
+  /**
+   * Phase 4 extension 1: toolCallId → client-executed tool call tracking
+   * (created at `tool.input.started`, removed at the opencode-side
+   * terminal — plan §14.12).
+   */
+  clientToolCalls: Map<string, ClientToolInvocation>;
   /** The most recent `session.inbox.enqueued` (external/TUI prompt tracking). */
   lastInbox: { text: string; delivery: string } | null;
   // ── Phase 2: changesets ────────────────────────────────────────────────
@@ -327,12 +350,52 @@ export class Host {
     if (socket?.clientId) {
       const record = this.clients.get(socket.clientId);
       if (record && record.socketId === socketId) record.socketId = null;
+      // Phase 4 extension 1: the spec says the server SHOULD remove an
+      // active client when it disconnects (plan §14.12). Safe: the
+      // official client re-dispatches `activeClientSet` on re-subscribe.
+      this.evictActiveClient(socket.clientId);
     }
     this.channels.removeSocket(socketId);
     this.sockets.delete(socketId);
-    // MVP gap: active clients are not evicted on disconnect (the spec
-    // expects eviction without a timely reconnect); they refresh via
-    // `session/activeClientSet` on the next turn/dispatch.
+  }
+
+  /**
+   * Phase 4 extension 1: evict a disconnected client's active-client
+   * role from every session it holds (server-side
+   * `session/activeClientRemoved`), fail its in-flight client-tool
+   * executions (the opencode tool then fails → the pump's normal
+   * `tool.failed` path completes the AHP tool call — the state is still
+   * `running`, so the terminal suppression does not apply), clear the
+   * session input request each execution raised (the
+   * `toolClientExecution` request, or the `toolConfirmation` that
+   * replaced it under the same id when the result was held for
+   * approval — without this the session keeps a stale request and, for
+   * a held result, sits in InputNeeded forever), and re-sync the
+   * opencode tool union (it shrank).
+   */
+  private evictActiveClient(clientId: string): void {
+    let evicted = false;
+    for (const rec of this.sessions.values()) {
+      if (!rec.sessionStore.state.activeClients.some((c) => c.clientId === clientId)) continue;
+      evicted = true;
+      this.publish({
+        channel: rec.channel,
+        action: { type: ActionType.SessionActiveClientRemoved, clientId },
+      });
+      for (const [toolCallId, inv] of rec.clientToolCalls) {
+        if (inv.clientId !== clientId || inv.result !== undefined) continue;
+        inv.result = { ok: false, error: `client ${clientId} disconnected before completing the tool call` };
+        this.settleClientTool(rec, inv);
+        // The reducer's inputNeededRemoved is a no-op when the id is
+        // absent, so this is safe for an invocation whose request was
+        // already cleared on the normal completion path.
+        this.publish({
+          channel: rec.channel,
+          action: { type: ActionType.SessionInputNeededRemoved, id: toolCallId },
+        });
+      }
+    }
+    if (evicted) void this.syncClientToolsToOpencode();
   }
 
   // ── event pump ─────────────────────────────────────────────────────────
@@ -735,6 +798,7 @@ export class Host {
       lastInbox: null,
       changesets: new Map(),
       turnSnapshots: new Map(),
+      clientToolCalls: new Map(),
     };
     this.sessions.set(created.sessionID, rec);
     this.byChannel.set(channel, rec);
@@ -744,6 +808,10 @@ export class Host {
     // resolve in the registry.
     this.channels.addSession(suffix);
     this.channels.addSession(created.sessionID);
+
+    // Phase 4 extension 1: a createSession `activeClient` seeds the
+    // session's tools — register them with opencode now.
+    if (activeClients.length > 0) void this.syncClientToolsToOpencode();
 
     // Session-channel lifecycle (server-side, no origin).
     this.publish({ channel, action: { type: ActionType.SessionReady } });
@@ -886,6 +954,15 @@ export class Host {
         return;
       case ActionType.ChatToolCallConfirmed:
         await this.dispatchToolCallConfirmed(rec, stateAction, origin);
+        return;
+      case ActionType.ChatToolCallComplete:
+        await this.dispatchToolCallComplete(rec, stateAction, origin);
+        return;
+      case ActionType.ChatToolCallContentChanged:
+        this.dispatchToolCallContentChanged(rec, stateAction, origin);
+        return;
+      case ActionType.ChatToolCallResultConfirmed:
+        this.dispatchToolCallResultConfirmed(rec, stateAction, origin);
         return;
       case ActionType.ChatTurnCancelled:
         await this.dispatchTurnCancelled(rec, stateAction, origin);
@@ -1118,6 +1195,157 @@ export class Host {
     rec.toolForPermission.delete(permissionID);
   }
 
+  // ── Phase 4 extension 1: client-executed tool calls ───────────────────
+
+  /**
+   * `chat/toolCallComplete` (client-dispatchable): the owning client
+   * finished executing a delegated tool call. Only valid for
+   * client-executed calls (the host emits its own complete for
+   * server-executed ones); the dispatching client must be the
+   * contributor. Echoes the action (reducer: running → completed, or
+   * → pending-result-confirmation when `requiresResultConfirmation`),
+   * clears the execution input request, and settles the opencode-side
+   * waiter with the client's result.
+   */
+  private async dispatchToolCallComplete(rec: SessionRecord, action: StateAction, origin: ActionOrigin | undefined): Promise<void> {
+    const chatURI = chatChannelURI(rec.sessionID);
+    const a = action as ChatToolCallCompleteAction;
+    const toolCallId = typeof a.toolCallId === "string" ? a.toolCallId : null;
+    const invocation = toolCallId !== null ? rec.clientToolCalls.get(toolCallId) : undefined;
+    if (toolCallId === null || invocation === undefined) {
+      this.echo(chatURI, action, origin, `tool call ${toolCallId ?? "?"} is not a client-executed call`);
+      return;
+    }
+    if (origin !== undefined && invocation.clientId !== origin.clientId) {
+      this.echo(chatURI, action, origin, `only the contributing client (${invocation.clientId}) may complete this call`);
+      return;
+    }
+    const result = normalizeToolCallResult(a.result);
+    if (result === null) {
+      this.echo(chatURI, action, origin, "invalid chat/toolCallComplete params (result.success must be a boolean)");
+      return;
+    }
+    const status = this.toolCallState(rec, toolCallId)?.status;
+    if (status !== ToolCallStatus.Running && status !== ToolCallStatus.PendingConfirmation) {
+      this.echo(chatURI, action, origin, `tool call ${toolCallId} is not ready to complete (status ${status ?? "absent"})`);
+      return;
+    }
+    const requiresConfirmation = a.requiresResultConfirmation === true;
+    // Echo first: the reducer moves running → completed (or
+    // pending-result-confirmation); the settle below must observe the
+    // new state for the confirmation input request.
+    this.echo(chatURI, action, origin);
+    if (requiresConfirmation) {
+      // Hold the client's result until the approval reply; surface the
+      // user-facing confirmation on the session channel (this variant,
+      // unlike the execution request, raises SessionStatus.InputNeeded).
+      invocation.pendingResult = result;
+      const pending = this.pendingToolCall(rec, toolCallId);
+      if (pending !== null && rec.currentTurnId !== null) {
+        this.publish({
+          channel: rec.channel,
+          action: {
+            type: ActionType.SessionInputNeededSet,
+            request: {
+              id: toolCallId,
+              chat: chatURI,
+              kind: SessionInputRequestKind.ToolConfirmation,
+              turnId: rec.currentTurnId,
+              toolCall: pending,
+            } satisfies SessionToolConfirmationRequest,
+          },
+        });
+      }
+    } else {
+      this.publish({
+        channel: rec.channel,
+        action: { type: ActionType.SessionInputNeededRemoved, id: toolCallId },
+      });
+      this.settleClientTool(rec, invocation, clientResultToFacade(result));
+    }
+  }
+
+  /**
+   * `chat/toolCallContentChanged` (client-dispatchable): the owning
+   * client streams partial content while executing (the reducer
+   * replaces the running call's `content`). Echo-only — opencode needs
+   * no counterpart; the spec says the server SHOULD reject dispatches
+   * from a client that is not the contributor.
+   */
+  private dispatchToolCallContentChanged(rec: SessionRecord, action: StateAction, origin: ActionOrigin | undefined): void {
+    const chatURI = chatChannelURI(rec.sessionID);
+    const a = action as ChatToolCallContentChangedAction;
+    const toolCallId = typeof a.toolCallId === "string" ? a.toolCallId : null;
+    const invocation = toolCallId !== null ? rec.clientToolCalls.get(toolCallId) : undefined;
+    if (toolCallId === null || invocation === undefined) {
+      this.echo(chatURI, action, origin, `tool call ${toolCallId ?? "?"} is not a client-executed call`);
+      return;
+    }
+    if (origin !== undefined && invocation.clientId !== origin.clientId) {
+      this.echo(chatURI, action, origin, `only the contributing client (${invocation.clientId}) may stream content for this call`);
+      return;
+    }
+    if (!Array.isArray(a.content)) {
+      this.echo(chatURI, action, origin, "invalid chat/toolCallContentChanged params (content must be an array)");
+      return;
+    }
+    if (this.toolCallState(rec, toolCallId)?.status !== ToolCallStatus.Running) {
+      this.echo(chatURI, action, origin, `tool call ${toolCallId} is not running`);
+      return;
+    }
+    this.echo(chatURI, action, origin);
+  }
+
+  /**
+   * `chat/toolCallResultConfirmed` (client-dispatchable): the user
+   * approved or denied a client tool's result after a
+   * `requiresResultConfirmation` completion. Echoes (reducer:
+   * pending-result-confirmation → completed / cancelled with reason
+   * `result-denied`), clears the confirmation input request, and
+   * settles the opencode-side waiter (approved → the held client
+   * result; denied → a Tool.Error the model sees).
+   */
+  private dispatchToolCallResultConfirmed(rec: SessionRecord, action: StateAction, origin: ActionOrigin | undefined): void {
+    const chatURI = chatChannelURI(rec.sessionID);
+    const a = action as ChatToolCallResultConfirmedAction;
+    const toolCallId = typeof a.toolCallId === "string" ? a.toolCallId : null;
+    if (toolCallId === null || typeof a.approved !== "boolean") {
+      this.echo(chatURI, action, origin, "invalid chat/toolCallResultConfirmed params");
+      return;
+    }
+    const invocation = rec.clientToolCalls.get(toolCallId);
+    if (invocation === undefined) {
+      this.echo(chatURI, action, origin, `no pending result confirmation for tool call ${toolCallId}`);
+      return;
+    }
+    if (origin !== undefined && invocation.clientId !== origin.clientId) {
+      this.echo(chatURI, action, origin, `only the contributing client (${invocation.clientId}) may confirm this result`);
+      return;
+    }
+    if (this.toolCallState(rec, toolCallId)?.status !== ToolCallStatus.PendingResultConfirmation) {
+      this.echo(chatURI, action, origin, `tool call ${toolCallId} is not awaiting result confirmation`);
+      return;
+    }
+    this.echo(chatURI, action, origin);
+    this.publish({
+      channel: rec.channel,
+      action: { type: ActionType.SessionInputNeededRemoved, id: toolCallId },
+    });
+    const held = invocation.pendingResult;
+    if (held === undefined) {
+      // Unreachable in practice (the state only reaches
+      // pending-result-confirmation through our complete path); fail
+      // closed so the opencode tool cannot hang.
+      this.settleClientTool(rec, invocation, { ok: false, error: "no recorded result to confirm" });
+      return;
+    }
+    if (a.approved) {
+      this.settleClientTool(rec, invocation, clientResultToFacade(held as ToolCallResult));
+    } else {
+      this.settleClientTool(rec, invocation, { ok: false, error: "the client denied the tool result" });
+    }
+  }
+
   private async dispatchTurnCancelled(rec: SessionRecord, action: StateAction, origin: ActionOrigin | undefined): Promise<void> {
     const chatURI = chatChannelURI(rec.sessionID);
     const a = action as ChatTurnCancelledAction;
@@ -1194,7 +1422,7 @@ export class Host {
       this.echo(rec.channel, action, origin, "activeClient.clientId must match the dispatching client");
       return;
     }
-    const tools = Array.isArray(ac["tools"]) ? (ac["tools"] as ToolDefinition[]) : [];
+    const tools = normalizeToolDefinitions(ac["tools"]);
     const normalized: SessionActiveClient = {
       clientId: ac["clientId"] as string,
       tools,
@@ -1205,6 +1433,9 @@ export class Host {
       action: { type: ActionType.SessionActiveClientSet, activeClient: normalized },
       origin,
     });
+    // Phase 4 extension 1: the session's tool contribution changed —
+    // re-sync the location-global opencode tool union.
+    void this.syncClientToolsToOpencode();
   }
 
   private dispatchActiveClientRemoved(
@@ -1219,6 +1450,9 @@ export class Host {
       return;
     }
     this.echo(rec.channel, action, origin);
+    // Phase 4 extension 1: the session's tool contribution shrank —
+    // re-sync the location-global opencode tool union.
+    void this.syncClientToolsToOpencode();
   }
 
   // ── opencode event pump handlers ───────────────────────────────────────
@@ -1346,12 +1580,21 @@ export class Host {
         }
         return;
       }
-      case "tool.input.started":
+      case "tool.input.started": {
         if (rec.currentTurnId === null) {
           this.log(`tool.input.started outside a turn (session ${rec.sessionID}, tool ${ev.name}); ignored`);
           return;
         }
         rec.toolName.set(ev.id, ev.name);
+        // Phase 4 extension 1: when the session's active clients provide
+        // this tool, the call is client-executed — the client
+        // `contributor` must be established at start (the official
+        // reducer ignores a late one), and the call is tracked for the
+        // `execute` bridge + the client's dispatchable actions.
+        const clientTool = this.clientToolContributor(rec, ev.name);
+        if (clientTool !== null) {
+          rec.clientToolCalls.set(ev.id, { clientId: clientTool, turnId: rec.currentTurnId });
+        }
         this.publish({
           channel: chatURI,
           action: {
@@ -1360,17 +1603,45 @@ export class Host {
             toolCallId: ev.id,
             toolName: ev.name,
             displayName: displayNameFor(ev.name),
+            ...(clientTool !== null
+              ? { contributor: { kind: ToolCallContributorKind.Client, clientId: clientTool } }
+              : {}),
           },
         });
         return;
-      case "tool.input.ended":
+      }
+      case "tool.input.ended": {
         rec.toolInput.set(ev.id, ev.text);
         // Phase 2: for file-mutating tools, capture the pre-edit file
         // content now (the event fires before execution — the last safe
         // point). Awaited in the sequential pump so the capture is
         // complete before `execution.*` can end the turn.
         if (this.opts.changesets) await this.captureTurnBefore(rec, ev.id, ev.text);
+        // Phase 4 extension 1: a client-executed call clears its
+        // confirmation gate here (no opencode permission can fire for
+        // it) — ready straight to running, then surface the execution
+        // request so the owning client picks up the work.
+        if (rec.clientToolCalls.has(ev.id)) {
+          this.ensureToolReady(rec, ev.id, false);
+          const invocation = rec.clientToolCalls.get(ev.id);
+          const running = this.toolCallState(rec, ev.id);
+          if (invocation !== undefined && running !== null && running.status === ToolCallStatus.Running && rec.currentTurnId !== null) {
+            const request: SessionToolClientExecutionRequest = {
+              id: ev.id,
+              chat: chatURI,
+              kind: SessionInputRequestKind.ToolClientExecution,
+              turnId: rec.currentTurnId,
+              clientId: invocation.clientId,
+              toolCall: running,
+            };
+            this.publish({
+              channel: rec.channel,
+              action: { type: ActionType.SessionInputNeededSet, request },
+            });
+          }
+        }
         return;
+      }
       case "tool.progress":
         // First sign the tool is actually running (opencode auto-approved):
         // finalize the tool call as running.
@@ -1379,7 +1650,13 @@ export class Host {
       case "tool.success": {
         if (rec.currentTurnId === null) return;
         this.ensureToolReady(rec, ev.id, false);
-        if (this.toolCallTerminal(rec, ev.id)) return; // e.g. denied → already cancelled
+        if (this.toolCallTerminal(rec, ev.id)) {
+          // e.g. denied → already cancelled, or a client-executed call
+          // the client already completed: no echo, but the tracking
+          // (including the client-tool record) must still be cleared.
+          this.clearToolTracking(rec, ev.id);
+          return;
+        }
         const name = rec.toolName.get(ev.id) ?? "tool";
         const input = rec.toolInput.get(ev.id);
         this.publish({
@@ -1401,7 +1678,12 @@ export class Host {
       case "tool.failed": {
         if (rec.currentTurnId === null) return;
         this.ensureToolReady(rec, ev.id, false);
-        if (this.toolCallTerminal(rec, ev.id)) return;
+        if (this.toolCallTerminal(rec, ev.id)) {
+          // Already terminal (client-executed call completed by the
+          // client, or a call cancelled upstream) — clear the tracking.
+          this.clearToolTracking(rec, ev.id);
+          return;
+        }
         const name = rec.toolName.get(ev.id) ?? "tool";
         const input = rec.toolInput.get(ev.id);
         this.publish({
@@ -1975,6 +2257,134 @@ export class Host {
     rec.toolInput.delete(toolCallId);
     rec.toolName.delete(toolCallId);
     rec.toolReady.delete(toolCallId);
+    rec.clientToolCalls.delete(toolCallId);
+  }
+
+  // ── Phase 4 extension 1: client-tool helpers ───────────────────────────
+
+  /**
+   * The session's active client providing `toolName` (the tool-call
+   * contributor), or null when no active client provides it (a
+   * server-executed call — the normal path).
+   */
+  private clientToolContributor(rec: SessionRecord, toolName: string): string | null {
+    return findProvider(rec.sessionStore.state.activeClients, toolName);
+  }
+
+  /**
+   * Re-sync the location-global opencode tool registry with the
+   * cross-session union of every live session's active-client tools
+   * (first-registered wins per name). Location-global by design —
+   * opencode's tool state is per-location, not per-session (plan
+   * §14.12): the `execute` bridge re-checks per-session ownership at
+   * runtime.
+   */
+  private async syncClientToolsToOpencode(): Promise<void> {
+    const clients: SessionActiveClient[] = [];
+    for (const rec of this.sessions.values()) {
+      for (const client of rec.sessionStore.state.activeClients) clients.push(client);
+    }
+    const tools = toolUnion(clients).map(
+      (t): FacadeClientTool => ({
+        name: t.name,
+        description: descriptionFor(t),
+        inputSchema: inputSchemaFor(t),
+      }),
+    );
+    try {
+      await this.opts.facade.syncClientTools(tools);
+    } catch (err) {
+      // R2: a tool-registry failure must not break the AHP surface —
+      // the active-client state stays authoritative on the AHP side.
+      this.log(`client tool sync failed: ${errorMessage(err)}`);
+    }
+  }
+
+  /**
+   * Settle a client-tool invocation with its final result: the
+   * opencode-side `execute` (blocked on the waiter) unblocks and
+   * returns/throws, which drives the pump's `tool.success`/
+   * `tool.failed` terminal (the AHP state is already terminal — the
+   * pump's `toolCallTerminal` check suppresses a duplicate echo and
+   * clears the tracking). Settling twice is a no-op.
+   *
+   * `result` may be omitted when the invocation's `result` was already
+   * set by the caller (the eviction / session-removal paths set it
+   * first and then settle to deliver it).
+   */
+  private settleClientTool(rec: SessionRecord, invocation: ClientToolInvocation, result?: FacadeClientToolResult): void {
+    if (invocation.result === undefined) {
+      if (result === undefined) return; // nothing to settle
+      invocation.result = result;
+    }
+    if (invocation.waiter !== undefined && invocation.waiter !== null) {
+      invocation.waiter(invocation.result);
+      invocation.waiter = null;
+    }
+  }
+
+  /**
+   * The opencode tool `execute` bridge (called from the
+   * `ctx.tool.transform` registration in src/index.ts): route one
+   * client-tool invocation to the owning AHP client and wait for its
+   * result.
+   *
+   * Per-session scoping (plan §14.12): the tool is visible location-
+   * globally, but execution only resolves when *this* session is an
+   * AHP session with an active client providing the tool — otherwise
+   * the opencode tool fails (a `Tool.Error` the model sees), so e.g. a
+   * TUI session can see the tool but not execute it.
+   */
+  executeClientTool(input: {
+    sessionID: string;
+    toolCallId: string;
+    name: string;
+    signal: AbortSignal;
+  }): Promise<FacadeClientToolResult> {
+    const rec = this.sessions.get(input.sessionID);
+    if (rec === undefined) {
+      return Promise.resolve({
+        ok: false,
+        error: `no AHP session for tool "${input.name}" (session ${input.sessionID} is not an AHP session)`,
+      });
+    }
+    const invocation = rec.clientToolCalls.get(input.toolCallId);
+    if (invocation === undefined) {
+      return Promise.resolve({
+        ok: false,
+        error: `no client-executed call in flight for tool "${input.name}" (it was not registered by this session's active client)`,
+      });
+    }
+    if (findProvider(rec.sessionStore.state.activeClients, input.name) !== invocation.clientId) {
+      return Promise.resolve({
+        ok: false,
+        error: `session ${rec.sessionID} has no active client providing tool "${input.name}"`,
+      });
+    }
+    if (input.signal.aborted) {
+      const result: FacadeClientToolResult = { ok: false, error: `execution of "${input.name}" was cancelled` };
+      this.settleClientTool(rec, invocation, result);
+      return Promise.resolve(result);
+    }
+    // The invocation may already be settled (the client completed before
+    // opencode started the execute — possible: the client only needs the
+    // pump's ready/inputNeeded actions, not our execute). Deliver the
+    // settled result; otherwise register the waiter.
+    const settled = invocation.result;
+    if (settled !== undefined) return Promise.resolve(settled);
+    return new Promise<FacadeClientToolResult>((resolve) => {
+      invocation.waiter = resolve;
+      const onAbort = () => {
+        if (invocation.result === undefined) {
+          this.settleClientTool(rec, invocation, {
+            ok: false,
+            error: `execution of "${input.name}" was cancelled (turn interrupted)`,
+          });
+        }
+        // If already settled, the waiter is gone — the abort is a no-op.
+      };
+      input.signal.addEventListener("abort", onAbort, { once: true });
+    });
   }
 
   // ── session registration / removal ─────────────────────────────────────
@@ -2050,6 +2460,7 @@ export class Host {
       lastInbox: null,
       changesets: new Map(),
       turnSnapshots: new Map(),
+      clientToolCalls: new Map(),
     };
     this.sessions.set(fs.sessionID, rec);
     this.byChannel.set(channel, rec);
@@ -2073,6 +2484,17 @@ export class Host {
     }
     rec.changesets.clear();
     rec.turnSnapshots.clear();
+    // Phase 4 extension 1: fail any in-flight client-tool executions
+    // (the session is going away — the waiters must not leak) and
+    // re-sync the opencode tool union (this session's clients' tools
+    // leave the cross-session set).
+    for (const inv of rec.clientToolCalls.values()) {
+      if (inv.result !== undefined) continue;
+      inv.result = { ok: false, error: "session removed before the client completed the tool call" };
+      this.settleClientTool(rec, inv);
+    }
+    rec.clientToolCalls.clear();
+    const hadClients = rec.sessionStore.state.activeClients.length > 0;
     this.sessions.delete(rec.sessionID);
     this.byChannel.delete(rec.channel);
     this.byChannel.delete(chatChannelURI(rec.sessionID));
@@ -2084,6 +2506,7 @@ export class Host {
       action: { type: ActionType.RootActiveSessionsChanged, activeSessions: this.sessions.size },
     });
     this.notifyRoot("root/sessionRemoved", { channel: ROOT_CHANNEL, session: rec.channel });
+    if (hadClients) void this.syncClientToolsToOpencode();
   }
 
   // ── state / publishing ─────────────────────────────────────────────────
@@ -2294,11 +2717,67 @@ function firstEnabledModelRef(models: readonly { providerID: string; modelID: st
 
 /** Normalize an untrusted `activeClient` payload (untrusted JSON-RPC). */
 function normalizeActiveClient(ac: Record<string, unknown>): SessionActiveClient {
-  const tools = Array.isArray(ac["tools"]) ? (ac["tools"] as ToolDefinition[]) : [];
   return {
     clientId: ac["clientId"] as string,
-    tools,
+    tools: normalizeToolDefinitions(ac["tools"]),
     ...(typeof ac["displayName"] === "string" ? { displayName: ac["displayName"] as string } : {}),
+  };
+}
+
+/**
+ * Wire-validate a client-dispatched `toolCallComplete` result (plan
+ * §14.12): `success` is the one field the host depends on (it decides
+ * the facade result + the Tool.Error path); the rest is stored
+ * verbatim for the AHP state mirror.
+ */
+function normalizeToolCallResult(raw: unknown): ToolCallResult | null {
+  if (typeof raw !== "object" || raw === null) return null;
+  const r = raw as Record<string, unknown>;
+  if (typeof r["success"] !== "boolean") return null;
+  const pastTense = r["pastTenseMessage"];
+  return {
+    success: r["success"],
+    pastTenseMessage:
+      typeof pastTense === "string"
+        ? pastTense
+        : (isRecord(pastTense) && typeof pastTense["markdown"] === "string"
+            ? (pastTense["markdown"] as string)
+            : ""),
+    ...(Array.isArray(r["content"]) ? { content: r["content"] as ToolResultContent[] } : {}),
+    ...(isRecord(r["structuredContent"]) ? { structuredContent: r["structuredContent"] as Record<string, unknown> } : {}),
+    ...(isRecord(r["error"]) ? { error: r["error"] as { message: string; code?: string } } : {}),
+  };
+}
+
+/** StringOrMarkdown → plain string (the facade result carries text). */
+function stringOrMarkdownToText(v: StringOrMarkdown | undefined): string {
+  if (v === undefined) return "";
+  if (typeof v === "string") return v;
+  return typeof v.markdown === "string" ? v.markdown : "";
+}
+
+/**
+ * A validated client `ToolCallResult` → the opencode-side result:
+ * success:false → the `Tool.Error` message (the model sees the
+ * failure); success → the text content blocks joined (non-text blocks
+ * stay in the AHP state for the client's UI; the model gets the text +
+ * the past-tense message).
+ */
+function clientResultToFacade(result: ToolCallResult): FacadeClientToolResult {
+  if (!result.success) {
+    return { ok: false, error: result.error?.message ?? "the client reported a tool failure" };
+  }
+  const texts: string[] = [];
+  for (const c of result.content ?? []) {
+    // The content came from the wire (untrusted) — guard the shape.
+    if (c.type === ToolResultContentType.Text && typeof c.text === "string") texts.push(c.text);
+  }
+  const content = texts.join("\n\n");
+  return {
+    ok: true,
+    pastTenseMessage: stringOrMarkdownToText(result.pastTenseMessage),
+    ...(content.length > 0 ? { content } : {}),
+    ...(result.structuredContent !== undefined ? { structuredContent: result.structuredContent } : {}),
   };
 }
 
