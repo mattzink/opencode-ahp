@@ -45,6 +45,11 @@ import type { SessionDomain } from "@opencode/plugin/promise/session";
  * is derived through the plugin package's declared subpaths.
  */
 type SessionInfo = Awaited<ReturnType<SessionDomain["get"]>>;
+/**
+ * The `SessionCreateInput["metadata"]` type — a JSON record per the
+ * `Session.Metadata` schema (derived the same way as `SessionInfo`).
+ */
+type SessionCreateMetadata = NonNullable<Parameters<SessionDomain["create"]>[0]>["metadata"];
 import { isRecord, resolveOptions, type Options } from "./options.js";
 import { createListener, type Listener } from "./transport.js";
 import { Host } from "./host.js";
@@ -147,6 +152,9 @@ function mapSessionInfo(info: SessionInfo): FacadeSession {
     ...(info.model !== undefined ? { model: modelRefOf(info) } : {}),
     // SessionInfo.time carries `archived` only while archived.
     ...(info.time.archived !== undefined ? { archived: true } : {}),
+    // Durable, core-opaque metadata (plan §14.13.1): the host reads its
+    // `opencode-ahp` chat-binding marker from it on external registration.
+    ...(isRecord(info.metadata) ? { metadata: info.metadata as Record<string, unknown> } : {}),
     time: { created: info.time.created, updated: info.time.updated },
   };
 }
@@ -297,7 +305,13 @@ function implementFacade(ctx: Context, hiddenSessionID: string | null, hostRef: 
       }));
     },
     // ── Phase 1: sessions ────────────────────────────────────────────────
-    async createSession(input?: { id?: string; title?: string; agent?: string; model?: FacadeModelRef }) {
+    async createSession(input?: {
+      id?: string;
+      title?: string;
+      agent?: string;
+      model?: FacadeModelRef;
+      metadata?: Record<string, unknown>;
+    }) {
       const info = await ctx.session.create({
         ...(input?.id !== undefined ? { id: input.id } : {}),
         ...(input?.title !== undefined ? { title: input.title } : {}),
@@ -311,6 +325,12 @@ function implementFacade(ctx: Context, hiddenSessionID: string | null, hostRef: 
               },
             }
           : {}),
+        // Plan §14.13.1: the chat-binding marker is written atomically at
+        // create (no read-merge — core projects MetadataUpdated as a full
+        // column replacement, so a later update would clobber it). Session
+        // metadata is JSON by the Session.Metadata schema; the facade keeps
+        // it unknown-typed, so the single cast lives here.
+        ...(input?.metadata !== undefined ? { metadata: input.metadata as SessionCreateMetadata } : {}),
       });
       return mapSessionInfo(info);
     },
@@ -327,6 +347,9 @@ function implementFacade(ctx: Context, hiddenSessionID: string | null, hostRef: 
       } catch {
         return null; // gone (removed) — the pump treats null as "skip"
       }
+    },
+    async removeSession(sessionID: string) {
+      await ctx.session.remove({ sessionID });
     },
     async prompt(input: { sessionID: string; text: string; delivery?: "steer" | "queue" }) {
       const res = await ctx.session.prompt({

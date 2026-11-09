@@ -844,10 +844,14 @@ user commit/push → CI publish.
   surface).
 - Automations / AHP 1.1 features once they stabilize.
 
-**Status (2026-11-08): extension 1 (client-provided tools) done,
-live-verified** (`scripts/ahp-client-tools.mjs` against the LAN host,
-provider `opencode`). Three turns: a direct happy path (the model calls
-the client `ping` by name, the start carries the client contributor, the
+**Status (2026-11-09): extensions 1 + 2 done, live-verified; extension 2
+includes restart durability (metadata markers, §14.13.1) — verified
+across a location reload.**
+
+*Extension 1 (client-provided tools)* —
+`scripts/ahp-client-tools.mjs` against the LAN host, provider
+`opencode`. Three turns: a direct happy path (the model calls the
+client `ping` by name, the start carries the client contributor, the
 execution request leaves the session in progress — status 33 — and the
 client's result lands in the snapshot), a client failure result
 (`success: false` + error text), and the full
@@ -856,12 +860,28 @@ the execution request under the same id, session 33 → 56 while the
 result awaits approval, approval → 40, held content in the snapshot).
 Disconnect eviction live-verified mid-confirmation: the in-flight call
 settles with a disconnect error, the stale session input request is
-cleared, the model replies, and the turn completes. 232/232 tests
-green, typecheck clean. Findings in §14.12 (the `codemode: false`
-registration gotcha, the upsert/`awaitsUser` session-reducer
-semantics, and the eviction state-hygiene fix). Remaining: user
-commit/push → CI publish; extensions 2–4 (multi-chat,
-elicitation/terminal, automations / AHP 1.1).
+cleared, the model replies, and the turn completes. Findings in §14.12
+(the `codemode: false` registration gotcha, the upsert/`awaitsUser`
+session-reducer semantics, and the eviction state-hygiene fix).
+
+*Extension 2 (multi-chat)* — `scripts/ahp-multi-chat.mjs`, 20/20 checks
+on the LAN host: the plain capability advertised; `createChat`
+(`session/chatAdded`, subscribable peer chat, two-chat catalog with the
+default first); a turn on each chat completing against its own
+opencode backend; `listSessions` surfacing exactly one AHP session for
+the backend pair (the peer backend never re-surfaces); `source`
+rejected `-32602`; `disposeChat` (`session/chatRemoved`, session
+healthy, peer channel gone, a further default-chat turn fine).
+Findings in §14.13 (wire contract + the 1 chat ↔ 1 opencode session
+design; the peer opencode id deliberately absent from the channel
+registry; `chatAdded` precedes the `initialMessage` rollback window).
+**Durability (§14.13.1):** the chat binding + the client-chosen session
+channel survive a location reload via metadata markers on the opencode
+sessions; live-verified with `--leave-peer` / `--recheck` across a
+reload (cycle 2, §14.13.1).
+
+253/253 tests green, typecheck clean. Remaining: user commit/push → CI
+publish; extensions 3–4 (elicitation/terminal, automations / AHP 1.1).
 
 ### Phase 5 — Conformance (last phase, carved out of Phase 3, 2026-11-08)
 
@@ -1825,6 +1845,476 @@ client-dispatchable tool-action cases, `onClose` eviction, union
 re-sync on every active-client change. `index.ts` — the
 `ctx.tool.transform` registration (the host back-reference assigned
 immediately after host construction, the `listener` closure pattern).
+
+### 14.13 Phase 4 extension 2 — multi-chat per session (2026-11-09)
+
+**Wire contract (AHP 1.0.0 dist, verified).**
+
+- Capability gate: `AgentInfo.capabilities.multipleChats?:
+  MultipleChatsCapability { fork?: boolean; sideChat?: boolean }`
+  (`channels-root/state.d.ts` L106). Empty `{}` advertises plain
+  multi-chat; **absent = clients MUST NOT call `createChat`**. VS Code
+  reads it from the root-state agents list —
+  `vscode-baseAgentHostSessionsProvider.ts` L5303 maps
+  `agent.provider → agent.capabilities` into `_agentCapabilities`, and
+  L1898 gates the "new chat" UI on `supportsMultipleChats`.
+- `createChat` — client→server **request, result `null`**
+  (`common/messages.d.ts` `CommandMap`, same shape as `createSession`).
+  `CreateChatParams { channel: sessionURI, chat: client-chosen chatURI
+  (e.g. `ahp-chat:/<uuid>`), initialMessage?: Message, source?:
+  {kind:"fork"|"sideChat", chat, turnId, selection?}, workingDirectories?
+  : URI[] }`. `source` is only legal when the matching sub-capability is
+  advertised; `workingDirectories` only with
+  `multipleWorkingDirectories`.
+- `disposeChat` — client→server **request, result `null`**;
+  `DisposeChatParams` is empty (the `channel` in `BaseParams` names the
+  chat). "Disposes a chat and cleans up server-side resources."
+- `moveChat` → `MoveChatResult { session }`; requires
+  `ChatSummary.movable: true` (absent = false).
+- Catalog actions are **server-origin only** (none `@clientDispatchable`):
+  `session/chatAdded { summary: ChatSummary }` (upsert by
+  `summary.resource`), `session/chatRemoved { chat: URI }` (no-op when
+  absent; the reducer also clears `defaultChat` if it pointed at the
+  removed chat), `session/chatUpdated { chat, changes:
+  Partial<ChatSummary> }` (partial; `resource` never carried),
+  `session/chatsReordered { chats: URI[] }` (host-only convergence,
+  complete order, invalid orders ignored), `session/defaultChatChanged {
+  defaultChat?: URI }`. The official session reducer implements all five
+  (`channels-session/reducer.js` L122–178); `SessionState.chats?:
+  SessionChatSummary[]` (L478), `SessionState.defaultChat?` (L480).
+- `ChatSummary { resource, title, status, activity?, modifiedAt, changes?,
+  origin?, movable?, interactivity?, workingDirectories? }`
+  (`channels-chat/state.d.ts` L152). `SessionChatSummary` (session-state
+  copy, L487) is structurally narrower; the reducer stores the full
+  `ChatSummary` (assignable).
+- **Status projection rule** (`SessionChatUpdated` doc): when
+  `changes.status` changes the host MUST also publish the updated compact
+  catalog through `root/sessionSummaryChanged`.
+- `Message { text, origin: { kind }, attachments?, model?, agent? }`.
+
+**VS Code client flow (L8620–8680, 1.145.2).** `_createAdditionalChat`:
+gate on `supportsMultipleChats` → mint `chatUri =
+newAgentHostChatUri(sessionUri, defaultChat, initializeResult)` → `await
+connection.createChat(sessionUri, chatUri, options)` → `waitForState`
+until the chat appears in `cached.chats` (fed by the `session/chatAdded`
+action via `_applyChatCatalogFromState`) → on failure (chat never
+surfaces) **rollback with `connection.disposeChat(chatUri)`**. So the
+accepted contract is: `createChat` resolves `null` promptly; the catalog
+mutation arrives as a `session/chatAdded` action; `disposeChat` is safe
+to call on an accepted-but-unmaterialized chat. Fork UI separately
+gated on `multipleChats.fork` (L8697). The client reads `defaultChat`
+from session state first (`_lastSessionStates[...].defaultChat`), else
+the root-summary metadata; with multiple chats it displays **per-chat
+catalog status** ("the default chat shows its own catalog status and
+time, not the session aggregate" — `applyChatMetadata` L2002).
+
+**opencode side (plugin surface, 2.2.6).**
+
+- `SessionDomain` (`@opencode/plugin` dist/promise/session.d.ts) =
+  `list | create | get | remove | switchAgent | switchModel | prompt |
+  generate | command | compact | synthetic | interrupt | update | move |
+  context | wait | instructions`. **No fork** — even though it is
+  first-class server-side (`@opencode/client` `session.fork(SessionForkInput
+  { sessionID, before? })`, `@opencode/schema` `SessionFork.Boundary`,
+  `session.forked` event): plugins get a picked `SessionApi` and no raw
+  client accessor.
+- `ctx.session.remove({ sessionID })` → void (`SessionRemoveInput/Output`).
+- Conclusion: base multi-chat is implementable 1:1 (one AHP chat ↔ one
+  opencode session); fork/sideChat are not (until opencode exposes fork
+  to plugins).
+
+**Our host (pre-change).** `handleCreateSession` already publishes
+`SessionReady` + `SessionChatAdded` + `SessionDefaultChatChanged` for the
+single default chat (host.ts L816–825); `registerExternal` mirrors that
+for pump-registered sessions; `publish()` already diffs
+`chats`/`defaultChat` into `root/sessionSummaryChanged`
+(`maybeNotifySummaryChanged`); `buildSessionSummary` already emits
+`chats: [chat]` + `defaultChat`. Gaps: no `createChat`/`disposeChat`
+handlers (both hit the METHOD_NOT_FOUND default); all turn state
+(`currentTurnId`, part/tool tracking, `clientToolCalls`, prompt buffers,
+changeset stores) lives on `SessionRecord` (one chat); the event pump
+joins on `ev.sessionID` → `rec` and hardcodes
+`chatChannelURI(rec.sessionID)`; `ChannelRegistry.subscribe` requires
+`sessions.has(sessionIDOf(uri))`, so a client-chosen chat suffix must be
+registered; changeset lookup resolves the owner via
+`this.sessions.get(parsed.sessionID)` (suffix == opencode id only for the
+default chat); the `session.created` guard only checks
+`sessions.has(...)` (a chat backend session would surface as a
+bogus root-level external session after the 250 ms grace); no facade
+`removeSession`.
+
+**Design (implemented).**
+
+- **Capability**: `mapCatalog` adds `capabilities: { multipleChats: {} }`
+  to every `AgentInfo`. No `fork`/`sideChat` (plugin surface, above); no
+  `multipleWorkingDirectories`.
+- **Model — 1 AHP chat ↔ 1 opencode session.** The default chat keeps
+  binding to the session's own opencode session (existing behavior, zero
+  wire change for single-chat clients). Each `createChat` mints a fresh
+  opencode session (same provider/model resolution as `createSession`;
+  `initialMessage.model/agent` applied like `dispatchTurnStarted`) and
+  binds it to the client-chosen chat URI.
+- **`ChatRuntime`** (new per-chat record): `uri`, `sessionID` (opencode
+  id), `chatStore`, and everything that was per-session turn state —
+  `currentTurnId`, `turnStartedAt`, `turnModelRef`, `parts`, `toolInput`,
+  `toolName`, `toolReady`, `permissionForTool`, `toolForPermission`,
+  `clientToolCalls`, `lastInbox`, `changesets`, `turnSnapshots`.
+  `SessionRecord` now holds `chats: Map<chatURI, ChatRuntime>` +
+  `defaultChatURI`; `rec.sessionID` = the default chat's opencode id
+  (keeps the `sessions` keying). A host-level reverse binding
+  `byOpencode: Map<opencodeSessionID, { rec, chat }>` feeds the event
+  pump.
+- **`createChat`**: validate `channel` (session kind, known) + `chat`
+  (chat kind, fresh suffix, no `/changeset/` marker, not the default
+  chat URI); reject `source` and `workingDirectories` with
+  `INVALID_PARAMS` (caps not advertised); create the opencode session;
+  register the runtime (`bindChat`: `rec.chats` + `byChannel` + reverse
+  binding; the channel registry gets the chat **suffix** only — the
+  peer's opencode id deliberately gets no registry entry: there is no
+  subscribable session channel for it, and peer-chat changesets resolve
+  their owner through the chat suffix anyway); publish
+  `session/chatAdded` (the plain `chatSummaryOf` summary) — **before**
+  the `initialMessage` step, so a failed first turn is observed on the
+  wire as `chatAdded` → `chatRemoved` (documented edge);
+  `initialMessage` → write-ahead first turn (claim + prompt,
+  `dispatchTurnStarted` semantics; invalid text → rollback +
+  `INVALID_PARAMS`, selection/prompt failure → rollback + `INTERNAL`);
+  respond `null`.
+- **`disposeChat`**: refuse the default chat (a session keeps its
+  default chat; there is no re-home mechanism — the reducer would only
+  clear the `defaultChat` hint); unknown chat → -32001; otherwise
+  `removeChat` (AHP-side unbind **first**: clear live changesets with
+  `changeset/cleared`, fail in-flight client-tool calls — same as
+  `removeRecord` — drop the runtime + registry entries + reverse
+  binding), **then** `await facade.removeSession` (new:
+  `ctx.session.remove`; failure caught + logged, R2), **then** publish
+  `session/chatRemoved`. The unbind-before-removal order matters: the
+  racing `session.deleted` from opencode then sees the `byOpencode`
+  guard clean and cannot double-publish the removal. Respond `null`.
+- **Event pump**: `session.created` guard now also skips ids already in
+  `byOpencode` (chat backends must not become root-level external
+  sessions). All handlers resolve the binding through `byOpencode` —
+  `chatURI` comes from the binding, not
+  `chatChannelURI(rec.sessionID)`. `session.deleted` on a chat backend
+  drops just that chat (`session/chatRemoved`); on the default
+  opencode session it removes the whole record (existing).
+  `session.renamed` on a chat backend → `session/chatUpdated { changes:
+  { title } }` (there is no chat title action); on the default →
+  `session/titleChanged` (existing).
+- **Routing**: chat-channel `dispatchAction` handlers resolve the
+  `ChatRuntime` from the channel URI; per-chat active-turn checks and
+  per-chat prompt targets — **concurrent turns across chats are
+  allowed** (per-chat `currentTurnId`). Model/agent message selections
+  apply to that chat's opencode session only (natural 1:1 isolation).
+- **Snapshots/summary**: `snapshotFor` serves any registered chat URI
+  from `rec.chats.get(uri).chatStore.state`; `sessionSummary(rec)` emits
+  the full catalog (default first, then insertion order) +
+  `defaultChat`; changeset owner lookup resolves through
+  `byChannel.get(parsed.ownerUri)` (fixes suffix ≠ opencode id for
+  client-chosen chats).
+- **Session status stays input-needed-driven** (the session reducer has
+  no activity action); per-chat activity lives in the catalog status —
+  exactly what VS Code displays in multi-chat mode. `defaultChat` never
+  changes after creation (VS Code input routing + `_backendDefaultChat`
+  rely on it).
+
+**Live verification (2026-11-09, LAN host, provider `opencode`).**
+`scripts/ahp-multi-chat.mjs`, 20/20 checks: capability advertised on
+the root catalog; `createChat` → `session/chatAdded` + subscribable
+peer chat + two-chat catalog (default first); a turn on each chat
+completing against its own backend; `listSessions` gaining exactly the
+one AHP session (the peer backend never re-surfaces — checked
+*differentially* against the pre-existing probe sessions on the shared
+LAN host, so the probe works on a dirty server); `source` rejected
+`-32602`; `disposeChat` → `session/chatRemoved`, session healthy with
+its default chat, peer channel un-subscribable `-32001`, and a further
+default-chat turn still completing. 246/246 tests green (12 new
+multi-chat host tests + 2 bridge catalog tests), typecheck clean.
+
+**Accepted non-goals.** No fork/sideChat (no plugin fork API in 2.2.6 —
+revisit if opencode exposes it). No `moveChat` (never advertise
+`movable: true`; requests hit METHOD_NOT_FOUND). No
+`chatsReordered` emissions (insertion order is stable; the action is a
+host-only convergence signal). No default-chat reassignment. No
+`disposeSession` command (pre-existing gap, orthogonal — the root
+channel still lists sessions; opencode owns deletion).
+
+### 14.13.1 Chat-binding durability across restarts (2026-11-09)
+
+**Problem.** The host's in-memory `SessionRecord`/`ChatRuntime` state is
+gone after a location reload, and there is **no boot-time event replay**
+— pre-existing opencode sessions resurface only on the first
+`listSessions` (or a live `session.created`), which is where external
+registration runs. Without help, a multi-chat session restarts as two
+standalone single-chat sessions (the owner under its minted opencode id,
+the peer backend as a ghost session) — the chat catalog is lost, and
+for a client-chosen session channel the session *identity* changes.
+Opencode **session metadata** is the only durable surface a plugin has;
+the design rides markers on it.
+
+**opencode wire ground truth (2.2.6 + dev `1284450a03`).**
+- `Session.Metadata = Record(String, Json)` (`@opencode/schema`
+  `session-metadata.ts`) — core-opaque; the plugin's `mapSessionInfo`
+  passes it through (`FacadeSession.metadata?`), and
+  `ctx.session.create` accepts it (`SessionCreateInput.metadata?`,
+  verified in the installed 2.2.6 dist).
+- The core projector applies `MetadataUpdated` as a **full column
+  replacement** (`packages/core/src/session/projector.ts`) — a later
+  metadata write *clobbers* earlier content. The marker is therefore
+  stamped **atomically at create** (no read-merge); the only other
+  metadata writer in core is the plugin `session.update` path
+  (keep-alive anchor — a different session).
+- Forks **inherit** the parent's metadata (core documents the
+  inheritance) — the fork edge below.
+
+**Marker schemas (both under one metadata key `opencode-ahp`).**
+- **Peer-chat backend** (stamped by `handleCreateChat` on the minted
+  backend session): `{ chat: <chat channel URI>, owner: <the owner's
+  opencode session id> }` — `owner` is the opencode id, *not* the
+  channel suffix (for a client-chosen session the suffix differs from
+  the minted id).
+- **Default backend of a minted-id session** (stamped by
+  `handleCreateSession` only when the client-chosen suffix is *not*
+  `ses`-prefixed, i.e. opencode minted the id): `{ channel: <session
+  channel URI> }` — the client-chosen session channel. A `ses`-prefixed
+  suffix *is* the opencode id; its `ahp-session:/ses_…` channel
+  re-derives from the id and needs no marker.
+- The keep-alive anchor uses the same key with a **string** value
+  (`"keep-alive"`) — `parseAhpMarker` is defensive: a non-record marker
+  or a field with the wrong kind means "no marker" (standalone
+  registration under the opencode id).
+
+**Re-attach (`registerExternal` outcomes, in order).**
+1. The opencode id already backs a chat of a live record → skip
+   (peer backends never resurface as their own sessions).
+2. Peer marker, owner registered, marker's chat URI free →
+   **`reattachPeerChat`**: rebuild the `ChatRuntime`, `bindChat`, and
+   publish `session/chatAdded` on the **live** owner store through
+   `publish` (unlike a fresh standalone registration, the owner store
+   is live — existing subscribers and the root diff get the change).
+   The backend gets no standalone session (its session channel is never
+   registered — subscribing to it is -32001).
+3. Peer marker, owner not registered yet → **`pendingChatBindings`
+   queue** keyed by owner id (a peer can be listed *before* its owner
+   in the same synchronous `listSessions` pass). `drainPendingChatBindings`
+   runs on the owner's standalone registration *before* the root
+   announcement, so `sessionAdded` carries the full chat catalog.
+4. Channel marker, marked channel free → standalone registration under
+   the **original client channel** (`registerExternalStandalone(fs,
+   channel)`); the channel registry resolves both the opencode id and
+   the client suffix (mirroring `handleCreateSession`). Marked channel
+   already bound → log + fall back to the opencode-id channel.
+5. **Orphan fallback** (queued peer, owner never registered): after the
+   250 ms grace window (shared `EXTERNAL_REGISTER_GRACE_MS`), the host
+   re-checks `getSession(owner)`; owner **gone from opencode** (deleted
+   in the TUI while the plugin was down) → each queued peer registers
+   standalone (the data stays reachable). Owner still in opencode → the
+   queue waits for the next `listSessions`/registration; a failed owner
+   lookup keeps the queue for the next check.
+6. **Fork edge**: a fork inherits the parent's peer marker → the marker's
+   chat URI is already bound → duplicate-URI guard → standalone fallback
+   (logged; the data stays reachable).
+
+**Documented divergences.**
+- Re-attached chat **titles are re-derived** (`Chat <n>` in re-attach
+  order) — AHP chat titles are host-side state and are not durable; the
+  pre-restart title is gone. Session **titles survive** (client renames
+  propagate to the opencode session title via `facade.rename`, so the
+  re-listed session carries them).
+- The **slow-create race** (pump registers the session externally while
+  `createSession` is still in flight, >250 ms): with the channel
+  marker, the interim external registration lands under the *marked*
+  channel, so the remap check (`interim.channel !== channel`) is false
+  and the re-registration below re-announces the session — a duplicate
+  `root/sessionAdded` in this rare race. Cosmetic: clients converge on
+  the snapshot, and the pre-marker remap behavior (sessionRemoved +
+  re-add) simply no longer fires for marked channels (host.ts comment
+  at the remap site).
+
+**Live verification (2026-11-09, LAN host).** Cycle 1 (peer marker
+only): `--leave-peer` green; the post-reload recheck showed the peer
+chat re-attached at its original URI, but the owner session had
+resurfaced under its **opencode id** (`ahp-session:/ses_…`) instead of
+the client channel (`ahp-session:/lan-mc-…`) — the channel identity
+needed its own marker (above). Cycle 2: `--leave-peer` green with
+**both** markers confirmed in the durable store via `/api/session`
+(default backend `{"opencode-ahp":{"channel":"ahp-session:/lan-mc-mw9exhl3"}}`,
+peer `{"opencode-ahp":{"chat":"ahp-chat:/lan-mc-peer-mw9exhl3","owner":"ses_…"}}`);
+after a second location reload, `--recheck` fully green — the session is
+listed at its **original channel**, the peer chat re-attached at its
+**original URI** (two chats, default first), no ghost session carries
+the peer chat, a turn on the re-attached chat completes against the
+surviving backend, and `disposeChat` cleans up (the session keeps its
+default chat).
+
+**Status (2026-11-09):** implemented — 253/253 tests (7 new durability
+tests: peer-marker stamp; restart re-attach; ordering drain; orphan
+fallback; fork duplicate-URI; channel-marker stamp; channel-marker
+restart resurface), typecheck clean; live-verified above.
+
+### 14.14 Durability audit — do previous features need the marker strategy? (2026-11-09)
+
+**Question.** Extension 2 made chat *binding* (identity — which opencode
+session backs which AHP chat/channel) durable via the `opencode-ahp`
+metadata marker (§14.13.1). Do any **previous** features (Phases 0–3 +
+extension 1) lose something material across a location reload, and would a
+similar metadata-persistence strategy improve their durability /
+crash-resilience? **Investigation only — nothing implemented.**
+
+**Method.** For each feature's state: (a) where it lives (in-memory host
+state vs. the opencode durable store), (b) what survives a reload, (c)
+whether the plugin surface can recover it, (d) whether the marker is the
+right mechanism.
+
+**Reload ground truth (what it destroys).** A location reload is
+`LocationServiceMap.reload` — invalidate every RcMap ref (all
+location-scoped service finalizers run) + rebuild. The host's entire
+in-memory state is torn down: `SessionRecord`, `ChatRuntime`, every chat's
+`turns[]`, the changeset stores, active clients, and the in-flight
+turn/permission joins. The opencode **durable** store (SQLite) is
+unaffected: session rows, session metadata (the marker), session message
+history, session titles, and per-message snapshot IDs. There is **no
+boot-time event replay** — pre-existing sessions resurface only on the
+first `listSessions`, which is where external registration reads the
+marker.
+
+**Findings, ranked by value.**
+
+**1. Turn/message history hydration — the one real gap (a new extension;
+no marker needed).**
+- After a reload every re-registered chat starts from
+  `initialChatState` → `turns: []` (bridge.ts). The host loads **no**
+  history: `ctx.session.context` is on the plugin surface (`SessionDomain`
+  includes `context`; wired in the plugin host as
+  `context: (input) => sessions.context(input.sessionID)`) but is **used
+  nowhere** in the host, and `fetchTurns` is **not implemented** (falls
+  through the dispatch switch's `default` → `-32601`).
+- opencode's session history is durable and fully readable from a plugin:
+  `ctx.session.context({ sessionID })` → `SessionMessage.Info[]` = the
+  **active context window** (`SessionStore.context` =
+  `SessionHistory.load(db, id, "latest")`) — the full history unless a
+  completed local compaction exists, in which case `seq >= compaction.seq`
+  (native compactions replay their stored messages for the model-neutral
+  `"latest"` reader). That is exactly the window the model sees — the
+  correct thing to hydrate.
+- `SessionMessage.Info` = `AgentSelected | ModelSelected |
+  LocationSwitched | User | Synthetic | System | Skill | Shell |
+  Assistant | Compaction | Idle`. `User { id, metadata?, time.created,
+  text, files? }`; `Assistant { id, agent, model, content: [text |
+  reasoning | tool parts], time { created, ran?, completed? }, snapshot
+  { start?, end?, files? }, tokens?, error? }`.
+- Mapping to AHP `Turn { id, startedAt?, duration?, message,
+  responseParts, usage, state: complete|cancelled|error }` is
+  straightforward: a `User` message starts a turn (`message.text`); the
+  following `Assistant` supplies `responseParts` (its content parts),
+  `usage` (`tokens`), `state` (`error` → `TurnState.Error`), and
+  `startedAt`/`duration` (`time.created`/`completed`).
+- **AHP 1.0.0 already has first-class pagination for exactly this:**
+  `fetchTurns { channel, cursor? }` (client→server request; the host MUST
+  dispatch `chat/turnsLoaded` before responding; an unrecognised cursor →
+  `InvalidParams`; an omitted cursor = the next older page, opportunistically)
+  + `ChatTurnsLoadedAction { turns (oldest-first, prepended),
+  turnsNextCursor? }` + `ChatState.turnsNextCursor`. **VS Code 1.145.2 does
+  not call `fetchTurns` yet** (confirmed in the extracted sources) — but the
+  subscribe snapshot is host-controlled, so hydrating turns on
+  (re)subscribe already helps the current client, and `fetchTurns` is the
+  forward path for deep pagination.
+- **No marker is needed for the content.** The marker only carries
+  identity/binding (which opencode session ↔ which AHP chat/channel); the
+  turn *content* is recovered directly from `ctx.session.context` for the
+  bound session. So this is a new Phase 4 extension, not an extension of
+  the marker.
+- Sub-item — **historical per-turn changesets are *not* fully
+  recoverable.** `ctx.vcs.diff`'s `mode` is `working | branch | committed`
+  with a single `base` reference; there is no mode that diffs two snapshot
+  IDs. The per-`Assistant` `snapshot { start, end }` (opencode git
+  snapshot IDs) is durable, but the plugin VCS surface cannot diff them
+  directly. Session/working changesets still recompute (the current
+  `refreshChangeset` reads the "after" state from disk); only per-turn
+  changeset history would need snapshot-diffing the plugin surface does not
+  expose.
+
+**2. In-flight turns are not resumable — document as a known limitation
+(not fixable with the marker).**
+- A reload **interrupts in-flight executions**: `LocationServiceMap.reload`
+  invalidates all refs and the finalizers interrupt the execution fibers
+  (the execution API documents "interrupt active work … idle interruption
+  is a no-op"). The in-flight turn's `activeTurn`/streaming parts are lost;
+  a client cannot resume it and must start a new turn.
+- **The "orphaned permission" concern self-resolves.** The `Permission`
+  service keeps pending requests in an in-memory `Map<ID, Pending>` with a
+  `Deferred` each, and its finalizer (`close`, registered via
+  `Effect.addFinalizer`) publishes `permission.replied: reject` for
+  **every** pending request and fails each deferred with `DeclinedError`.
+  On reload, pending permissions are therefore auto-declined (not left
+  dangling) and the waiting turn settles cleanly.
+- Caveat: the reject fires **during the old location's teardown**, and our
+  event pump is torn down in the same pass — so an AHP client never receives
+  a "your permission was declined by the reload" notice; it just sees the
+  session go idle / the turn end. Acceptable under R2, but worth stating.
+
+**3. Active clients — confirmed *not* durable by protocol design; do NOT
+persist.**
+- AHP docs (`SessionState.activeClients`): "Membership is host-managed:
+  clients add (or refresh) themselves with `session/activeClientSet`, and
+  the host removes them with `session/activeClientRemoved` when they
+  unsubscribe, disconnect without reconnecting in time, or reconnect
+  without resubscribing to the session."
+- So membership is **per-connection, transient, and client-reannounced** —
+  not a durable session property. After a host restart the client
+  resubscribes; the VS Code dispatch path
+  (`_dispatchActiveClientWhenResolved`) dedupes against (a) the
+  host-reported `existing` from the subscription snapshot and (b)
+  `lastPublished`, which is **keyed by the connection object**. On
+  reconnect the `connection` is a fresh object, so the (b) check fails and
+  the client re-dispatches `activeClientSet` when that path re-runs.
+  **Self-heal is a client-side obligation by protocol design** — persisting
+  it on the host would be wrong (it would re-announce clients that
+  actually disconnected, and it is not a durable property).
+- Flag: the exact reconnect/resubscribe orchestration is not in the
+  extracted VS Code 1.145.2 sources, so re-dispatch on reconnect is
+  strongly indicated (protocol intent + connection-keyed dedupe) but not
+  100% confirmed. Worst case the opencode-side tool registration resets
+  with the plugin runtime, so state stays consistent.
+
+**4. Read/status bits (isRead, session/chat status) — low value; persist
+only if it becomes a real ask.**
+- `isRead`, `isArchived`, status/activity, and chat `isRead`/`isArchived`
+  are in-memory and lost on reload; re-registration reconstructs them from
+  defaults. Small scalars that *could* ride the marker, but low user value
+  now. Candidate only if read-marker persistence is requested.
+
+**5. Chat titles — confirmed non-issue (no durable state to lose).**
+- AHP 1.0.0 has **no `ChatTitleChanged` action and no `title` field on
+  `CreateChatParams`** (verified against the `StateAction` union and
+  `CreateChatParams`). Chat titles are host-chose (`Chat 1`, `Chat <n>`)
+  and were never client-settable — so there is no pre-restart chat title to
+  preserve, and `reattachPeerChat` re-deriving `Chat <n>` is correct (the
+  index `n` can shift if re-attach order differs — cosmetic).
+- **Session titles** (the only client-settable title) already survive:
+  `session/titleChanged` → `dispatchTitleChanged` → `facade.rename` → the
+  opencode session title (durable), re-read on re-registration (§14.13.1).
+- (An earlier "cheap fix" idea — use `fs.title` for re-attached *chat*
+  titles — is **rejected**: `fs.title` is the peer backend's opencode
+  *session* title, a different concept from the host-chose AHP chat title;
+  using it would conflate the two and be inconsistent with the default
+  chat's "Chat 1".)
+
+**Conclusion / recommendation.**
+- The marker strategy (§14.13.1) is correctly scoped to *identity/binding*
+  persistence — which is exactly what it does. Previous features that lose
+  state across a reload split into two buckets:
+  - **Content already durable in opencode and recoverable through the
+    existing plugin API** — the real gap is that the host never hydrates
+    it. The only candidate worth scheduling is **turn-history hydration**
+    (finding 1): a new Phase 4 extension using `ctx.session.context` + AHP's
+    `fetchTurns` / `chat/turnsLoaded` / `turnsNextCursor`, with **no marker
+    change**.
+  - **Ephemeral-by-design state** (active clients, in-flight turns,
+    read/status bits) — should **not** be persisted; document as known
+    limitations (findings 2, 3, 4).
+- **No previous feature needs a new marker.** The one worth doing is turn
+  hydration, which is extension-scale work, not a marker addition.
 
 ---
 

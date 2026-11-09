@@ -29,16 +29,17 @@ export function channelKind(uri: string): ChannelKind {
   return "unknown";
 }
 
-/**
- * Channel URI of a session. opencode has one chat per session (plan §3.2
- * gap, same as pi-ahp / ahp-acp-gateway), and the session's default chat
- * reuses the session id.
- */
+/** Channel URI of a session. */
 export function sessionChannelURI(sessionID: string): string {
   return SESSION_PREFIX + sessionID;
 }
 
-/** Channel URI of a session's (single) default chat. */
+/**
+ * Channel URI of a session's default chat. The default chat reuses the
+ * session's opencode id as its suffix (the single-chat zero-wire-change
+ * mapping); peer chats created via `createChat` carry client-chosen
+ * suffixes instead (plan §14.13).
+ */
 export function chatChannelURI(sessionID: string): string {
   return CHAT_PREFIX + sessionID;
 }
@@ -97,19 +98,23 @@ export function parseChangesetChannel(uri: string): ParsedChangesetChannel | nul
   return null;
 }
 
-/** Changeset URI of a session's uncommitted (working-tree) changes. */
-export function uncommittedChangesetURI(sessionID: string): string {
-  return `${chatChannelURI(sessionID)}/changeset/uncommitted`;
+/**
+ * Changeset URI of one chat's uncommitted (working-tree) changes. The
+ * owner is the chat channel itself (multi-chat: every chat has its own
+ * uncommitted changeset — plan §14.13).
+ */
+export function uncommittedChangesetURI(chatChannel: string): string {
+  return `${chatChannel}/changeset/uncommitted`;
 }
 
-/** Changeset URI of a session's session-wide changes. */
-export function sessionChangesetURI(sessionID: string): string {
-  return `${sessionChannelURI(sessionID)}/changeset/session`;
+/** Changeset URI of a session's session-wide changes (owner: the session channel). */
+export function sessionChangesetURI(sessionChannel: string): string {
+  return `${sessionChannel}/changeset/session`;
 }
 
-/** Changeset URI of one turn's captured file changes. */
-export function turnChangesetURI(sessionID: string, turnId: string): string {
-  return `${chatChannelURI(sessionID)}/changeset/turn/${turnId}`;
+/** Changeset URI of one turn's captured file changes (owner: the chat channel). */
+export function turnChangesetURI(chatChannel: string, turnId: string): string {
+  return `${chatChannel}/changeset/turn/${turnId}`;
 }
 
 export interface SubscribeOutcome {

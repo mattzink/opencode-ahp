@@ -70,8 +70,20 @@ describe("mapCatalog", () => {
             maxPromptTokens: 229376,
           },
         ],
+        capabilities: { multipleChats: {} },
       },
     ]);
+  });
+
+  it("advertises plain multi-chat (no fork/sideChat sub-caps — plan §14.13)", () => {
+    const agents = mapCatalog([provider()]);
+    // Empty object = multi-chat without source-based creation; conformant
+    // clients (VS Code gates its fork UI on `multipleChats.fork`) never
+    // attempt the unsupported forms.
+    expect(agents[0]!.capabilities).toEqual({ multipleChats: {} });
+    expect(agents[0]!.capabilities?.multipleChats?.fork).toBeUndefined();
+    expect(agents[0]!.capabilities?.multipleChats?.sideChat).toBeUndefined();
+    expect(agents[0]!.capabilities?.multipleWorkingDirectories).toBeUndefined();
   });
 
   it("uses an explicit description when present", () => {
@@ -790,8 +802,8 @@ describe("mapV2Event", () => {
 // ── Phase 2: changesets ───────────────────────────────────────────────────
 
 describe("changeset catalogues", () => {
-  it("session catalog: the session-wide changeset only", () => {
-    const catalog = sessionChangesetCatalog("s-1");
+  it("session catalog: the session-wide changeset only (owner: the session channel)", () => {
+    const catalog = sessionChangesetCatalog("ahp-session:/s-1");
     expect(catalog).toEqual([
       {
         label: "Session Changes",
@@ -802,14 +814,23 @@ describe("changeset catalogues", () => {
     ]);
   });
 
-  it("chat catalog: uncommitted + session + the per-turn template", () => {
-    const catalog = chatChangesetCatalog("s-1");
+  it("chat catalog: uncommitted + session + the per-turn template (owner-aware URIs)", () => {
+    const catalog = chatChangesetCatalog("ahp-chat:/s-1", "ahp-session:/s-1");
     expect(catalog.map((c) => [c.label, c.uriTemplate, c.changeKind])).toEqual([
       ["Uncommitted Changes", "ahp-chat:/s-1/changeset/uncommitted", "uncommitted"],
       ["Session Changes", "ahp-session:/s-1/changeset/session", "session"],
       ["Turn Changes", "ahp-chat:/s-1/changeset/turn/{turnId}", "turn"],
     ]);
     for (const c of catalog) expect(c.capabilities).toEqual({ review: {} });
+  });
+
+  it("chat catalog: a peer chat's uncommitted/turn changesets key off its own URI", () => {
+    const catalog = chatChangesetCatalog("ahp-chat:/peer-1", "ahp-session:/s-1");
+    expect(catalog.map((c) => [c.label, c.uriTemplate, c.changeKind])).toEqual([
+      ["Uncommitted Changes", "ahp-chat:/peer-1/changeset/uncommitted", "uncommitted"],
+      ["Session Changes", "ahp-session:/s-1/changeset/session", "session"],
+      ["Turn Changes", "ahp-chat:/peer-1/changeset/turn/{turnId}", "turn"],
+    ]);
   });
 });
 

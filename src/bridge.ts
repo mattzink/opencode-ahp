@@ -91,6 +91,12 @@ export interface FacadeSession {
   model?: FacadeModelRef;
   archived?: boolean;
   time: { created: number; updated: number };
+  /**
+   * Durable, core-opaque session metadata (plan §14.13.1). The host uses
+   * one key — `opencode-ahp` — to make the peer-chat binding survive a
+   * restart; everything else is passed through opaquely.
+   */
+  metadata?: Record<string, unknown>;
 }
 
 /** `SessionPromptInput.delivery` (steer | queue; absent = default). */
@@ -174,11 +180,19 @@ export interface OpencodeFacade {
     title?: string;
     agent?: string;
     model?: FacadeModelRef;
+    /** Durable session metadata (plan §14.13.1) — the host's chat-binding marker rides here. */
+    metadata?: Record<string, unknown>;
   }): Promise<FacadeSession>;
   /** All opencode sessions for this location. */
   listSessions(): Promise<readonly FacadeSession[]>;
   /** One opencode session, or null when it does not exist. */
   getSession(sessionID: string): Promise<FacadeSession | null>;
+  /**
+   * Remove an opencode session (`ctx.session.remove`). Phase 4
+   * extension 2: `disposeChat` removes a chat's backend session, and
+   * record removal disposes the peer-chat backends (plan §14.13).
+   */
+  removeSession(sessionID: string): Promise<void>;
   /**
    * Send a prompt. `delivery` maps to `SessionPromptInput.delivery`
    * ("steer" | "queue"); absent = the default (start or continue a turn).
@@ -397,6 +411,12 @@ export function mapCatalog(
       displayName: provider.name,
       description: provider.description ?? provider.name,
       models,
+      // Phase 4 extension 2 (plan §14.13): advertise plain multi-chat.
+      // No `fork`/`sideChat` sub-caps — the opencode plugin surface has
+      // no fork API in 2.2.6, so conformant clients (VS Code gates its
+      // UI on these) will never attempt the unsupported source forms.
+      // No `multipleWorkingDirectories` either (a location is one dir).
+      capabilities: { multipleChats: {} },
       ...(customizations !== undefined ? { customizations } : {}),
     });
   }
@@ -704,7 +724,9 @@ export function userMessage(text: string, model?: string, agentUri?: string): Me
 
 /**
  * Build the `SessionSummary` for root notifications / `listSessions` from
- * a live record's denormalized fields.
+ * a live record's denormalized fields. `chats` is the full catalog in
+ * authoritative order (default first, then insertion order — plan
+ * §14.13).
  */
 export function buildSessionSummary(input: {
   channel: string;
@@ -714,7 +736,7 @@ export function buildSessionSummary(input: {
   activity?: string;
   createdAt: string;
   modifiedAt: string;
-  chat: ChatSummary;
+  chats: ChatSummary[];
   defaultChat: string;
 }): SessionSummary {
   return {
@@ -725,7 +747,7 @@ export function buildSessionSummary(input: {
     ...(input.activity !== undefined ? { activity: input.activity } : {}),
     createdAt: input.createdAt,
     modifiedAt: input.modifiedAt,
-    chats: [input.chat],
+    chats: input.chats,
     defaultChat: input.defaultChat,
   };
 }
@@ -967,12 +989,13 @@ export function discardOperation(): ChangesetOperation {
  * The session channel's changeset catalogue: the session-wide changeset
  * only (the protocol's "session" changeKind — all changes the agent has
  * produced; approximated by the working tree vs HEAD, plan §14.10).
+ * Takes the session channel URI (the owner — plan §14.13).
  */
-export function sessionChangesetCatalog(sessionID: string): Changeset[] {
+export function sessionChangesetCatalog(sessionChannel: string): Changeset[] {
   return [
     {
       label: "Session Changes",
-      uriTemplate: sessionChangesetURI(sessionID),
+      uriTemplate: sessionChangesetURI(sessionChannel),
       changeKind: "session",
       capabilities: { review: {} },
     },
@@ -980,27 +1003,29 @@ export function sessionChangesetCatalog(sessionID: string): Changeset[] {
 }
 
 /**
- * The chat channel's changeset catalogue: uncommitted changes, the
- * session-wide changeset, and the per-turn template (`{turnId}` expands
- * against the chat's turns — the protocol's standard template shapes).
+ * The chat channel's changeset catalogue: the chat's own uncommitted
+ * changes, the session-wide changeset, and the per-turn template
+ * (`{turnId}` expands against the chat's turns — the protocol's standard
+ * template shapes). Multi-chat: every chat has its own catalogue keyed
+ * off its own channel URI (plan §14.13).
  */
-export function chatChangesetCatalog(sessionID: string): Changeset[] {
+export function chatChangesetCatalog(chatChannel: string, sessionChannel: string): Changeset[] {
   return [
     {
       label: "Uncommitted Changes",
-      uriTemplate: uncommittedChangesetURI(sessionID),
+      uriTemplate: uncommittedChangesetURI(chatChannel),
       changeKind: "uncommitted",
       capabilities: { review: {} },
     },
     {
       label: "Session Changes",
-      uriTemplate: sessionChangesetURI(sessionID),
+      uriTemplate: sessionChangesetURI(sessionChannel),
       changeKind: "session",
       capabilities: { review: {} },
     },
     {
       label: "Turn Changes",
-      uriTemplate: turnChangesetURI(sessionID, "{turnId}"),
+      uriTemplate: turnChangesetURI(chatChannel, "{turnId}"),
       changeKind: "turn",
       capabilities: { review: {} },
     },

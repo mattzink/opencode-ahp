@@ -25,10 +25,13 @@
  * (`chat/turnStarted`, `chat/pendingMessageSet`, `chat/toolCallConfirmed`,
  * `chat/turnCancelled`, drafts/read/title/activeClient echoes, …).
  *
- * Session model: one opencode session = one AHP session channel = one
- * default chat channel (plan §3.2 gap, same as pi-ahp). Channel suffixes
- * are opaque; opencode session ids start with "ses" and double as
- * suffixes for externally created sessions.
+ * Session model: one AHP session = one opencode location session record
+ * holding a chat catalog; one AHP chat = one opencode session (plan
+ * §14.13). The default chat reuses the record's opencode session, so
+ * single-chat clients see zero wire change; peer chats created via
+ * `createChat` bind fresh opencode sessions to client-chosen chat URIs.
+ * Channel suffixes are opaque; opencode session ids start with "ses"
+ * and double as suffixes for externally created sessions.
  *
  * Root session lifecycle events (`root/sessionAdded`,
  * `root/sessionRemoved`, `root/sessionSummaryChanged`) are JSON-RPC
@@ -185,22 +188,16 @@ interface ClientRecord {
 }
 
 /**
- * Everything the host knows about one live opencode session: the two
- * official-reducer stores (session + its single chat), the denormalized
- * summary fields for root notifications, and the per-turn tracking the
- * event pump needs to join opencode events to AHP turns.
+ * Phase 4 extension 2: everything the host tracks for one AHP chat —
+ * the backing opencode session, its chat-state store, and the per-turn
+ * tracking the event pump needs to join opencode events to AHP turns.
+ * One AHP chat ↔ one opencode session (plan §14.13).
  */
-interface SessionRecord {
-  /** The opencode session id (`ses_…`). */
+interface ChatRuntime {
+  /** The AHP chat channel URI (`ahp-chat:/…`). */
+  uri: string;
+  /** The opencode session id backing this chat (`ses_…`). */
   sessionID: string;
-  /** The AHP session channel URI (`ahp-session:/<suffix>`). */
-  channel: string;
-  /** Identity `SessionSummary.provider` (fixed at registration). */
-  provider: string;
-  createdAt: string;
-  /** Denormalized `SessionSummary.modifiedAt` (ISO; lexicographic = chronological). */
-  modifiedAt: string;
-  sessionStore: SessionStateStore;
   chatStore: ChatStateStore;
   // ── turn tracking (event-pump join state) ────────────────────────────
   /** The AHP turnId the pump joins opencode events to, or null. */
@@ -230,15 +227,45 @@ interface SessionRecord {
   /** The most recent `session.inbox.enqueued` (external/TUI prompt tracking). */
   lastInbox: { text: string; delivery: string } | null;
   // ── Phase 2: changesets ────────────────────────────────────────────────
-  /** Live changeset stores, keyed by changeset URI (created on subscribe). */
+  /**
+   * Live chat-owned changeset stores (uncommitted + turn), keyed by
+   * changeset URI (created on subscribe). The session-kind changeset
+   * store lives on the record instead (the session channel owns it).
+   */
   changesets: Map<string, ChangesetStateStore>;
   /**
    * Per-turn file snapshots for the turn changesets: turnId → absPath →
    * captured {before (pre-edit disk read), after (disk at turn end)}.
-   * `null` = the file was absent on that side. Kept until the session is
+   * `null` = the file was absent on that side. Kept until the chat is
    * removed (content refs + discard-restore read them, plan §14.10).
    */
   turnSnapshots: Map<string, Map<string, { before: string | null; after: string | null }>>;
+}
+
+/**
+ * Everything the host knows about one AHP session: the session store,
+ * its chat catalog (default chat first, then insertion order), and the
+ * denormalized summary fields for root notifications. `sessionID` is the
+ * default chat's opencode id — the key of the `sessions` map and the
+ * event-pump join key for the default chat.
+ */
+interface SessionRecord {
+  /** The default chat's opencode session id (`ses_…`). */
+  sessionID: string;
+  /** The AHP session channel URI (`ahp-session:/<suffix>`). */
+  channel: string;
+  /** Identity `SessionSummary.provider` (fixed at registration). */
+  provider: string;
+  createdAt: string;
+  /** Denormalized `SessionSummary.modifiedAt` (ISO; lexicographic = chronological). */
+  modifiedAt: string;
+  sessionStore: SessionStateStore;
+  /** Chat runtimes keyed by chat channel URI (default first, insertion order). */
+  chats: Map<string, ChatRuntime>;
+  /** The chat channel URI that receives input when none is selected. */
+  defaultChatURI: string;
+  /** The session-kind changeset store (owned by the session channel). */
+  sessionChangesets: Map<string, ChangesetStateStore>;
 }
 
 export interface HostOptions {
@@ -275,6 +302,41 @@ const LIST_SESSIONS_DEFAULT_LIMIT = 100;
 const SNAPSHOT_TOOLS = new Set(["write", "edit", "apply", "patch"]);
 /** The tool-input keys that carry a file path (checked in order). */
 const SNAPSHOT_PATH_KEYS = ["path", "file_path", "filePath", "file"] as const;
+/**
+ * Phase 4 extension 2 (durability): the opencode session-metadata key
+ * carrying the AHP markers (plan §14.13.1). Two shapes, same key:
+ *   - on a peer-chat backend:
+ *     `{ chat: <chat channel URI>, owner: <the opencode session id of
+ *     the owning AHP session> }` — `owner` is the opencode id, not the
+ *     channel suffix (a client-chosen suffix differs from the minted
+ *     opencode id);
+ *   - on the default backend of a minted-id session:
+ *     `{ channel: <session channel URI> }` — the client-chosen session
+ *     channel (a "ses" suffix is its own opencode id and needs none).
+ * (The keep-alive anchor uses the same key with a STRING value —
+ * `parseAhpMarker` ignores non-record markers.)
+ */
+const AHP_METADATA_KEY = "opencode-ahp";
+
+/**
+ * Parse the AHP markers from an opencode session's durable metadata.
+ * Defensive: a malformed shape (missing key, non-record marker — e.g.
+ * the keep-alive anchor — or wrong-kind fields) means "no marker" —
+ * standalone registration under the opencode id.
+ */
+function parseAhpMarker(metadata: unknown): { chat?: string; owner?: string; channel?: string } | null {
+  if (!isRecord(metadata)) return null;
+  const marker = metadata[AHP_METADATA_KEY];
+  if (!isRecord(marker)) return null;
+  const out: { chat?: string; owner?: string; channel?: string } = {};
+  const chat = marker["chat"];
+  if (typeof chat === "string" && channelKind(chat) === "chat") out.chat = chat;
+  const owner = marker["owner"];
+  if (typeof owner === "string" && owner.startsWith("ses")) out.owner = owner;
+  const channel = marker["channel"];
+  if (typeof channel === "string" && channelKind(channel) === "session") out.channel = channel;
+  return Object.keys(out).length > 0 ? out : null;
+}
 
 export class Host {
   private readonly seq: Sequencer;
@@ -290,6 +352,24 @@ export class Host {
    */
   private readonly sessions = new Map<string, SessionRecord>();
   private readonly byChannel = new Map<string, SessionRecord>();
+  /**
+   * Phase 4 extension 2: opencode session id → the (record, chat) the id
+   * backs. The event pump's join key — every chat has its own opencode
+   * session, and the pump must land on the owning chat, not just the
+   * record (plan §14.13).
+   */
+  private readonly byOpencode = new Map<string, { rec: SessionRecord; chat: ChatRuntime }>();
+  /**
+   * Phase 4 extension 2 (durability): marked peer backends whose owner
+   * AHP session is not registered yet, keyed by the marker's `owner`
+   * (opencode session id). A peer can be listed before its owner in the
+   * same synchronous `listSessions` pass, and after a restart the owner
+   * record does not exist until it is listed (there is no boot-time
+   * event replay). Drained when the owner registers; an entry whose
+   * owner is gone from opencode falls back to standalone registration
+   * after the grace window.
+   */
+  private readonly pendingChatBindings = new Map<string, { fs: FacadeSession; chatURI: string }[]>();
   private readonly opts: HostOptions;
   private readonly log: (message: string) => void;
   private turnCounter = 0;
@@ -382,17 +462,20 @@ export class Host {
         channel: rec.channel,
         action: { type: ActionType.SessionActiveClientRemoved, clientId },
       });
-      for (const [toolCallId, inv] of rec.clientToolCalls) {
-        if (inv.clientId !== clientId || inv.result !== undefined) continue;
-        inv.result = { ok: false, error: `client ${clientId} disconnected before completing the tool call` };
-        this.settleClientTool(rec, inv);
-        // The reducer's inputNeededRemoved is a no-op when the id is
-        // absent, so this is safe for an invocation whose request was
-        // already cleared on the normal completion path.
-        this.publish({
-          channel: rec.channel,
-          action: { type: ActionType.SessionInputNeededRemoved, id: toolCallId },
-        });
+      // In-flight client-tool calls are per-chat (plan §14.13).
+      for (const chat of rec.chats.values()) {
+        for (const [toolCallId, inv] of chat.clientToolCalls) {
+          if (inv.clientId !== clientId || inv.result !== undefined) continue;
+          inv.result = { ok: false, error: `client ${clientId} disconnected before completing the tool call` };
+          this.settleClientTool(inv);
+          // The reducer's inputNeededRemoved is a no-op when the id is
+          // absent, so this is safe for an invocation whose request was
+          // already cleared on the normal completion path.
+          this.publish({
+            channel: rec.channel,
+            action: { type: ActionType.SessionInputNeededRemoved, id: toolCallId },
+          });
+        }
       }
     }
     if (evicted) void this.syncClientToolsToOpencode();
@@ -484,6 +567,12 @@ export class Host {
         break;
       case "createSession":
         await this.handleCreateSession(socketId, msg);
+        break;
+      case "createChat":
+        await this.handleCreateChat(socketId, msg);
+        break;
+      case "disposeChat":
+        await this.handleDisposeChat(socketId, msg);
         break;
       case "resourceRead":
         await this.handleResourceRead(socketId, msg);
@@ -747,12 +836,29 @@ export class Host {
     // only when it already is one; otherwise let opencode mint an id and
     // record the suffix→id mapping (the record key is the opencode id).
     const passID = suffix.startsWith("ses") ? suffix : undefined;
-    const created = await this.opts.facade.createSession({ id: passID, model });
+    const created = await this.opts.facade.createSession({
+      id: passID,
+      model,
+      // Durability (plan §14.13.1): a minted-id default backend carries
+      // the client-chosen session channel in its opencode metadata —
+      // after a restart the session resurfaces under the ORIGINAL channel
+      // instead of its opencode id (a "ses" suffix IS the opencode id and
+      // needs no marker).
+      ...(passID === undefined ? { metadata: { [AHP_METADATA_KEY]: { channel } } } : {}),
+    });
 
     // Slow-create race: the pump may have registered this opencode session
     // under its own id as an external session while `createSession` was in
     // flight. Remap: drop the interim record (root/sessionRemoved) and
     // re-register under the client-chosen channel below.
+    //
+    // Marker interaction (plan §14.13.1): with the channel marker, the
+    // interim external registration lands under the MARKED channel (the
+    // client's own), so `interim.channel !== channel` is false and the
+    // remap is skipped — the re-registration below then re-announces the
+    // session (a duplicate root/sessionAdded in this rare race; cosmetic,
+    // the client converges on the snapshot, and the race requires
+    // createSession to exceed the 250 ms external-register grace).
     const interim = this.sessions.get(created.sessionID);
     if (interim !== undefined && interim.channel !== channel) {
       this.removeRecord(interim);
@@ -773,9 +879,6 @@ export class Host {
         customizations,
       }),
     );
-    const chatStore = createChatStateStore(
-      initialChatState({ resource: chatChannelURI(created.sessionID), title: "Chat 1", modifiedAt: now }),
-    );
     const rec: SessionRecord = {
       sessionID: created.sessionID,
       channel,
@@ -785,29 +888,19 @@ export class Host {
         ? new Date(created.time.updated).toISOString()
         : now,
       sessionStore,
-      chatStore,
-      currentTurnId: null,
-      turnStartedAt: null,
-      turnModelRef: null,
-      parts: new Set(),
-      toolInput: new Map(),
-      toolName: new Map(),
-      toolReady: new Set(),
-      permissionForTool: new Map(),
-      toolForPermission: new Map(),
-      lastInbox: null,
-      changesets: new Map(),
-      turnSnapshots: new Map(),
-      clientToolCalls: new Map(),
+      chats: new Map(),
+      defaultChatURI: chatChannelURI(created.sessionID),
+      sessionChangesets: new Map(),
     };
     this.sessions.set(created.sessionID, rec);
     this.byChannel.set(channel, rec);
-    this.byChannel.set(chatChannelURI(created.sessionID), rec);
     // The session channel carries the client-chosen suffix; the chat
     // channel and the event pump carry the opencode id — both must
     // resolve in the registry.
     this.channels.addSession(suffix);
     this.channels.addSession(created.sessionID);
+    const defaultChat = this.newChatRuntime(rec.defaultChatURI, created.sessionID, "Chat 1", now);
+    this.bindChat(rec, defaultChat);
 
     // Phase 4 extension 1: a createSession `activeClient` seeds the
     // session's tools — register them with opencode now.
@@ -817,11 +910,11 @@ export class Host {
     this.publish({ channel, action: { type: ActionType.SessionReady } });
     this.publish({
       channel,
-      action: { type: ActionType.SessionChatAdded, summary: chatSummaryOf(chatStore.state) },
+      action: { type: ActionType.SessionChatAdded, summary: chatSummaryOf(defaultChat.chatStore.state) },
     });
     this.publish({
       channel,
-      action: { type: ActionType.SessionDefaultChatChanged, defaultChat: chatChannelURI(created.sessionID) },
+      action: { type: ActionType.SessionDefaultChatChanged, defaultChat: rec.defaultChatURI },
     });
     // Phase 2: advertise the changeset catalogues (session channel: the
     // session-wide changeset; chat channel: uncommitted + session + the
@@ -829,11 +922,14 @@ export class Host {
     if (this.opts.changesets) {
       this.publish({
         channel,
-        action: { type: ActionType.SessionChangesetsChanged, changesets: sessionChangesetCatalog(created.sessionID) },
+        action: { type: ActionType.SessionChangesetsChanged, changesets: sessionChangesetCatalog(channel) },
       });
       this.publish({
-        channel: chatChannelURI(created.sessionID),
-        action: { type: ActionType.ChatChangesetsChanged, changesets: chatChangesetCatalog(created.sessionID) },
+        channel: rec.defaultChatURI,
+        action: {
+          type: ActionType.ChatChangesetsChanged,
+          changesets: chatChangesetCatalog(rec.defaultChatURI, channel),
+        },
       });
     }
     // Root: active-session count (action, replayed) + sessionAdded (notification).
@@ -847,6 +943,289 @@ export class Host {
     });
 
     this.sendFrame(socketId, { jsonrpc: "2.0", id: msg.id ?? null, result: null });
+  }
+
+  // ── Phase 4 extension 2: multi-chat ────────────────────────────────────
+
+  /**
+   * Fresh per-chat runtime (plan §14.13): one AHP chat = one opencode
+   * session, with its own chat-state store and all the per-turn tracking
+   * the event pump joins opencode events to.
+   */
+  private newChatRuntime(uri: string, sessionID: string, title: string, modifiedAt: string): ChatRuntime {
+    return {
+      uri,
+      sessionID,
+      chatStore: createChatStateStore(initialChatState({ resource: uri, title, modifiedAt })),
+      currentTurnId: null,
+      turnStartedAt: null,
+      turnModelRef: null,
+      parts: new Set(),
+      toolInput: new Map(),
+      toolName: new Map(),
+      toolReady: new Set(),
+      permissionForTool: new Map(),
+      toolForPermission: new Map(),
+      clientToolCalls: new Map(),
+      lastInbox: null,
+      changesets: new Map(),
+      turnSnapshots: new Map(),
+    };
+  }
+
+  /**
+   * Bind a chat runtime to its record: the record's catalog, the
+   * channel→record lookup, and the opencode-id→(record, chat) reverse
+   * binding (the event pump's join key). The channel registry gets the
+   * chat URI's suffix — that is what makes the chat channel and its
+   * changesets (whose owner is the chat channel) subscribable. The
+   * default chat's suffix IS its opencode id, added by the
+   * registration paths; a peer chat's opencode id gets no registry
+   * entry (it has no subscribable session channel of its own — plan
+   * §14.13).
+   */
+  private bindChat(rec: SessionRecord, chat: ChatRuntime): void {
+    rec.chats.set(chat.uri, chat);
+    this.byChannel.set(chat.uri, rec);
+    this.byOpencode.set(chat.sessionID, { rec, chat });
+    const suffix = sessionIDOf(chat.uri);
+    if (suffix !== null) this.channels.addSession(suffix);
+  }
+
+  /**
+   * Unbind a chat runtime (dispose or record removal): clear its live
+   * changesets (`changeset/cleared` — protocol case 2), fail its
+   * in-flight client-tool executions (the waiters must not leak), and
+   * drop every binding.
+   */
+  private removeChat(rec: SessionRecord, chat: ChatRuntime, toolError = "chat removed before the client completed the tool call"): void {
+    for (const uri of chat.changesets.keys()) {
+      this.publish({ channel: uri, action: { type: ActionType.ChangesetCleared } });
+    }
+    chat.changesets.clear();
+    chat.turnSnapshots.clear();
+    for (const inv of chat.clientToolCalls.values()) {
+      if (inv.result !== undefined) continue;
+      inv.result = { ok: false, error: toolError };
+      this.settleClientTool(inv);
+    }
+    chat.clientToolCalls.clear();
+    rec.chats.delete(chat.uri);
+    this.byChannel.delete(chat.uri);
+    this.byOpencode.delete(chat.sessionID);
+    const suffix = sessionIDOf(chat.uri);
+    if (suffix !== null) this.channels.removeSession(suffix);
+    this.channels.removeSession(chat.sessionID);
+  }
+
+  /**
+   * `createChat` (AHP 1.0.0 chat command): create a new chat in an
+   * existing session. The 1:1 mapping (plan §14.13): mint a fresh
+   * opencode session (same provider/model resolution as `createSession`)
+   * and bind it to the client-chosen chat URI. Result: `null` (the
+   * client waits for `session/chatAdded` on the session channel, and
+   * rolls back with `disposeChat` when the chat never surfaces — so
+   * everything below is published before the response). `source` and
+   * `workingDirectories` are rejected with INVALID_PARAMS: the
+   * capability is advertised without fork/sideChat/
+   * multipleWorkingDirectories, so conformant clients never send them.
+   *
+   * Error codes: -32602 (invalid params, including `source`/
+   * `workingDirectories`), -32001 (no such session), -32003 (chat URI
+   * already exists), -32603 (backend session creation or initial
+   * message failure — the chat is rolled back in that case).
+   */
+  private async handleCreateChat(socketId: number, msg: RpcMessage): Promise<void> {
+    const params = isRecord(msg.params) ? msg.params : {};
+    const channel = params["channel"];
+    const chatURI = params["chat"];
+    if (typeof channel !== "string" || channelKind(channel) !== "session") {
+      this.sendError(socketId, msg.id, ERROR_INVALID_PARAMS, "createChat requires an ahp-session:/… channel");
+      return;
+    }
+    const rec = this.byChannel.get(channel);
+    if (rec === undefined) {
+      this.sendError(socketId, msg.id, ERROR_SESSION_NOT_FOUND, `no such session: ${channel}`);
+      return;
+    }
+    if (typeof chatURI !== "string" || channelKind(chatURI) !== "chat") {
+      this.sendError(socketId, msg.id, ERROR_INVALID_PARAMS, "createChat requires an ahp-chat:/… chat URI");
+      return;
+    }
+    // A marker in the chat suffix would make the chat channel
+    // string-identical to a changeset URI of the chat before the marker
+    // (the same trap createSession rejects for session suffixes).
+    if (chatURI.includes("/changeset/")) {
+      this.sendError(socketId, msg.id, ERROR_INVALID_PARAMS, "chat URI must not contain \"/changeset/\"");
+      return;
+    }
+    if (chatURI === rec.defaultChatURI || rec.chats.has(chatURI)) {
+      this.sendError(socketId, msg.id, ERROR_SESSION_EXISTS, `chat already exists: ${chatURI}`);
+      return;
+    }
+    if (params["source"] !== undefined) {
+      this.sendError(socketId, msg.id, ERROR_INVALID_PARAMS, "createChat `source` is not supported (no fork/sideChat capability)");
+      return;
+    }
+    if (params["workingDirectories"] !== undefined) {
+      this.sendError(socketId, msg.id, ERROR_INVALID_PARAMS, "createChat `workingDirectories` is not supported (no multipleWorkingDirectories capability)");
+      return;
+    }
+
+    // Same provider/model resolution as createSession's default path:
+    // the first non-disabled provider's first enabled model.
+    const providers = await this.opts.facade.listCatalog();
+    const provider = providers.find((p) => p.activation !== "disabled");
+    const model = provider !== undefined ? firstEnabledModelRef(provider.models) : undefined;
+    const now = new Date().toISOString();
+    let created;
+    try {
+      // Plan §14.13.1: write the chat-binding marker atomically at
+      // create — it is what re-attaches this backend to this session's
+      // chat catalog after an opencode/plugin restart (opencode session
+      // metadata is the only durable surface a plugin has).
+      created = await this.opts.facade.createSession({
+        model,
+        metadata: { [AHP_METADATA_KEY]: { chat: chatURI, owner: rec.sessionID } },
+      });
+    } catch (err) {
+      this.sendError(socketId, msg.id, ERROR_INTERNAL, `failed to create the chat's backend session: ${errorMessage(err)}`);
+      return;
+    }
+    const chat = this.newChatRuntime(chatURI, created.sessionID, `Chat ${rec.chats.size + 1}`, now);
+    this.bindChat(rec, chat);
+    // Session-channel lifecycle (server-side, no origin): the catalog
+    // mutation the client is waiting for, plus the changeset catalogue
+    // on the new chat channel.
+    this.publish({
+      channel,
+      action: { type: ActionType.SessionChatAdded, summary: chatSummaryOf(chat.chatStore.state) },
+    });
+    if (this.opts.changesets) {
+      this.publish({
+        channel: chatURI,
+        action: { type: ActionType.ChatChangesetsChanged, changesets: chatChangesetCatalog(chatURI, rec.channel) },
+      });
+    }
+
+    // initialMessage → the chat's first turn (write-ahead, same
+    // claim-then-prompt semantics as dispatchTurnStarted). A failure
+    // rolls the whole chat back — the client never sees a chat whose
+    // promised first turn never happened.
+    const initialParam = params["initialMessage"];
+    if (initialParam !== undefined) {
+      if (!isRecord(initialParam) || typeof initialParam["text"] !== "string" || (initialParam["text"] as string).length === 0) {
+        await this.disposeChatBackend(rec, chat);
+        this.sendError(socketId, msg.id, ERROR_INVALID_PARAMS, "createChat `initialMessage` requires a message with non-empty text");
+        return;
+      }
+      const message = initialParam as unknown as Message;
+      const selectionError = await this.applyMessageSelection(chat, message);
+      if (selectionError !== null) {
+        await this.disposeChatBackend(rec, chat);
+        this.sendError(socketId, msg.id, ERROR_INTERNAL, `failed to apply initial message model/agent selection: ${selectionError}`);
+        return;
+      }
+      const turnId = this.mintTurnId();
+      chat.currentTurnId = turnId;
+      chat.turnStartedAt = Date.now();
+      try {
+        await this.opts.facade.prompt({ sessionID: chat.sessionID, text: message.text });
+      } catch (err) {
+        chat.currentTurnId = null;
+        chat.turnStartedAt = null;
+        await this.disposeChatBackend(rec, chat);
+        this.sendError(socketId, msg.id, ERROR_INTERNAL, `initial message failed: ${errorMessage(err)}`);
+        return;
+      }
+      this.publish({
+        channel: chatURI,
+        action: {
+          type: ActionType.ChatTurnStarted,
+          turnId,
+          startedAt: new Date().toISOString(),
+          message,
+        },
+      });
+    }
+
+    this.sendFrame(socketId, { jsonrpc: "2.0", id: msg.id ?? null, result: null });
+  }
+
+  /**
+   * `disposeChat` (AHP 1.0.0 chat command): remove a chat and its
+   * opencode session from the session catalog. Result: `null`. The
+   * default chat cannot be disposed — a session keeps its default chat
+   * (there is no re-home mechanism; disposing it would leave the
+   * `defaultChat` hint dangling). VS Code's createChat-rollback path
+   * relies on `disposeChat` being answerable for any chat it created.
+   */
+  private async handleDisposeChat(socketId: number, msg: RpcMessage): Promise<void> {
+    const params = isRecord(msg.params) ? msg.params : {};
+    const channel = params["channel"];
+    if (typeof channel !== "string" || channelKind(channel) !== "chat") {
+      this.sendError(socketId, msg.id, ERROR_INVALID_PARAMS, "disposeChat requires an ahp-chat:/… channel");
+      return;
+    }
+    const rec = this.byChannel.get(channel);
+    const chat = rec !== undefined ? rec.chats.get(channel) : undefined;
+    if (rec === undefined || chat === undefined) {
+      this.sendError(socketId, msg.id, ERROR_SESSION_NOT_FOUND, `no such chat: ${channel}`);
+      return;
+    }
+    if (channel === rec.defaultChatURI) {
+      this.sendError(socketId, msg.id, ERROR_INVALID_PARAMS, "the default chat cannot be disposed");
+      return;
+    }
+    await this.disposeChatBackend(rec, chat);
+    this.sendFrame(socketId, { jsonrpc: "2.0", id: msg.id ?? null, result: null });
+  }
+
+  /**
+   * Remove a chat from the AHP surface, then its opencode session. The
+   * AHP-side unbind goes FIRST: opencode's `session.deleted` event for
+   * the backend races this call through the event pump, and the pump
+   * must see the chat already unbound (its `byOpencode` guard) or it
+   * would publish a duplicate `session/chatRemoved`. R2: a failed
+   * removal still drops the AHP chat — the lingering opencode session
+   * shows up in the TUI (and lazily in `listSessions`) until deleted
+   * there.
+   */
+  private async disposeChatBackend(rec: SessionRecord, chat: ChatRuntime): Promise<void> {
+    this.removeChat(rec, chat);
+    try {
+      await this.opts.facade.removeSession(chat.sessionID);
+    } catch (err) {
+      this.log(`failed to remove the chat's opencode session ${chat.sessionID}: ${errorMessage(err)}`);
+    }
+    this.publish({ channel: rec.channel, action: { type: ActionType.SessionChatRemoved, chat: chat.uri } });
+  }
+
+  /**
+   * Apply a message's model/agent selection to a chat's opencode session
+   * before its prompt (`SessionPromptInput` carries no model/agent
+   * fields). Null on success, the error message on failure.
+   */
+  private async applyMessageSelection(chat: ChatRuntime, message: Message): Promise<string | null> {
+    try {
+      if (message.model?.id !== undefined && message.model.id.includes("/")) {
+        const sep = message.model.id.indexOf("/");
+        const providerID = message.model.id.slice(0, sep);
+        const modelID = message.model.id.slice(sep + 1);
+        if (providerID.length > 0 && modelID.length > 0) {
+          await this.opts.facade.switchModel({ sessionID: chat.sessionID, model: { providerID, modelID } });
+        }
+      }
+      if (message.agent?.uri !== undefined) {
+        const agentID = agentIDFromUri(message.agent.uri);
+        if (agentID !== null) {
+          await this.opts.facade.switchAgent({ sessionID: chat.sessionID, agent: agentID });
+        }
+      }
+    } catch (err) {
+      return errorMessage(err);
+    }
+    return null;
   }
 
   /**
@@ -940,32 +1319,53 @@ export class Host {
     }
     const rec = this.byChannel.get(channel);
     if (rec === undefined) {
-      this.echo(channel, stateAction, origin, `no such session: ${channel}`);
+      this.echo(
+        channel,
+        stateAction,
+        origin,
+        kind === "chat" ? `no such chat: ${channel}` : `no such session: ${channel}`,
+      );
       return;
     }
+    if (kind === "chat" && !rec.chats.has(channel)) {
+      this.echo(channel, stateAction, origin, `no such chat: ${channel}`);
+      return;
+    }
+    // Chat actions run against the owning chat runtime (plan §14.13);
+    // a chat action on a session channel is rejected (a session no
+    // longer identifies a single chat once multi-chat is on).
+    const chat = rec.chats.get(channel);
+    const noChat = () => this.echo(channel, stateAction, origin, `chat actions require a chat channel: ${channel}`);
 
     // From here on every branch either echoes (accepted or rejected).
     switch (stateAction.type) {
       case ActionType.ChatTurnStarted:
-        await this.dispatchTurnStarted(rec, stateAction, origin);
+        if (chat === undefined) { noChat(); return; }
+        await this.dispatchTurnStarted(chat, stateAction, origin);
         return;
       case ActionType.ChatPendingMessageSet:
-        await this.dispatchPendingMessageSet(rec, stateAction, origin);
+        if (chat === undefined) { noChat(); return; }
+        await this.dispatchPendingMessageSet(chat, stateAction, origin);
         return;
       case ActionType.ChatToolCallConfirmed:
-        await this.dispatchToolCallConfirmed(rec, stateAction, origin);
+        if (chat === undefined) { noChat(); return; }
+        await this.dispatchToolCallConfirmed(chat, stateAction, origin);
         return;
       case ActionType.ChatToolCallComplete:
-        await this.dispatchToolCallComplete(rec, stateAction, origin);
+        if (chat === undefined) { noChat(); return; }
+        await this.dispatchToolCallComplete(chat, stateAction, origin);
         return;
       case ActionType.ChatToolCallContentChanged:
-        this.dispatchToolCallContentChanged(rec, stateAction, origin);
+        if (chat === undefined) { noChat(); return; }
+        this.dispatchToolCallContentChanged(chat, stateAction, origin);
         return;
       case ActionType.ChatToolCallResultConfirmed:
-        this.dispatchToolCallResultConfirmed(rec, stateAction, origin);
+        if (chat === undefined) { noChat(); return; }
+        this.dispatchToolCallResultConfirmed(chat, stateAction, origin);
         return;
       case ActionType.ChatTurnCancelled:
-        await this.dispatchTurnCancelled(rec, stateAction, origin);
+        if (chat === undefined) { noChat(); return; }
+        await this.dispatchTurnCancelled(chat, stateAction, origin);
         return;
       case ActionType.SessionTitleChanged:
         await this.dispatchTitleChanged(rec, stateAction, origin);
@@ -1042,8 +1442,8 @@ export class Host {
     return undefined;
   }
 
-  private async dispatchTurnStarted(rec: SessionRecord, action: StateAction, origin: ActionOrigin | undefined): Promise<void> {
-    const chatURI = chatChannelURI(rec.sessionID);
+  private async dispatchTurnStarted(chat: ChatRuntime, action: StateAction, origin: ActionOrigin | undefined): Promise<void> {
+    const chatURI = chat.uri;
     const a = action as ChatTurnStartedAction;
     const turnId = typeof a.turnId === "string" && a.turnId.length > 0 ? a.turnId : null;
     const message =
@@ -1061,7 +1461,7 @@ export class Host {
       typeof a.startedAt === "string" && !Number.isNaN(Date.parse(a.startedAt))
         ? a
         : { ...a, startedAt: new Date().toISOString() };
-    if (rec.chatStore.state.activeTurn !== undefined) {
+    if (chat.chatStore.state.activeTurn !== undefined) {
       this.echo(
         chatURI,
         action,
@@ -1071,46 +1471,32 @@ export class Host {
       return;
     }
 
-    // Apply the message's model/agent selection before the prompt
-    // (`SessionPromptInput` carries no model/agent fields).
-    try {
-      if (message.model?.id !== undefined && message.model.id.includes("/")) {
-        const sep = message.model.id.indexOf("/");
-        const providerID = message.model.id.slice(0, sep);
-        const modelID = message.model.id.slice(sep + 1);
-        if (providerID.length > 0 && modelID.length > 0) {
-          await this.opts.facade.switchModel({ sessionID: rec.sessionID, model: { providerID, modelID } });
-        }
-      }
-      if (message.agent?.uri !== undefined) {
-        const agentID = agentIDFromUri(message.agent.uri);
-        if (agentID !== null) {
-          await this.opts.facade.switchAgent({ sessionID: rec.sessionID, agent: agentID });
-        }
-      }
-    } catch (err) {
-      this.echo(chatURI, action, origin, `failed to apply model/agent selection: ${errorMessage(err)}`);
+    // Apply the message's model/agent selection to THIS chat's opencode
+    // session before the prompt (per-chat isolation, plan §14.13).
+    const selectionError = await this.applyMessageSelection(chat, message);
+    if (selectionError !== null) {
+      this.echo(chatURI, action, origin, `failed to apply model/agent selection: ${selectionError}`);
       return;
     }
 
     // Write-ahead: claim the turn BEFORE the prompt so the
     // `session.execution.started` event joins it even when it races the
     // prompt's resolve; revert on failure.
-    rec.currentTurnId = turnId;
-    rec.turnStartedAt = Date.now();
+    chat.currentTurnId = turnId;
+    chat.turnStartedAt = Date.now();
     try {
-      await this.opts.facade.prompt({ sessionID: rec.sessionID, text: message.text });
+      await this.opts.facade.prompt({ sessionID: chat.sessionID, text: message.text });
     } catch (err) {
-      rec.currentTurnId = null;
-      rec.turnStartedAt = null;
+      chat.currentTurnId = null;
+      chat.turnStartedAt = null;
       this.echo(chatURI, action, origin, `prompt failed: ${errorMessage(err)}`);
       return;
     }
     this.echo(chatURI, normalized, origin);
   }
 
-  private async dispatchPendingMessageSet(rec: SessionRecord, action: StateAction, origin: ActionOrigin | undefined): Promise<void> {
-    const chatURI = chatChannelURI(rec.sessionID);
+  private async dispatchPendingMessageSet(chat: ChatRuntime, action: StateAction, origin: ActionOrigin | undefined): Promise<void> {
+    const chatURI = chat.uri;
     const a = action as { kind?: unknown; id?: unknown; message?: unknown };
     const kind = a.kind === "steering" || a.kind === "queued" ? a.kind : null;
     const id = typeof a.id === "string" && a.id.length > 0 ? a.id : null;
@@ -1122,7 +1508,7 @@ export class Host {
       this.echo(chatURI, action, origin, "invalid chat/pendingMessageSet params");
       return;
     }
-    const hasActiveTurn = rec.chatStore.state.activeTurn !== undefined;
+    const hasActiveTurn = chat.chatStore.state.activeTurn !== undefined;
     // steer → delivery "steer" (only while a turn is active); queued →
     // delivery "queue"; a steering message with no active turn falls back
     // to a plain prompt (it becomes the next turn).
@@ -1132,7 +1518,7 @@ export class Host {
         : "queue"
       : undefined;
     try {
-      await this.opts.facade.prompt({ sessionID: rec.sessionID, text: message.text, delivery });
+      await this.opts.facade.prompt({ sessionID: chat.sessionID, text: message.text, delivery });
     } catch (err) {
       this.echo(chatURI, action, origin, `prompt failed: ${errorMessage(err)}`);
       return;
@@ -1146,8 +1532,8 @@ export class Host {
     // `queuedMessageId` — the reducer dequeues it.
     this.echo(chatURI, action, origin);
     const turnId = this.mintTurnId();
-    rec.currentTurnId = turnId;
-    rec.turnStartedAt = Date.now();
+    chat.currentTurnId = turnId;
+    chat.turnStartedAt = Date.now();
     this.publish({
       channel: chatURI,
       action: {
@@ -1160,22 +1546,23 @@ export class Host {
     });
   }
 
-  private async dispatchToolCallConfirmed(rec: SessionRecord, action: StateAction, origin: ActionOrigin | undefined): Promise<void> {
-    const chatURI = chatChannelURI(rec.sessionID);
+  private async dispatchToolCallConfirmed(chat: ChatRuntime, action: StateAction, origin: ActionOrigin | undefined): Promise<void> {
+    const chatURI = chat.uri;
+    const rec = this.byChannel.get(chatURI)!;
     const a = action as ChatToolCallConfirmedAction;
     const toolCallId = typeof a.toolCallId === "string" ? a.toolCallId : null;
     if (toolCallId === null) {
       this.echo(chatURI, action, origin, "invalid chat/toolCallConfirmed params");
       return;
     }
-    const permissionID = rec.permissionForTool.get(toolCallId);
+    const permissionID = chat.permissionForTool.get(toolCallId);
     if (permissionID === undefined) {
       this.echo(chatURI, action, origin, `no pending permission for tool call ${toolCallId}`);
       return;
     }
     try {
       await this.opts.facade.replyPermission({
-        sessionID: rec.sessionID,
+        sessionID: chat.sessionID,
         requestID: permissionID,
         decision: a.approved === true ? "once" : "reject",
       });
@@ -1191,8 +1578,8 @@ export class Host {
       channel: rec.channel,
       action: { type: ActionType.SessionInputNeededRemoved, id: toolCallId },
     });
-    rec.permissionForTool.delete(toolCallId);
-    rec.toolForPermission.delete(permissionID);
+    chat.permissionForTool.delete(toolCallId);
+    chat.toolForPermission.delete(permissionID);
   }
 
   // ── Phase 4 extension 1: client-executed tool calls ───────────────────
@@ -1207,11 +1594,12 @@ export class Host {
    * clears the execution input request, and settles the opencode-side
    * waiter with the client's result.
    */
-  private async dispatchToolCallComplete(rec: SessionRecord, action: StateAction, origin: ActionOrigin | undefined): Promise<void> {
-    const chatURI = chatChannelURI(rec.sessionID);
+  private async dispatchToolCallComplete(chat: ChatRuntime, action: StateAction, origin: ActionOrigin | undefined): Promise<void> {
+    const chatURI = chat.uri;
+    const rec = this.byChannel.get(chatURI)!;
     const a = action as ChatToolCallCompleteAction;
     const toolCallId = typeof a.toolCallId === "string" ? a.toolCallId : null;
-    const invocation = toolCallId !== null ? rec.clientToolCalls.get(toolCallId) : undefined;
+    const invocation = toolCallId !== null ? chat.clientToolCalls.get(toolCallId) : undefined;
     if (toolCallId === null || invocation === undefined) {
       this.echo(chatURI, action, origin, `tool call ${toolCallId ?? "?"} is not a client-executed call`);
       return;
@@ -1225,7 +1613,7 @@ export class Host {
       this.echo(chatURI, action, origin, "invalid chat/toolCallComplete params (result.success must be a boolean)");
       return;
     }
-    const status = this.toolCallState(rec, toolCallId)?.status;
+    const status = this.toolCallState(chat, toolCallId)?.status;
     if (status !== ToolCallStatus.Running && status !== ToolCallStatus.PendingConfirmation) {
       this.echo(chatURI, action, origin, `tool call ${toolCallId} is not ready to complete (status ${status ?? "absent"})`);
       return;
@@ -1240,8 +1628,8 @@ export class Host {
       // user-facing confirmation on the session channel (this variant,
       // unlike the execution request, raises SessionStatus.InputNeeded).
       invocation.pendingResult = result;
-      const pending = this.pendingToolCall(rec, toolCallId);
-      if (pending !== null && rec.currentTurnId !== null) {
+      const pending = this.pendingToolCall(chat, toolCallId);
+      if (pending !== null && chat.currentTurnId !== null) {
         this.publish({
           channel: rec.channel,
           action: {
@@ -1250,7 +1638,7 @@ export class Host {
               id: toolCallId,
               chat: chatURI,
               kind: SessionInputRequestKind.ToolConfirmation,
-              turnId: rec.currentTurnId,
+              turnId: chat.currentTurnId,
               toolCall: pending,
             } satisfies SessionToolConfirmationRequest,
           },
@@ -1261,7 +1649,7 @@ export class Host {
         channel: rec.channel,
         action: { type: ActionType.SessionInputNeededRemoved, id: toolCallId },
       });
-      this.settleClientTool(rec, invocation, clientResultToFacade(result));
+      this.settleClientTool(invocation, clientResultToFacade(result));
     }
   }
 
@@ -1272,11 +1660,11 @@ export class Host {
    * no counterpart; the spec says the server SHOULD reject dispatches
    * from a client that is not the contributor.
    */
-  private dispatchToolCallContentChanged(rec: SessionRecord, action: StateAction, origin: ActionOrigin | undefined): void {
-    const chatURI = chatChannelURI(rec.sessionID);
+  private dispatchToolCallContentChanged(chat: ChatRuntime, action: StateAction, origin: ActionOrigin | undefined): void {
+    const chatURI = chat.uri;
     const a = action as ChatToolCallContentChangedAction;
     const toolCallId = typeof a.toolCallId === "string" ? a.toolCallId : null;
-    const invocation = toolCallId !== null ? rec.clientToolCalls.get(toolCallId) : undefined;
+    const invocation = toolCallId !== null ? chat.clientToolCalls.get(toolCallId) : undefined;
     if (toolCallId === null || invocation === undefined) {
       this.echo(chatURI, action, origin, `tool call ${toolCallId ?? "?"} is not a client-executed call`);
       return;
@@ -1289,7 +1677,7 @@ export class Host {
       this.echo(chatURI, action, origin, "invalid chat/toolCallContentChanged params (content must be an array)");
       return;
     }
-    if (this.toolCallState(rec, toolCallId)?.status !== ToolCallStatus.Running) {
+    if (this.toolCallState(chat, toolCallId)?.status !== ToolCallStatus.Running) {
       this.echo(chatURI, action, origin, `tool call ${toolCallId} is not running`);
       return;
     }
@@ -1305,15 +1693,16 @@ export class Host {
    * settles the opencode-side waiter (approved → the held client
    * result; denied → a Tool.Error the model sees).
    */
-  private dispatchToolCallResultConfirmed(rec: SessionRecord, action: StateAction, origin: ActionOrigin | undefined): void {
-    const chatURI = chatChannelURI(rec.sessionID);
+  private dispatchToolCallResultConfirmed(chat: ChatRuntime, action: StateAction, origin: ActionOrigin | undefined): void {
+    const chatURI = chat.uri;
+    const rec = this.byChannel.get(chatURI)!;
     const a = action as ChatToolCallResultConfirmedAction;
     const toolCallId = typeof a.toolCallId === "string" ? a.toolCallId : null;
     if (toolCallId === null || typeof a.approved !== "boolean") {
       this.echo(chatURI, action, origin, "invalid chat/toolCallResultConfirmed params");
       return;
     }
-    const invocation = rec.clientToolCalls.get(toolCallId);
+    const invocation = chat.clientToolCalls.get(toolCallId);
     if (invocation === undefined) {
       this.echo(chatURI, action, origin, `no pending result confirmation for tool call ${toolCallId}`);
       return;
@@ -1322,7 +1711,7 @@ export class Host {
       this.echo(chatURI, action, origin, `only the contributing client (${invocation.clientId}) may confirm this result`);
       return;
     }
-    if (this.toolCallState(rec, toolCallId)?.status !== ToolCallStatus.PendingResultConfirmation) {
+    if (this.toolCallState(chat, toolCallId)?.status !== ToolCallStatus.PendingResultConfirmation) {
       this.echo(chatURI, action, origin, `tool call ${toolCallId} is not awaiting result confirmation`);
       return;
     }
@@ -1336,27 +1725,27 @@ export class Host {
       // Unreachable in practice (the state only reaches
       // pending-result-confirmation through our complete path); fail
       // closed so the opencode tool cannot hang.
-      this.settleClientTool(rec, invocation, { ok: false, error: "no recorded result to confirm" });
+      this.settleClientTool(invocation, { ok: false, error: "no recorded result to confirm" });
       return;
     }
     if (a.approved) {
-      this.settleClientTool(rec, invocation, clientResultToFacade(held as ToolCallResult));
+      this.settleClientTool(invocation, clientResultToFacade(held as ToolCallResult));
     } else {
-      this.settleClientTool(rec, invocation, { ok: false, error: "the client denied the tool result" });
+      this.settleClientTool(invocation, { ok: false, error: "the client denied the tool result" });
     }
   }
 
-  private async dispatchTurnCancelled(rec: SessionRecord, action: StateAction, origin: ActionOrigin | undefined): Promise<void> {
-    const chatURI = chatChannelURI(rec.sessionID);
+  private async dispatchTurnCancelled(chat: ChatRuntime, action: StateAction, origin: ActionOrigin | undefined): Promise<void> {
+    const chatURI = chat.uri;
     const a = action as ChatTurnCancelledAction;
     const turnId = typeof a.turnId === "string" && a.turnId.length > 0 ? a.turnId : null;
-    const active = rec.chatStore.state.activeTurn;
+    const active = chat.chatStore.state.activeTurn;
     if (turnId === null || active === undefined || active.id !== turnId) {
       this.echo(chatURI, action, origin, "no active turn to cancel");
       return;
     }
     try {
-      await this.opts.facade.interrupt({ sessionID: rec.sessionID });
+      await this.opts.facade.interrupt({ sessionID: chat.sessionID });
     } catch (err) {
       this.echo(chatURI, action, origin, `interrupt failed: ${errorMessage(err)}`);
       return;
@@ -1365,12 +1754,12 @@ export class Host {
     // `modifiedAt` from it); the host clock is authoritative when the
     // client did not supply one.
     const duration =
-      typeof a.duration === "number" && Number.isFinite(a.duration) ? a.duration : this.turnDuration(rec);
+      typeof a.duration === "number" && Number.isFinite(a.duration) ? a.duration : this.turnDuration(chat);
     this.echo(chatURI, { ...a, duration }, origin);
     // The opencode `session.execution.interrupted` event finds no active
     // turn after the echo finalized it (skipped); run the queued/steering
     // handoff now, on the host side.
-    await this.finishTurn(rec);
+    await this.finishTurn(chat);
   }
 
   /**
@@ -1385,8 +1774,8 @@ export class Host {
       return;
     }
     const parsed = parseChangesetChannel(channel);
-    const rec = parsed !== null ? this.sessions.get(parsed.sessionID) : undefined;
-    const store = rec !== undefined ? rec.changesets.get(channel) : undefined;
+    const rec = parsed !== null ? this.byChannel.get(parsed.ownerUri) : undefined;
+    const store = rec !== undefined ? this.changesetStoreOf(rec, channel) : undefined;
     if (rec === undefined || store === undefined) {
       this.echo(channel, action, origin, "no such changeset");
       return;
@@ -1459,7 +1848,10 @@ export class Host {
 
   private async handleEvent(ev: FacadeEvent): Promise<void> {
     if (ev.type === "session.created") {
-      if (this.sessions.has(ev.sessionID)) return;
+      // Every live chat has its own opencode session (plan §14.13), so a
+      // created event for an already-bound id is ours (a createChat
+      // backend) and never an external session.
+      if (this.sessions.has(ev.sessionID) || this.byOpencode.has(ev.sessionID)) return;
       // Deferred registration: a concurrent `createSession` may still be
       // resolving for this opencode session under a client-chosen channel;
       // the grace + existence check avoids the double registration, and
@@ -1474,69 +1866,90 @@ export class Host {
       return;
     }
 
-    const rec = this.sessions.get(ev.sessionID);
-    if (rec === undefined) return; // only session.created registers sessions
-
-    const chatURI = chatChannelURI(rec.sessionID);
+    // The opencode session id joins to (record, chat) — every chat has
+    // its own backend session, and per-turn state lives on the chat
+    // (plan §14.13). Only session.created registers sessions.
+    const binding = this.byOpencode.get(ev.sessionID);
+    if (binding === undefined) return;
+    const { rec, chat } = binding;
+    const chatURI = chat.uri;
     switch (ev.type) {
       case "session.deleted":
-        this.removeRecord(rec);
+        if (chat.uri === rec.defaultChatURI) {
+          this.removeRecord(rec);
+        } else {
+          // Peer-chat backend gone (deleted in the TUI or by another
+          // surface): drop the AHP chat only — the record and its other
+          // chats stay.
+          this.removeChat(rec, chat);
+          this.publish({ channel: rec.channel, action: { type: ActionType.SessionChatRemoved, chat: chat.uri } });
+        }
         return;
       case "session.renamed":
-        this.publish({ channel: rec.channel, action: { type: ActionType.SessionTitleChanged, title: ev.title } });
+        if (chat.uri === rec.defaultChatURI) {
+          this.publish({ channel: rec.channel, action: { type: ActionType.SessionTitleChanged, title: ev.title } });
+        } else {
+          // No chat-title session action exists; the chat summary carries
+          // the title (the chat store's own title stays original — same
+          // pre-existing behavior as the default chat's titleChanged).
+          this.publish({
+            channel: rec.channel,
+            action: { type: ActionType.SessionChatUpdated, chat: chat.uri, changes: { title: ev.title } },
+          });
+        }
         return;
       case "inbox.enqueued":
-        rec.lastInbox = { text: ev.text, delivery: ev.delivery };
+        chat.lastInbox = { text: ev.text, delivery: ev.delivery };
         return;
       case "inbox.delivered":
         // Steering consumption is handled at turn end (finishTurn).
         return;
       case "execution.started":
-        if (rec.currentTurnId !== null) return; // write-ahead already claimed the turn
+        if (chat.currentTurnId !== null) return; // write-ahead already claimed the turn
         // Orphan turn (an external TUI prompt, or a handoff this host did
         // not initiate): start it with the last-seen inbox message.
-        this.startTurn(rec, rec.lastInbox !== null ? userMessage(rec.lastInbox.text) : userMessage(""));
+        this.startTurn(chat, chat.lastInbox !== null ? userMessage(chat.lastInbox.text) : userMessage(""));
         return;
       case "execution.succeeded":
-        if (rec.currentTurnId === null) return;
+        if (chat.currentTurnId === null) return;
         this.publish({
           channel: chatURI,
-          action: { type: ActionType.ChatTurnComplete, turnId: rec.currentTurnId, duration: this.turnDuration(rec) },
+          action: { type: ActionType.ChatTurnComplete, turnId: chat.currentTurnId, duration: this.turnDuration(chat) },
         });
-        await this.finishTurn(rec);
+        await this.finishTurn(chat);
         return;
       case "execution.failed":
-        if (rec.currentTurnId === null) return;
+        if (chat.currentTurnId === null) return;
         const part: ErrorResponsePart = {
           kind: ResponsePartKind.Error,
           error: { errorType: ev.error.type, message: ev.error.message },
         };
         this.publish({
           channel: chatURI,
-          action: { type: ActionType.ChatError, turnId: rec.currentTurnId, duration: this.turnDuration(rec), part },
+          action: { type: ActionType.ChatError, turnId: chat.currentTurnId, duration: this.turnDuration(chat), part },
         });
-        await this.finishTurn(rec);
+        await this.finishTurn(chat);
         return;
       case "execution.interrupted":
         // Skipped when the client's own `chat/turnCancelled` echo already
         // finalized the turn (currentTurnId is null).
-        if (rec.currentTurnId === null) return;
+        if (chat.currentTurnId === null) return;
         this.publish({
           channel: chatURI,
-          action: { type: ActionType.ChatTurnCancelled, turnId: rec.currentTurnId, duration: this.turnDuration(rec) },
+          action: { type: ActionType.ChatTurnCancelled, turnId: chat.currentTurnId, duration: this.turnDuration(chat) },
         });
-        await this.finishTurn(rec);
+        await this.finishTurn(chat);
         return;
       case "step.started":
-        rec.turnModelRef = `${ev.model.providerID}/${ev.model.modelID}`;
+        chat.turnModelRef = `${ev.model.providerID}/${ev.model.modelID}`;
         return;
       case "text.delta":
       case "reasoning.delta": {
-        if (rec.currentTurnId === null) return;
+        if (chat.currentTurnId === null) return;
         const kind = ev.type === "text.delta" ? ResponsePartKind.Markdown : ResponsePartKind.Reasoning;
         const key = `${ev.assistantMessageID}:${kind}:${ev.ordinal}`;
-        const first = !rec.parts.has(key);
-        rec.parts.add(key);
+        const first = !chat.parts.has(key);
+        chat.parts.add(key);
         const partId = `part-${key}`;
         if (first) {
           // Lazily emit the part on the first delta; it carries the
@@ -1545,7 +1958,7 @@ export class Host {
             channel: chatURI,
             action: {
               type: ActionType.ChatResponsePart,
-              turnId: rec.currentTurnId,
+              turnId: chat.currentTurnId,
               part: { kind, id: partId, content: ev.delta },
             },
           });
@@ -1554,26 +1967,26 @@ export class Host {
             channel: chatURI,
             action:
               kind === ResponsePartKind.Markdown
-                ? { type: ActionType.ChatDelta, turnId: rec.currentTurnId, partId, content: ev.delta }
-                : { type: ActionType.ChatReasoning, turnId: rec.currentTurnId, partId, content: ev.delta },
+                ? { type: ActionType.ChatDelta, turnId: chat.currentTurnId, partId, content: ev.delta }
+                : { type: ActionType.ChatReasoning, turnId: chat.currentTurnId, partId, content: ev.delta },
           });
         }
         return;
       }
       case "text.ended":
       case "reasoning.ended": {
-        if (rec.currentTurnId === null) return;
+        if (chat.currentTurnId === null) return;
         // Fallback for non-streaming providers that emit only the final
         // text: if no delta opened the part, emit it now with the full text.
         const kind = ev.type === "text.ended" ? ResponsePartKind.Markdown : ResponsePartKind.Reasoning;
         const key = `${ev.assistantMessageID}:${kind}:${ev.ordinal}`;
-        if (!rec.parts.has(key)) {
-          rec.parts.add(key);
+        if (!chat.parts.has(key)) {
+          chat.parts.add(key);
           this.publish({
             channel: chatURI,
             action: {
               type: ActionType.ChatResponsePart,
-              turnId: rec.currentTurnId,
+              turnId: chat.currentTurnId,
               part: { kind, id: `part-${key}`, content: ev.text },
             },
           });
@@ -1581,25 +1994,26 @@ export class Host {
         return;
       }
       case "tool.input.started": {
-        if (rec.currentTurnId === null) {
-          this.log(`tool.input.started outside a turn (session ${rec.sessionID}, tool ${ev.name}); ignored`);
+        if (chat.currentTurnId === null) {
+          this.log(`tool.input.started outside a turn (session ${chat.sessionID}, tool ${ev.name}); ignored`);
           return;
         }
-        rec.toolName.set(ev.id, ev.name);
+        chat.toolName.set(ev.id, ev.name);
         // Phase 4 extension 1: when the session's active clients provide
         // this tool, the call is client-executed — the client
         // `contributor` must be established at start (the official
         // reducer ignores a late one), and the call is tracked for the
         // `execute` bridge + the client's dispatchable actions.
+        // (Active clients are session-level; the chat tracks the call.)
         const clientTool = this.clientToolContributor(rec, ev.name);
         if (clientTool !== null) {
-          rec.clientToolCalls.set(ev.id, { clientId: clientTool, turnId: rec.currentTurnId });
+          chat.clientToolCalls.set(ev.id, { clientId: clientTool, turnId: chat.currentTurnId });
         }
         this.publish({
           channel: chatURI,
           action: {
             type: ActionType.ChatToolCallStart,
-            turnId: rec.currentTurnId,
+            turnId: chat.currentTurnId,
             toolCallId: ev.id,
             toolName: ev.name,
             displayName: displayNameFor(ev.name),
@@ -1611,26 +2025,26 @@ export class Host {
         return;
       }
       case "tool.input.ended": {
-        rec.toolInput.set(ev.id, ev.text);
+        chat.toolInput.set(ev.id, ev.text);
         // Phase 2: for file-mutating tools, capture the pre-edit file
         // content now (the event fires before execution — the last safe
         // point). Awaited in the sequential pump so the capture is
         // complete before `execution.*` can end the turn.
-        if (this.opts.changesets) await this.captureTurnBefore(rec, ev.id, ev.text);
+        if (this.opts.changesets) await this.captureTurnBefore(chat, ev.id, ev.text);
         // Phase 4 extension 1: a client-executed call clears its
         // confirmation gate here (no opencode permission can fire for
         // it) — ready straight to running, then surface the execution
         // request so the owning client picks up the work.
-        if (rec.clientToolCalls.has(ev.id)) {
-          this.ensureToolReady(rec, ev.id, false);
-          const invocation = rec.clientToolCalls.get(ev.id);
-          const running = this.toolCallState(rec, ev.id);
-          if (invocation !== undefined && running !== null && running.status === ToolCallStatus.Running && rec.currentTurnId !== null) {
+        if (chat.clientToolCalls.has(ev.id)) {
+          this.ensureToolReady(chat, ev.id, false);
+          const invocation = chat.clientToolCalls.get(ev.id);
+          const running = this.toolCallState(chat, ev.id);
+          if (invocation !== undefined && running !== null && running.status === ToolCallStatus.Running && chat.currentTurnId !== null) {
             const request: SessionToolClientExecutionRequest = {
               id: ev.id,
               chat: chatURI,
               kind: SessionInputRequestKind.ToolClientExecution,
-              turnId: rec.currentTurnId,
+              turnId: chat.currentTurnId,
               clientId: invocation.clientId,
               toolCall: running,
             };
@@ -1645,25 +2059,25 @@ export class Host {
       case "tool.progress":
         // First sign the tool is actually running (opencode auto-approved):
         // finalize the tool call as running.
-        this.ensureToolReady(rec, ev.id, false);
+        this.ensureToolReady(chat, ev.id, false);
         return;
       case "tool.success": {
-        if (rec.currentTurnId === null) return;
-        this.ensureToolReady(rec, ev.id, false);
-        if (this.toolCallTerminal(rec, ev.id)) {
+        if (chat.currentTurnId === null) return;
+        this.ensureToolReady(chat, ev.id, false);
+        if (this.toolCallTerminal(chat, ev.id)) {
           // e.g. denied → already cancelled, or a client-executed call
           // the client already completed: no echo, but the tracking
           // (including the client-tool record) must still be cleared.
-          this.clearToolTracking(rec, ev.id);
+          this.clearToolTracking(chat, ev.id);
           return;
         }
-        const name = rec.toolName.get(ev.id) ?? "tool";
-        const input = rec.toolInput.get(ev.id);
+        const name = chat.toolName.get(ev.id) ?? "tool";
+        const input = chat.toolInput.get(ev.id);
         this.publish({
           channel: chatURI,
           action: {
             type: ActionType.ChatToolCallComplete,
-            turnId: rec.currentTurnId,
+            turnId: chat.currentTurnId,
             toolCallId: ev.id,
             result: {
               success: true,
@@ -1672,25 +2086,25 @@ export class Host {
             },
           },
         });
-        this.clearToolTracking(rec, ev.id);
+        this.clearToolTracking(chat, ev.id);
         return;
       }
       case "tool.failed": {
-        if (rec.currentTurnId === null) return;
-        this.ensureToolReady(rec, ev.id, false);
-        if (this.toolCallTerminal(rec, ev.id)) {
+        if (chat.currentTurnId === null) return;
+        this.ensureToolReady(chat, ev.id, false);
+        if (this.toolCallTerminal(chat, ev.id)) {
           // Already terminal (client-executed call completed by the
           // client, or a call cancelled upstream) — clear the tracking.
-          this.clearToolTracking(rec, ev.id);
+          this.clearToolTracking(chat, ev.id);
           return;
         }
-        const name = rec.toolName.get(ev.id) ?? "tool";
-        const input = rec.toolInput.get(ev.id);
+        const name = chat.toolName.get(ev.id) ?? "tool";
+        const input = chat.toolInput.get(ev.id);
         this.publish({
           channel: chatURI,
           action: {
             type: ActionType.ChatToolCallComplete,
-            turnId: rec.currentTurnId,
+            turnId: chat.currentTurnId,
             toolCallId: ev.id,
             result: {
               success: false,
@@ -1699,23 +2113,23 @@ export class Host {
             },
           },
         });
-        this.clearToolTracking(rec, ev.id);
+        this.clearToolTracking(chat, ev.id);
         return;
       }
       case "usage.updated":
         // Session-cumulative tokens; the chat reducer replaces the turn's
         // usage, so the latest cumulative values are the turn's view.
-        if (rec.currentTurnId === null) return;
+        if (chat.currentTurnId === null) return;
         this.publish({
           channel: chatURI,
           action: {
             type: ActionType.ChatUsage,
-            turnId: rec.currentTurnId,
+            turnId: chat.currentTurnId,
             usage: {
               inputTokens: ev.tokens.input,
               outputTokens: ev.tokens.output,
               cacheReadTokens: ev.tokens.cache.read,
-              ...(rec.turnModelRef !== null ? { model: rec.turnModelRef } : {}),
+              ...(chat.turnModelRef !== null ? { model: chat.turnModelRef } : {}),
             },
           },
         });
@@ -1728,16 +2142,16 @@ export class Host {
           return;
         }
         const toolCallId = ev.source.id;
-        rec.permissionForTool.set(toolCallId, ev.id);
-        rec.toolForPermission.set(ev.id, toolCallId);
-        this.ensureToolReady(rec, toolCallId, true);
-        const pending = this.pendingToolCall(rec, toolCallId);
-        if (pending !== null && rec.currentTurnId !== null) {
+        chat.permissionForTool.set(toolCallId, ev.id);
+        chat.toolForPermission.set(ev.id, toolCallId);
+        this.ensureToolReady(chat, toolCallId, true);
+        const pending = this.pendingToolCall(chat, toolCallId);
+        if (pending !== null && chat.currentTurnId !== null) {
           const request: SessionToolConfirmationRequest = {
             id: toolCallId,
             chat: chatURI,
             kind: SessionInputRequestKind.ToolConfirmation,
-            turnId: rec.currentTurnId,
+            turnId: chat.currentTurnId,
             toolCall: pending,
           };
           this.publish({
@@ -1747,10 +2161,10 @@ export class Host {
         }
         return;
       case "permission.replied": {
-        const toolCallId = rec.toolForPermission.get(ev.requestID);
-        rec.toolForPermission.delete(ev.requestID);
+        const toolCallId = chat.toolForPermission.get(ev.requestID);
+        chat.toolForPermission.delete(ev.requestID);
         if (toolCallId !== undefined) {
-          rec.permissionForTool.delete(toolCallId);
+          chat.permissionForTool.delete(toolCallId);
           // Safety net: the client's `chat/toolCallConfirmed` normally
           // removes the input request first; this covers the reply
           // arriving without (or before) the echo.
@@ -1773,17 +2187,17 @@ export class Host {
     return `turn_${Date.now().toString(36)}_${this.turnCounter.toString(36)}`;
   }
 
-  private turnDuration(rec: SessionRecord): number {
-    return Math.max(0, Date.now() - (rec.turnStartedAt ?? Date.now()));
+  private turnDuration(chat: ChatRuntime): number {
+    return Math.max(0, Date.now() - (chat.turnStartedAt ?? Date.now()));
   }
 
   /** Claim a turn (write-ahead) and publish `chat/turnStarted`. */
-  private startTurn(rec: SessionRecord, message: Message, queuedMessageId?: string): void {
+  private startTurn(chat: ChatRuntime, message: Message, queuedMessageId?: string): void {
     const turnId = this.mintTurnId();
-    rec.currentTurnId = turnId;
-    rec.turnStartedAt = Date.now();
+    chat.currentTurnId = turnId;
+    chat.turnStartedAt = Date.now();
     this.publish({
-      channel: chatChannelURI(rec.sessionID),
+      channel: chat.uri,
       action: {
         type: ActionType.ChatTurnStarted,
         turnId,
@@ -1804,14 +2218,14 @@ export class Host {
    * "after" content is read from disk here, and the uncommitted/session/
    * turn changesets recompute (async: awaits the facade).
    */
-  private async finishTurn(rec: SessionRecord): Promise<void> {
-    const endedTurnId = rec.currentTurnId;
-    rec.currentTurnId = null;
-    rec.turnStartedAt = null;
-    const state = rec.chatStore.state;
+  private async finishTurn(chat: ChatRuntime): Promise<void> {
+    const endedTurnId = chat.currentTurnId;
+    chat.currentTurnId = null;
+    chat.turnStartedAt = null;
+    const state = chat.chatStore.state;
     if (state.steeringMessage !== undefined) {
       this.publish({
-        channel: chatChannelURI(rec.sessionID),
+        channel: chat.uri,
         action: {
           type: ActionType.ChatPendingMessageRemoved,
           kind: PendingMessageKind.Steering,
@@ -1822,13 +2236,13 @@ export class Host {
     const queued = state.queuedMessages;
     if (queued !== undefined && queued.length > 0) {
       const next = queued[0]!;
-      this.startTurn(rec, next.message, next.id);
-    } else if (rec.lastInbox !== null && rec.lastInbox.delivery === "queue") {
+      this.startTurn(chat, next.message, next.id);
+    } else if (chat.lastInbox !== null && chat.lastInbox.delivery === "queue") {
       // A queued prompt from outside AHP (e.g. the TUI).
-      this.startTurn(rec, userMessage(rec.lastInbox.text));
+      this.startTurn(chat, userMessage(chat.lastInbox.text));
     }
     if (this.opts.changesets && endedTurnId !== null) {
-      await this.refreshTurnChangesets(rec, endedTurnId);
+      await this.refreshTurnChangesets(this.byChannel.get(chat.uri)!, chat, endedTurnId);
     }
   }
 
@@ -1841,9 +2255,9 @@ export class Host {
    * the tool is not file-mutating, the input carries no parseable path,
    * or the path resolves outside the location directory.
    */
-  private async captureTurnBefore(rec: SessionRecord, toolCallId: string, inputJson: string): Promise<void> {
-    const turnId = rec.currentTurnId;
-    const toolName = rec.toolName.get(toolCallId);
+  private async captureTurnBefore(chat: ChatRuntime, toolCallId: string, inputJson: string): Promise<void> {
+    const turnId = chat.currentTurnId;
+    const toolName = chat.toolName.get(toolCallId);
     if (turnId === null || toolName === undefined || !SNAPSHOT_TOOLS.has(toolName)) return;
     let parsed: unknown;
     try {
@@ -1867,11 +2281,12 @@ export class Host {
       return;
     }
     // The pump is sequential, so the turn cannot have ended between the
-    // call and the await — but the record may be gone (session deleted).
-    if (rec.currentTurnId !== turnId || !this.sessions.has(rec.sessionID)) return;
-    const turnFiles = rec.turnSnapshots.get(turnId) ?? new Map();
+    // call and the await — but the chat may be gone (session deleted or
+    // chat disposed).
+    if (chat.currentTurnId !== turnId || !this.byOpencode.has(chat.sessionID)) return;
+    const turnFiles = chat.turnSnapshots.get(turnId) ?? new Map();
     if (!turnFiles.has(absPath)) turnFiles.set(absPath, { before, after: null });
-    rec.turnSnapshots.set(turnId, turnFiles);
+    chat.turnSnapshots.set(turnId, turnFiles);
   }
 
   /** Resolve a tool-input path against the location directory (must stay inside it). */
@@ -1882,14 +2297,43 @@ export class Host {
     return isPathInside(absPath, dir) ? absPath : null;
   }
 
-  /** Get-or-create the changeset store for a URI (fresh stores start computing). */
-  private changesetStore(rec: SessionRecord, uri: string): ChangesetStateStore {
-    let store = rec.changesets.get(uri);
+  /**
+   * The changeset store's owner (plan §14.13): session-kind changesets
+   * live on the record (the session channel owns them); uncommitted/turn
+   * changesets live on the owning chat. Null when the owner is gone
+   * (a disposed chat's changesets are un-subscribable).
+   */
+  private changesetOwner(rec: SessionRecord, uri: string): { kind: "session" } | { kind: "chat"; chat: ChatRuntime } | null {
+    const parsed = parseChangesetChannel(uri);
+    if (parsed === null) return null;
+    if (parsed.kind === "session") return { kind: "session" };
+    const chat = rec.chats.get(parsed.ownerUri);
+    return chat === undefined ? null : { kind: "chat", chat };
+  }
+
+  /**
+   * Get-or-create the changeset store for a URI (fresh stores start
+   * computing). Owner-aware — see `changesetOwner`; null when the owner
+   * is gone.
+   */
+  private changesetStore(rec: SessionRecord, uri: string): ChangesetStateStore | null {
+    const owner = this.changesetOwner(rec, uri);
+    if (owner === null) return null;
+    const map = owner.kind === "chat" ? owner.chat.changesets : rec.sessionChangesets;
+    let store = map.get(uri);
     if (store === undefined) {
       store = createChangesetStateStore({ status: ChangesetStatus.Computing, files: [] });
-      rec.changesets.set(uri, store);
+      map.set(uri, store);
     }
     return store;
+  }
+
+  /** The live store for a URI, or undefined when it has never been created. */
+  private changesetStoreOf(rec: SessionRecord, uri: string): ChangesetStateStore | undefined {
+    const owner = this.changesetOwner(rec, uri);
+    if (owner === null) return undefined;
+    const map = owner.kind === "chat" ? owner.chat.changesets : rec.sessionChangesets;
+    return map.get(uri);
   }
 
   /** The store's current per-file review flags, keyed by file id. */
@@ -1913,13 +2357,19 @@ export class Host {
     const parsed = parseChangesetChannel(uri);
     if (parsed === null) return;
     const store = this.changesetStore(rec, uri);
+    if (store === null) return; // owner gone (disposed chat)
     let files;
     try {
       if (parsed.kind === "turn") {
+        // The turn's snapshots live on the owning chat; the content refs
+        // carry its opencode session id (the byOpencode join key, plan
+        // §14.13).
+        const chat = rec.chats.get(parsed.ownerUri);
+        if (chat === undefined) return;
         files = buildTurnChangesetFiles({
-          sessionID: parsed.sessionID,
+          sessionID: chat.sessionID,
           turnId: parsed.turnId ?? "",
-          files: rec.turnSnapshots.get(parsed.turnId ?? "") ?? new Map(),
+          files: chat.turnSnapshots.get(parsed.turnId ?? "") ?? new Map(),
           reviewedById: this.reviewedById(store),
         });
       } else {
@@ -1971,8 +2421,8 @@ export class Host {
    * the uncommitted, session, and ended-turn changesets — only the ones a
    * client has subscribed (unsubscribed changesets cost no seq).
    */
-  private async refreshTurnChangesets(rec: SessionRecord, turnId: string): Promise<void> {
-    const turnFiles = rec.turnSnapshots.get(turnId);
+  private async refreshTurnChangesets(rec: SessionRecord, chat: ChatRuntime, turnId: string): Promise<void> {
+    const turnFiles = chat.turnSnapshots.get(turnId);
     if (turnFiles !== undefined) {
       for (const [absPath, snap] of turnFiles) {
         if (snap.after === null) {
@@ -1984,12 +2434,14 @@ export class Host {
         }
       }
     }
+    // The chat's own uncommitted + turn changesets, plus the session-wide
+    // one (shared by all chats). Only the ones a client has subscribed.
     for (const uri of [
-      uncommittedChangesetURI(rec.sessionID),
-      sessionChangesetURI(rec.sessionID),
-      turnChangesetURI(rec.sessionID, turnId),
+      uncommittedChangesetURI(chat.uri),
+      sessionChangesetURI(rec.channel),
+      turnChangesetURI(chat.uri, turnId),
     ]) {
-      if (rec.changesets.has(uri)) await this.refreshChangeset(rec, uri);
+      if (this.changesetStoreOf(rec, uri) !== undefined) await this.refreshChangeset(rec, uri);
     }
   }
 
@@ -2064,13 +2516,13 @@ export class Host {
       this.sendFrame(socketId, { jsonrpc: "2.0", id: msg.id ?? null, result: this.encodeContent(content, encoding) });
       return;
     }
-    // snap — in-memory turn snapshot of a live session.
-    const rec = this.sessions.get(ref.sessionID);
-    if (rec === undefined) {
+    // snap — in-memory turn snapshot of a live chat's opencode session.
+    const binding = this.byOpencode.get(ref.sessionID);
+    if (binding === undefined) {
       this.sendError(socketId, msg.id, ERROR_NOT_FOUND, "no such session");
       return;
     }
-    const snap = rec.turnSnapshots.get(ref.turnId)?.get(ref.path);
+    const snap = binding.chat.turnSnapshots.get(ref.turnId)?.get(ref.path);
     const content = snap === undefined ? null : ref.part === "before" ? snap.before : snap.after;
     if (content === null) {
       this.sendError(socketId, msg.id, ERROR_NOT_FOUND, `not found: ${uri}`);
@@ -2107,12 +2559,12 @@ export class Host {
       this.sendError(socketId, msg.id, ERROR_INVALID_PARAMS, `not a changeset channel: ${channel}`);
       return;
     }
-    const rec = this.sessions.get(parsed.sessionID);
+    const rec = this.byChannel.get(parsed.ownerUri);
     if (rec === undefined) {
       this.sendError(socketId, msg.id, ERROR_SESSION_NOT_FOUND, "no such session");
       return;
     }
-    const store = rec.changesets.get(channel);
+    const store = this.changesetStoreOf(rec, channel);
     if (store === undefined) {
       this.sendError(socketId, msg.id, ERROR_SESSION_NOT_FOUND, `no such changeset: ${channel}`);
       return;
@@ -2152,7 +2604,9 @@ export class Host {
     });
     try {
       if (parsed.kind === "turn" && parsed.turnId !== undefined) {
-        await this.restoreTurnFile(rec, parsed.turnId, absPath);
+        // A live turn-changeset store implies a live owning chat
+        // (changesetStoreOf resolved it above).
+        await this.restoreTurnFile(rec.chats.get(parsed.ownerUri)!, parsed.turnId, absPath);
       } else {
         await this.opts.facade.discardFile(absPath);
       }
@@ -2186,8 +2640,8 @@ export class Host {
    * the turn (before === null) → delete it; otherwise write the pre-edit
    * content back.
    */
-  private async restoreTurnFile(rec: SessionRecord, turnId: string, absPath: string): Promise<void> {
-    const snap = rec.turnSnapshots.get(turnId)?.get(absPath);
+  private async restoreTurnFile(chat: ChatRuntime, turnId: string, absPath: string): Promise<void> {
+    const snap = chat.turnSnapshots.get(turnId)?.get(absPath);
     const before = snap?.before ?? null;
     if (before === null) {
       await this.opts.facade.deleteFile(absPath);
@@ -2204,16 +2658,16 @@ export class Host {
    *  - otherwise → `confirmed: "not-needed"` → straight to `running`
    *    (opencode auto-approved).
    */
-  private ensureToolReady(rec: SessionRecord, toolCallId: string, permission: boolean): void {
-    if (rec.toolReady.has(toolCallId) || rec.currentTurnId === null) return;
-    rec.toolReady.add(toolCallId);
-    const name = rec.toolName.get(toolCallId) ?? "tool";
-    const input = rec.toolInput.get(toolCallId);
+  private ensureToolReady(chat: ChatRuntime, toolCallId: string, permission: boolean): void {
+    if (chat.toolReady.has(toolCallId) || chat.currentTurnId === null) return;
+    chat.toolReady.add(toolCallId);
+    const name = chat.toolName.get(toolCallId) ?? "tool";
+    const input = chat.toolInput.get(toolCallId);
     this.publish({
-      channel: chatChannelURI(rec.sessionID),
+      channel: chat.uri,
       action: {
         type: ActionType.ChatToolCallReady,
-        turnId: rec.currentTurnId,
+        turnId: chat.currentTurnId,
         toolCallId,
         invocationMessage: invocationMessageFor(name, input),
         toolInput: input,
@@ -2222,9 +2676,9 @@ export class Host {
     });
   }
 
-  /** The live tool-call state in the current turn, or null when absent. */
-  private toolCallState(rec: SessionRecord, toolCallId: string): ToolCallState | null {
-    const turn = rec.chatStore.state.activeTurn;
+  /** The live tool-call state in the chat's current turn, or null when absent. */
+  private toolCallState(chat: ChatRuntime, toolCallId: string): ToolCallState | null {
+    const turn = chat.chatStore.state.activeTurn;
     if (turn === undefined) return null;
     for (const part of turn.responseParts) {
       if (part.kind === ResponsePartKind.ToolCall && part.toolCall.toolCallId === toolCallId) {
@@ -2238,8 +2692,8 @@ export class Host {
    * The tool call's state when it is awaiting confirmation (the
    * `SessionToolConfirmationRequest.toolCall` shape), or null otherwise.
    */
-  private pendingToolCall(rec: SessionRecord, toolCallId: string): ToolCallConfirmationState | null {
-    const tc = this.toolCallState(rec, toolCallId);
+  private pendingToolCall(chat: ChatRuntime, toolCallId: string): ToolCallConfirmationState | null {
+    const tc = this.toolCallState(chat, toolCallId);
     if (tc === null) return null;
     if (tc.status === ToolCallStatus.PendingConfirmation || tc.status === ToolCallStatus.PendingResultConfirmation) {
       return tc;
@@ -2248,16 +2702,16 @@ export class Host {
   }
 
   /** True when the tool call already left the ready states (completed/cancelled). */
-  private toolCallTerminal(rec: SessionRecord, toolCallId: string): boolean {
-    const tc = this.toolCallState(rec, toolCallId);
+  private toolCallTerminal(chat: ChatRuntime, toolCallId: string): boolean {
+    const tc = this.toolCallState(chat, toolCallId);
     return tc !== null && (tc.status === ToolCallStatus.Completed || tc.status === ToolCallStatus.Cancelled);
   }
 
-  private clearToolTracking(rec: SessionRecord, toolCallId: string): void {
-    rec.toolInput.delete(toolCallId);
-    rec.toolName.delete(toolCallId);
-    rec.toolReady.delete(toolCallId);
-    rec.clientToolCalls.delete(toolCallId);
+  private clearToolTracking(chat: ChatRuntime, toolCallId: string): void {
+    chat.toolInput.delete(toolCallId);
+    chat.toolName.delete(toolCallId);
+    chat.toolReady.delete(toolCallId);
+    chat.clientToolCalls.delete(toolCallId);
   }
 
   // ── Phase 4 extension 1: client-tool helpers ───────────────────────────
@@ -2312,7 +2766,7 @@ export class Host {
    * set by the caller (the eviction / session-removal paths set it
    * first and then settle to deliver it).
    */
-  private settleClientTool(rec: SessionRecord, invocation: ClientToolInvocation, result?: FacadeClientToolResult): void {
+  private settleClientTool(invocation: ClientToolInvocation, result?: FacadeClientToolResult): void {
     if (invocation.result === undefined) {
       if (result === undefined) return; // nothing to settle
       invocation.result = result;
@@ -2341,14 +2795,17 @@ export class Host {
     name: string;
     signal: AbortSignal;
   }): Promise<FacadeClientToolResult> {
-    const rec = this.sessions.get(input.sessionID);
-    if (rec === undefined) {
+    // The opencode session id joins to the (record, chat) that owns it —
+    // every chat has its own backend session (plan §14.13).
+    const binding = this.byOpencode.get(input.sessionID);
+    if (binding === undefined) {
       return Promise.resolve({
         ok: false,
         error: `no AHP session for tool "${input.name}" (session ${input.sessionID} is not an AHP session)`,
       });
     }
-    const invocation = rec.clientToolCalls.get(input.toolCallId);
+    const { rec, chat } = binding;
+    const invocation = chat.clientToolCalls.get(input.toolCallId);
     if (invocation === undefined) {
       return Promise.resolve({
         ok: false,
@@ -2363,7 +2820,7 @@ export class Host {
     }
     if (input.signal.aborted) {
       const result: FacadeClientToolResult = { ok: false, error: `execution of "${input.name}" was cancelled` };
-      this.settleClientTool(rec, invocation, result);
+      this.settleClientTool(invocation, result);
       return Promise.resolve(result);
     }
     // The invocation may already be settled (the client completed before
@@ -2376,7 +2833,7 @@ export class Host {
       invocation.waiter = resolve;
       const onAbort = () => {
         if (invocation.result === undefined) {
-          this.settleClientTool(rec, invocation, {
+          this.settleClientTool(invocation, {
             ok: false,
             error: `execution of "${input.name}" was cancelled (turn interrupted)`,
           });
@@ -2396,27 +2853,185 @@ export class Host {
    * is gone, already registered, or a createSession remap is pending.
    */
   private async registerExternalDeferred(sessionID: string): Promise<void> {
-    if (this.sessions.has(sessionID)) return;
+    if (this.sessions.has(sessionID) || this.byOpencode.has(sessionID)) return;
     let fs: FacadeSession | null;
     try {
       fs = await this.opts.facade.getSession(sessionID);
     } catch {
       return;
     }
-    if (fs === null || this.sessions.has(fs.sessionID)) return;
+    if (fs === null || this.sessions.has(fs.sessionID) || this.byOpencode.has(fs.sessionID)) return;
     this.registerExternal(fs);
   }
 
   /**
    * Register an opencode session the host did not create (TUI, another
-   * client). Applied directly to the fresh stores (no seq, no actions) —
-   * the registration is server-side bookkeeping, not a client-visible
-   * state transition; the root announcement carries the lifecycle.
+   * client, or a session resurfacing after a restart).
+   * Outcomes (plan §14.13 / §14.13.1):
+   *
+   *  - the opencode id already backs a chat of a live record → skip
+   *    (undefined); `listSessions` must not surface peer-chat backends
+   *    as their own AHP sessions;
+   *  - the session carries a peer marker and the owner record is
+   *    registered (and the marker's chat URI is free) → re-attach it to
+   *    the owner's chat catalog (undefined — no standalone session);
+   *  - the peer marker's owner is not registered yet → queue the
+   *    binding (undefined) — the owner may be listed later in the same
+   *    `listSessions` pass (there is no boot-time event replay);
+   *  - the session carries a channel marker (minted-id default backend)
+   *    and the marked channel is free → a standalone session registered
+   *    under the ORIGINAL client-chosen channel;
+   *  - otherwise → a standalone session whose channel reuses the
+   *    opencode id (the record).
    */
   private registerExternal(fs: FacadeSession): SessionRecord | undefined {
     const existing = this.sessions.get(fs.sessionID);
     if (existing !== undefined) return existing;
-    const channel = sessionChannelURI(fs.sessionID);
+    if (this.byOpencode.has(fs.sessionID)) return undefined;
+    const marker = parseAhpMarker(fs.metadata);
+    if (marker !== null) {
+      if (marker.chat !== undefined && marker.owner !== undefined) {
+        const owner = this.sessions.get(marker.owner);
+        if (owner !== undefined) {
+          if (this.byChannel.has(marker.chat)) {
+            // The marker's chat is already bound — e.g. a fork inherited
+            // the parent's metadata (core documents the inheritance).
+            // Standalone fallback: the data stays reachable in AHP.
+            this.log(
+              `ignoring the AHP marker on ${fs.sessionID}: chat ${marker.chat} is already bound (registering standalone)`,
+            );
+          } else {
+            return this.reattachPeerChat(owner, fs, marker.chat);
+          }
+        } else {
+          this.enqueueChatBinding(marker.owner, fs, marker.chat);
+          return undefined;
+        }
+      } else if (marker.channel !== undefined) {
+        // The default backend of a minted-id session carries the
+        // client-chosen session channel — resurface under it.
+        if (this.byChannel.has(marker.channel)) {
+          this.log(
+            `ignoring the AHP channel marker on ${fs.sessionID}: ${marker.channel} is already bound (registering under the opencode id)`,
+          );
+        } else {
+          return this.registerExternalStandalone(fs, marker.channel);
+        }
+      }
+    }
+    return this.registerExternalStandalone(fs);
+  }
+
+  /**
+   * Re-attach a marked peer backend to its owner session's chat catalog
+   * after a restart (plan §14.13.1). The owner store is LIVE (unlike a
+   * fresh standalone registration), so the catalog change goes through
+   * `publish` (store + any existing subscribers + the root diff), not a
+   * direct apply. The chat title is re-derived (`Chat <n>`) — a
+   * documented divergence from the pre-restart title. Returns undefined:
+   * the backend gets no standalone AHP session (its session channel is
+   * not registered — `sessions.get(peerID)` misses).
+   */
+  private reattachPeerChat(rec: SessionRecord, fs: FacadeSession, chatURI: string): undefined {
+    const modifiedAt = new Date(fs.time.updated).toISOString();
+    const chat = this.newChatRuntime(chatURI, fs.sessionID, `Chat ${rec.chats.size + 1}`, modifiedAt);
+    this.bindChat(rec, chat);
+    this.publish({
+      channel: rec.channel,
+      action: { type: ActionType.SessionChatAdded, summary: chatSummaryOf(chat.chatStore.state) },
+    });
+    if (this.opts.changesets) {
+      this.publish({
+        channel: chatURI,
+        action: { type: ActionType.ChatChangesetsChanged, changesets: chatChangesetCatalog(chatURI, rec.channel) },
+      });
+    }
+    this.log(`reattached peer chat ${chatURI} (backend ${fs.sessionID}) to session ${rec.channel} from its AHP marker`);
+    return undefined;
+  }
+
+  /**
+   * Queue a peer-chat binding whose owner is not registered yet (the
+   * peer was listed before the owner, or the owner has not been listed
+   * at all). `drainPendingChatBindings` resolves it when the owner
+   * registers. The orphan fallback fires after the grace window: if the
+   * owner is still unregistered and gone from opencode, the peer is
+   * surfaced as its own AHP session instead (the data stays reachable).
+   */
+  private enqueueChatBinding(ownerID: string, fs: FacadeSession, chatURI: string): void {
+    const queue = this.pendingChatBindings.get(ownerID) ?? [];
+    queue.push({ fs, chatURI });
+    this.pendingChatBindings.set(ownerID, queue);
+    setTimeout(() => {
+      void this.checkOrphanChatBindings(ownerID).catch((err) =>
+        this.log(`orphan chat-binding check failed: ${errorMessage(err)}`),
+      );
+    }, EXTERNAL_REGISTER_GRACE_MS);
+  }
+
+  /**
+   * Orphan fallback for queued peer-chat bindings (plan §14.13.1): the
+   * owner never registered and is gone from opencode (e.g. deleted in
+   * the TUI while the plugin was down). Drop the queue and register each
+   * peer as a standalone AHP session. A failed owner lookup keeps the
+   * queue — the next registration or timer re-checks.
+   */
+  private async checkOrphanChatBindings(ownerID: string): Promise<void> {
+    const queue = this.pendingChatBindings.get(ownerID);
+    if (queue === undefined || queue.length === 0) return; // the owner registered — drained
+    let owner: FacadeSession | null;
+    try {
+      owner = await this.opts.facade.getSession(ownerID);
+    } catch {
+      return;
+    }
+    if (owner !== null) return; // the owner still exists in opencode — it registers when listed
+    this.pendingChatBindings.delete(ownerID);
+    for (const { fs, chatURI } of queue) {
+      if (this.sessions.has(fs.sessionID) || this.byOpencode.has(fs.sessionID)) continue;
+      this.log(
+        `AHP marker owner ${ownerID} is gone from opencode — registering the orphaned peer ${fs.sessionID} (chat ${chatURI}) as a standalone session`,
+      );
+      this.registerExternalStandalone(fs);
+    }
+  }
+
+  /**
+   * Resolve queued peer-chat bindings once their owner registers (called
+   * from the standalone registration's success path). A chat URI that is
+   * already bound by then (e.g. the client created it again across the
+   * restart) falls back to standalone registration.
+   */
+  private drainPendingChatBindings(ownerID: string): void {
+    const queue = this.pendingChatBindings.get(ownerID);
+    const owner = this.sessions.get(ownerID);
+    if (queue === undefined || queue.length === 0 || owner === undefined) return;
+    this.pendingChatBindings.delete(ownerID);
+    for (const { fs, chatURI } of queue) {
+      if (this.sessions.has(fs.sessionID) || this.byOpencode.has(fs.sessionID)) continue;
+      if (this.byChannel.has(chatURI)) {
+        this.log(
+          `ignoring the AHP marker on ${fs.sessionID}: chat ${chatURI} is already bound (registering standalone)`,
+        );
+        this.registerExternalStandalone(fs);
+      } else {
+        this.reattachPeerChat(owner, fs, chatURI);
+      }
+    }
+  }
+
+  /**
+   * Register an opencode session as a single-chat AHP session (its
+   * default chat reuses the opencode id). The session channel defaults
+   * to the opencode id; the channel-marker path (plan §14.13.1) passes
+   * the ORIGINAL client-chosen channel instead — the registry then
+   * resolves both suffixes (mirroring `handleCreateSession`). Applied
+   * directly to the fresh stores (no seq, no actions) — the
+   * registration is server-side bookkeeping, not a client-visible state
+   * transition; the root announcement carries the lifecycle.
+   */
+  private registerExternalStandalone(fs: FacadeSession, channel?: string): SessionRecord {
+    const recChannel = channel ?? sessionChannelURI(fs.sessionID);
     const modifiedAt = new Date(fs.time.updated).toISOString();
     const sessionStore = createSessionStateStore(
       initialSessionState({
@@ -2428,44 +3043,43 @@ export class Host {
           : undefined, // Idle | IsRead | IsArchived
       }),
     );
-    const chatStore = createChatStateStore(
-      initialChatState({ resource: chatChannelURI(fs.sessionID), title: "Chat 1", modifiedAt }),
-    );
-    sessionStore.apply({ type: ActionType.SessionReady });
-    sessionStore.apply({ type: ActionType.SessionChatAdded, summary: chatSummaryOf(chatStore.state) });
-    sessionStore.apply({ type: ActionType.SessionDefaultChatChanged, defaultChat: chatChannelURI(fs.sessionID) });
-    // Phase 2: advertise the changeset catalogues directly on the fresh
-    // stores (registration is server-side bookkeeping — no seq, no actions).
-    if (this.opts.changesets) {
-      sessionStore.apply({ type: ActionType.SessionChangesetsChanged, changesets: sessionChangesetCatalog(fs.sessionID) });
-      chatStore.apply({ type: ActionType.ChatChangesetsChanged, changesets: chatChangesetCatalog(fs.sessionID) });
-    }
     const rec: SessionRecord = {
       sessionID: fs.sessionID,
-      channel,
+      channel: recChannel,
       provider: sessionStore.state.provider,
       createdAt: new Date(fs.time.created).toISOString(),
       modifiedAt,
       sessionStore,
-      chatStore,
-      currentTurnId: null,
-      turnStartedAt: null,
-      turnModelRef: null,
-      parts: new Set(),
-      toolInput: new Map(),
-      toolName: new Map(),
-      toolReady: new Set(),
-      permissionForTool: new Map(),
-      toolForPermission: new Map(),
-      lastInbox: null,
-      changesets: new Map(),
-      turnSnapshots: new Map(),
-      clientToolCalls: new Map(),
+      chats: new Map(),
+      defaultChatURI: chatChannelURI(fs.sessionID),
+      sessionChangesets: new Map(),
     };
     this.sessions.set(fs.sessionID, rec);
-    this.byChannel.set(channel, rec);
-    this.byChannel.set(chatChannelURI(fs.sessionID), rec);
-    this.channels.addSession(fs.sessionID);
+    this.byChannel.set(recChannel, rec);
+    // The registry resolves the opencode id (event pump, chat channels)
+    // and — for a channel-marker registration — the client-chosen
+    // suffix too (mirroring `handleCreateSession`).
+    const suffix = sessionIDOf(recChannel) as string;
+    if (suffix !== fs.sessionID) this.channels.addSession(suffix);
+    const defaultChat = this.newChatRuntime(rec.defaultChatURI, fs.sessionID, "Chat 1", modifiedAt);
+    this.bindChat(rec, defaultChat);
+    sessionStore.apply({ type: ActionType.SessionReady });
+    sessionStore.apply({ type: ActionType.SessionChatAdded, summary: chatSummaryOf(defaultChat.chatStore.state) });
+    sessionStore.apply({ type: ActionType.SessionDefaultChatChanged, defaultChat: rec.defaultChatURI });
+    // Phase 2: advertise the changeset catalogues directly on the fresh
+    // stores (registration is server-side bookkeeping — no seq, no actions).
+    if (this.opts.changesets) {
+      sessionStore.apply({ type: ActionType.SessionChangesetsChanged, changesets: sessionChangesetCatalog(recChannel) });
+      defaultChat.chatStore.apply({
+        type: ActionType.ChatChangesetsChanged,
+        changesets: chatChangesetCatalog(rec.defaultChatURI, recChannel),
+      });
+    }
+    // Durability (plan §14.13.1): peers whose marker points at this
+    // session may have been listed earlier in the same `listSessions`
+    // pass — re-attach them before the root announcement so the
+    // sessionAdded summary carries the full chat catalog.
+    this.drainPendingChatBindings(fs.sessionID);
     this.publish({
       channel: ROOT_CHANNEL,
       action: { type: ActionType.RootActiveSessionsChanged, activeSessions: this.sessions.size },
@@ -2476,28 +3090,34 @@ export class Host {
 
   /** Drop a session record and announce the removal on the root channel. */
   private removeRecord(rec: SessionRecord): void {
-    // Phase 2: every live changeset URI is about to become un-subscribable —
-    // dispatch `changeset/cleared` (protocol case 2) before the teardown so
-    // subscribers release their references.
-    for (const uri of rec.changesets.keys()) {
+    const hadClients = rec.sessionStore.state.activeClients.length > 0;
+    // Peer-chat backends are removed while their bindings are still live:
+    // an unbound lingering backend would be re-registered by the next
+    // listSessions scan as its own AHP session. R2: failures log — the
+    // AHP side tears down either way (the ghost then shows in the TUI).
+    for (const chat of rec.chats.values()) {
+      if (chat.uri === rec.defaultChatURI) continue;
+      void this.opts.facade
+        .removeSession(chat.sessionID)
+        .catch((err) => this.log(`failed to remove the peer chat's opencode session ${chat.sessionID}: ${errorMessage(err)}`));
+    }
+    // Phase 2: every live changeset URI is about to become un-subscribable
+    // — dispatch `changeset/cleared` (protocol case 2) before the teardown
+    // so subscribers release their references.
+    for (const uri of rec.sessionChangesets.keys()) {
       this.publish({ channel: uri, action: { type: ActionType.ChangesetCleared } });
     }
-    rec.changesets.clear();
-    rec.turnSnapshots.clear();
-    // Phase 4 extension 1: fail any in-flight client-tool executions
-    // (the session is going away — the waiters must not leak) and
-    // re-sync the opencode tool union (this session's clients' tools
-    // leave the cross-session set).
-    for (const inv of rec.clientToolCalls.values()) {
-      if (inv.result !== undefined) continue;
-      inv.result = { ok: false, error: "session removed before the client completed the tool call" };
-      this.settleClientTool(rec, inv);
+    rec.sessionChangesets.clear();
+    // Per-chat teardown (Phase 4 extension 2): live chat changesets
+    // (`changeset/cleared`), in-flight client-tool executions failed
+    // (the waiters must not leak), and every binding dropped.
+    let failedTools = false;
+    for (const chat of [...rec.chats.values()]) {
+      failedTools = failedTools || [...chat.clientToolCalls.values()].some((inv) => inv.result === undefined);
+      this.removeChat(rec, chat, "session removed before the client completed the tool call");
     }
-    rec.clientToolCalls.clear();
-    const hadClients = rec.sessionStore.state.activeClients.length > 0;
     this.sessions.delete(rec.sessionID);
     this.byChannel.delete(rec.channel);
-    this.byChannel.delete(chatChannelURI(rec.sessionID));
     const id = sessionIDOf(rec.channel);
     if (id !== null) this.channels.removeSession(id);
     this.channels.removeSession(rec.sessionID);
@@ -2506,7 +3126,11 @@ export class Host {
       action: { type: ActionType.RootActiveSessionsChanged, activeSessions: this.sessions.size },
     });
     this.notifyRoot("root/sessionRemoved", { channel: ROOT_CHANNEL, session: rec.channel });
-    if (hadClients) void this.syncClientToolsToOpencode();
+    // Phase 4 extension 1: re-sync the opencode tool union when this
+    // session's clients' tools leave the cross-session set (or any
+    // in-flight call was failed — the facade union is unchanged, but the
+    // session's execute gate must not linger).
+    if (hadClients || failedTools) void this.syncClientToolsToOpencode();
   }
 
   // ── state / publishing ─────────────────────────────────────────────────
@@ -2526,9 +3150,11 @@ export class Host {
       if (!this.opts.changesets) return null;
       const parsed = parseChangesetChannel(uri);
       if (parsed === null) return null;
-      const rec = this.sessions.get(parsed.sessionID);
+      // The owner is the session/chat channel (owner-aware, plan §14.13).
+      const rec = this.byChannel.get(parsed.ownerUri);
       if (rec === undefined) return null;
       const store = this.changesetStore(rec, uri);
+      if (store === null) return null; // owner gone (disposed chat)
       // First subscribe (or a failed computation) triggers the computation;
       // subsequent subscribes return the last completed state.
       if (store.state.status === ChangesetStatus.Computing || store.state.status === ChangesetStatus.Error) {
@@ -2542,8 +3168,9 @@ export class Host {
       if (uri === rec.channel) {
         return { resource: uri, state: rec.sessionStore.state, fromSeq: this.seq.seq };
       }
-      if (uri === chatChannelURI(rec.sessionID)) {
-        return { resource: uri, state: rec.chatStore.state, fromSeq: this.seq.seq };
+      const chat = rec.chats.get(uri);
+      if (chat !== undefined) {
+        return { resource: uri, state: chat.chatStore.state, fromSeq: this.seq.seq };
       }
       return null;
     }
@@ -2561,8 +3188,13 @@ export class Host {
   /** The denormalized `SessionSummary` view of a record. */
   private sessionSummary(rec: SessionRecord): SessionSummary {
     const s = rec.sessionStore.state;
-    const c = rec.chatStore.state;
-    const modifiedAt = c.modifiedAt > rec.modifiedAt ? c.modifiedAt : rec.modifiedAt;
+    // Authoritative chat order: default first, then insertion order
+    // (the default chat is bound first — plan §14.13).
+    const chats = [...rec.chats.values()].map((c) => chatSummaryOf(c.chatStore.state));
+    let modifiedAt = rec.modifiedAt;
+    for (const c of rec.chats.values()) {
+      if (c.chatStore.state.modifiedAt > modifiedAt) modifiedAt = c.chatStore.state.modifiedAt;
+    }
     return buildSessionSummary({
       channel: rec.channel,
       provider: rec.provider,
@@ -2571,8 +3203,8 @@ export class Host {
       activity: s.activity,
       createdAt: rec.createdAt,
       modifiedAt,
-      chat: chatSummaryOf(c),
-      defaultChat: chatChannelURI(rec.sessionID),
+      chats,
+      defaultChat: rec.defaultChatURI,
     });
   }
 
@@ -2595,11 +3227,13 @@ export class Host {
       if (kind === "root") {
         this.state.apply(draft.action as RootAction);
       } else if (kind === "changeset") {
-        // Changeset stores live on the record (keyed by URI), resolved
-        // through the parsed owner session.
+        // Changeset stores are owner-keyed (session-kind on the record,
+        // chat-kind on the chat — plan §14.13). Non-creating: a publish
+        // targets a store someone created (subscribe/refresh); a missing
+        // owner means the changeset is already torn down.
         const parsed = parseChangesetChannel(draft.channel);
-        const rec = parsed !== null ? this.sessions.get(parsed.sessionID) : undefined;
-        const store = rec !== undefined ? rec.changesets.get(draft.channel) : undefined;
+        const rec = parsed !== null ? this.byChannel.get(parsed.ownerUri) : undefined;
+        const store = rec !== undefined ? this.changesetStoreOf(rec, draft.channel) : undefined;
         if (store !== undefined) store.apply(draft.action as ChangesetAction);
       } else {
         // byChannel, not sessions.get(sessionIDOf(…)): the channel suffix
@@ -2607,9 +3241,13 @@ export class Host {
         const rec = this.byChannel.get(draft.channel);
         if (rec !== undefined) {
           const before = this.sessionSummary(rec);
-          if (kind === "session") rec.sessionStore.apply(draft.action as SessionAction);
-          else rec.chatStore.apply(draft.action as ChatAction);
-          if (kind === "chat") this.syncChatSummary(rec);
+          if (kind === "session") {
+            rec.sessionStore.apply(draft.action as SessionAction);
+          } else {
+            const chat = rec.chats.get(draft.channel);
+            if (chat !== undefined) chat.chatStore.apply(draft.action as ChatAction);
+          }
+          if (kind === "chat") this.syncChatSummary(rec, draft.channel);
           const after = this.sessionSummary(rec);
           this.maybeNotifySummaryChanged(rec, before, after);
         }
@@ -2627,8 +3265,9 @@ export class Host {
    * reducer-reachable for read/archive/input-needed bits, so the chat
    * summary is the activity source of truth.
    */
-  private syncChatSummary(rec: SessionRecord): void {
-    const chat = rec.chatStore.state;
+  private syncChatSummary(rec: SessionRecord, chatURI: string): void {
+    const chat = rec.chats.get(chatURI)?.chatStore.state;
+    if (chat === undefined) return;
     const entry = rec.sessionStore.state.chats.find((c) => c.resource === chat.resource);
     if (entry === undefined) return;
     const next = chatSummaryOf(chat);

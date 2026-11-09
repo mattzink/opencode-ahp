@@ -37,6 +37,19 @@ In the Agents window, an `opencode` host with:
   `requiresResultConfirmation` approval. Client tools bypass opencode's
   permission prompt; only the client that provided the tool may execute it
   or confirm its result.
+- **Multi-chat** — a session can host additional chats (AHP `createChat`,
+  gated on the advertised `multipleChats` capability): each chat runs
+  against its own opencode backend session with fully isolated turns, and
+  `disposeChat` removes a chat without touching the session. The chats
+  appear in the session's catalog (default chat first); each chat carries
+  its own changesets. Fork/side-chat creation is not supported (opencode
+  exposes no fork to plugins). Peer-chat backends appear in opencode's own
+  UI as ordinary sessions — they are real opencode sessions underneath.
+  **Survives restarts:** the host stamps small binding markers into the
+  opencode sessions' metadata at create, so after a location reload each
+  chat re-attaches at its original URI (and a client-chosen session
+  channel resurfaces under its original name); re-attached chat titles are
+  re-derived (`Chat 2`, …) while session titles and messages persist.
 - **Steering + queue** — a message sent mid-turn steers the active turn or
   queues for the next one (AHP `pendingMessageSet`).
 - **Changesets** — per-session diff channels (uncommitted, session, and
@@ -226,6 +239,14 @@ node scripts/ahp-client.mjs --token <token> [--base http://127.0.0.1:8765]
 node scripts/ahp-phase1.mjs --token <token> --base http://127.0.0.1:8765 --provider opencode
 # Phase 2 end-to-end: changesets (edit → diffs → discard) + mid-turn reconnect/replay
 node scripts/ahp-phase2.mjs --token <token> --base http://127.0.0.1:8765
+# Phase 4 extension 1: client-provided tools (ping tool, failed result, confirmation cycle)
+node scripts/ahp-client-tools.mjs --token <token> --base http://127.0.0.1:8765
+# Phase 4 extension 2: multi-chat (createChat/disposeChat, per-chat backends, no ghost sessions)
+node scripts/ahp-multi-chat.mjs --token <token> --base http://127.0.0.1:8765
+# multi-chat durability: leave the peer chat + backend alive, reload the
+# location, then recheck the re-attachment (chat at its original URI)
+node scripts/ahp-multi-chat.mjs --token <token> --base http://127.0.0.1:8765 --leave-peer
+node scripts/ahp-multi-chat.mjs --token <token> --base http://127.0.0.1:8765 --recheck <sessionChannel> <peerChatURI>
 # the same probes over native wss:// (self-signed test cert):
 NODE_TLS_REJECT_UNAUTHORIZED=0 node scripts/ahp-phase2.mjs --token <token> --base https://127.0.0.1:8765
 ```
