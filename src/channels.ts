@@ -4,17 +4,26 @@
  * sessions. Pure in-memory — no runtime dependencies.
  *
  * Phase 0 only the root channel is live; session/chat URI handling and
- * the session registry land with Phase 1 (session support).
+ * the session registry land with Phase 1 (session support). Phase 2 adds
+ * the changeset channel kind (`<owner>/changeset/{uncommitted|session|
+ * turn/<turnId>}` — plan §11).
  */
 
 export const ROOT_CHANNEL = "ahp-root://";
 const SESSION_PREFIX = "ahp-session:/";
 const CHAT_PREFIX = "ahp-chat:/";
+const CHANGASET_MARKER = "/changeset/";
 
-export type ChannelKind = "root" | "session" | "chat" | "unknown";
+export type ChannelKind = "root" | "session" | "chat" | "changeset" | "unknown";
 
 export function channelKind(uri: string): ChannelKind {
   if (uri === ROOT_CHANNEL) return "root";
+  // A changeset URI is an owner session/chat URI plus `/changeset/<kind>`.
+  // Checked before the owner prefixes so `<sessionURI>/changeset/session`
+  // is not misread as a session channel whose suffix contains the marker
+  // (createSession rejects such suffixes, so no live session channel can
+  // contain the marker — plan §14).
+  if (uri.lastIndexOf(CHANGASET_MARKER) > 0) return "changeset";
   if (uri.startsWith(SESSION_PREFIX) && uri.length > SESSION_PREFIX.length) return "session";
   if (uri.startsWith(CHAT_PREFIX) && uri.length > CHAT_PREFIX.length) return "chat";
   return "unknown";
@@ -42,6 +51,67 @@ export function sessionIDOf(uri: string): string | null {
   return null;
 }
 
+/**
+ * The three changeset kinds this host advertises (plan §11 Phase 2):
+ *  - `uncommitted`: working tree vs HEAD (owner: the chat channel);
+ *  - `session`: session-wide changes, same approximation (owner: the
+ *    session channel — the protocol's "session" changeKind);
+ *  - `turn`: the files a single turn captured before its edits
+ *    (owner: the chat channel; `turnId` is the AHP turn id).
+ */
+export type ChangesetKind = "uncommitted" | "session" | "turn";
+
+export interface ParsedChangesetChannel {
+  /** The owner session/chat channel URI (valid — see `sessionIDOf`). */
+  ownerUri: string;
+  /** The owner's opencode session id. */
+  sessionID: string;
+  kind: ChangesetKind;
+  /** Present iff `kind === "turn"`. */
+  turnId?: string;
+}
+
+/**
+ * Parse a changeset channel URI of the shape
+ * `<owner session|chat URI>/changeset/{uncommitted|session|turn/<turnId>}`,
+ * or null when the URI is not one. `lastIndexOf` splits on the LAST marker,
+ * and the owner must classify as a session/chat channel — so a URI whose
+ * owner itself contains the marker fails (no live session channel ever
+ * contains it: createSession rejects such suffixes).
+ */
+export function parseChangesetChannel(uri: string): ParsedChangesetChannel | null {
+  const index = uri.lastIndexOf(CHANGASET_MARKER);
+  if (index <= 0) return null;
+  const ownerUri = uri.slice(0, index);
+  const sessionID = sessionIDOf(ownerUri);
+  if (sessionID === null) return null;
+  const rest = uri.slice(index + CHANGASET_MARKER.length);
+  if (rest === "uncommitted" || rest === "session") {
+    return { ownerUri, sessionID, kind: rest };
+  }
+  if (rest.startsWith("turn/")) {
+    const turnId = rest.slice("turn/".length);
+    // Non-empty, no slashes: an AHP turn id (host-minted `turn-…`).
+    if (turnId.length > 0 && !turnId.includes("/")) return { ownerUri, sessionID, kind: "turn", turnId };
+  }
+  return null;
+}
+
+/** Changeset URI of a session's uncommitted (working-tree) changes. */
+export function uncommittedChangesetURI(sessionID: string): string {
+  return `${chatChannelURI(sessionID)}/changeset/uncommitted`;
+}
+
+/** Changeset URI of a session's session-wide changes. */
+export function sessionChangesetURI(sessionID: string): string {
+  return `${sessionChannelURI(sessionID)}/changeset/session`;
+}
+
+/** Changeset URI of one turn's captured file changes. */
+export function turnChangesetURI(sessionID: string, turnId: string): string {
+  return `${chatChannelURI(sessionID)}/changeset/turn/${turnId}`;
+}
+
 export interface SubscribeOutcome {
   ok: boolean;
   reason?: "unknown-uri" | "no-such-session";
@@ -60,7 +130,14 @@ export class ChannelRegistry {
     const kind = channelKind(uri);
     if (kind === "unknown") return { ok: false, reason: "unknown-uri" };
     if (kind !== "root") {
-      const id = sessionIDOf(uri);
+      let id: string | null;
+      if (kind === "changeset") {
+        const parsed = parseChangesetChannel(uri);
+        if (parsed === null) return { ok: false, reason: "unknown-uri" };
+        id = parsed.sessionID;
+      } else {
+        id = sessionIDOf(uri);
+      }
       if (id === null || !this.sessions.has(id)) return { ok: false, reason: "no-such-session" };
     }
     let set = this.subs.get(socketId);

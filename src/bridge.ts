@@ -13,7 +13,10 @@
  * the host uses to seed session/chat stores.
  */
 import { pathToFileURL } from "node:url";
+import { sessionChangesetURI, turnChangesetURI, uncommittedChangesetURI } from "./channels.js";
 import {
+  ChangesetOperationScope,
+  ChangesetOperationStatus,
   CustomizationLoadStatus,
   CustomizationType,
   MessageKind,
@@ -21,10 +24,14 @@ import {
   SessionStatus,
   type AgentCustomization,
   type AgentInfo,
+  type Changeset,
+  type ChangesetFile,
+  type ChangesetOperation,
   type ChatSummary,
   type ChatState,
   type Customization,
   type DirectoryCustomization,
+  type FileEdit,
   type Message,
   type SessionActiveClient,
   type SessionState,
@@ -192,6 +199,41 @@ export interface OpencodeFacade {
    * iterator ends (without error) when the signal aborts.
    */
   events(signal: AbortSignal): AsyncIterable<FacadeEvent>;
+  // ── Phase 2: changesets ───────────────────────────────────────────────
+  /**
+   * Working-tree diff vs HEAD (uncommitted changes, untracked files
+   * included), with **absolute** file paths. `[]` when the location is
+   * not a git repo, has no changes, or the diff fails (R2: degrade to
+   * empty, never throw).
+   */
+  vcsDiffWorking(): Promise<readonly FacadeDiffFile[]>;
+  /**
+   * The file's content in HEAD (`git show HEAD:<rel>`), or null when the
+   * location is not a repo, HEAD is missing, or the file is not tracked.
+   */
+  gitHeadFile(absPath: string): Promise<string | null>;
+  /** Read a UTF-8 file from disk, or null when it does not exist. */
+  readFile(absPath: string): Promise<string | null>;
+  /** Write a UTF-8 file (creating parent directories as needed). */
+  writeFile(absPath: string, content: string): Promise<void>;
+  /** Delete a file; no-op when it does not exist. */
+  deleteFile(absPath: string): Promise<void>;
+  /**
+   * Discard changes to one file: tracked → `git checkout HEAD -- <rel>`
+   * (fallback delete), untracked → delete.
+   */
+  discardFile(absPath: string): Promise<void>;
+}
+
+/**
+ * One entry of a VCS working-tree diff (the facade's shape — absolute
+ * paths, unlike opencode's repo-root-relative `FileDiff.Info`).
+ */
+export interface FacadeDiffFile {
+  path: string;
+  additions: number;
+  deletions: number;
+  status: "added" | "deleted" | "modified";
 }
 
 // ── Phase 0: catalog mappers ─────────────────────────────────────────────
@@ -567,6 +609,7 @@ export function initialSessionState(input: {
   activeClients?: SessionActiveClient[];
   customizations?: Customization[];
   status?: SessionStatus;
+  changesets?: Changeset[];
 }): SessionState {
   return {
     provider: input.provider,
@@ -579,6 +622,7 @@ export function initialSessionState(input: {
     ...(input.customizations !== undefined && input.customizations.length > 0
       ? { customizations: input.customizations }
       : {}),
+    ...(input.changesets !== undefined ? { changesets: input.changesets } : {}),
   };
 }
 
@@ -587,6 +631,7 @@ export function initialChatState(input: {
   resource: string;
   title: string;
   modifiedAt: string;
+  changesets?: Changeset[];
 }): ChatState {
   return {
     resource: input.resource,
@@ -594,6 +639,7 @@ export function initialChatState(input: {
     status: STATUS_IDLE_READ,
     modifiedAt: input.modifiedAt,
     turns: [],
+    ...(input.changesets !== undefined ? { changesets: input.changesets } : {}),
   };
 }
 
@@ -719,4 +765,289 @@ export function pastTenseMessageFor(toolName: string, inputText: string | undefi
     return known[msg] ?? `Ran ${toolName}`;
   }
   return msg;
+}
+
+// ── Phase 2: changesets ───────────────────────────────────────────────────
+
+/**
+ * Content-ref URIs the host serves through `resourceRead` (plan §14.10):
+ *  - `ahp-content://head/<b64url(absPath)>` — the file's content in HEAD
+ *    (`git show HEAD:<rel>`), for the "before" side of uncommitted/session
+ *    changes;
+ *  - `ahp-content://snap/<b64url(session)>/<b64url(turn)>/<b64url(absPath)>/<part>`
+ *    — a turn's captured pre-edit (`before`) or post-turn (`after`) content
+ *    from the in-memory snapshot store. Opaque and unguessable (base64url
+ *    segments, not path segments) so a client cannot point the host at
+ *    arbitrary snapshots.
+ *
+ * The "after" side of uncommitted/session changes is the live disk path
+ * itself (`file://`), read through `resourceRead` at view time.
+ */
+const CONTENT_REF_PREFIX = "ahp-content://";
+const CONTENT_HEAD_MARKER = "ahp-content://head/";
+const CONTENT_SNAP_MARKER = "ahp-content://snap/";
+
+/** The `file://` URI of an absolute path (a `ChangesetFile.id`). */
+export function fileUri(absPath: string): string {
+  return pathToFileURL(absPath).href;
+}
+
+/** Content ref for a file's HEAD content (the "before" of a live diff). */
+export function headContentRef(absPath: string): string {
+  return CONTENT_HEAD_MARKER + b64url(absPath);
+}
+
+/** Content ref for one part of a turn's snapshot. */
+export function snapContentRef(sessionID: string, turnId: string, absPath: string, part: "before" | "after"): string {
+  return `${CONTENT_SNAP_MARKER}${b64url(sessionID)}/${b64url(turnId)}/${b64url(absPath)}/${part}`;
+}
+
+/** Parsed content-ref URI, or null when the URI is not one of ours. */
+export type ParsedContentRef =
+  | { kind: "head"; path: string }
+  | { kind: "snap"; sessionID: string; turnId: string; path: string; part: "before" | "after" };
+
+export function parseContentRef(uri: string): ParsedContentRef | null {
+  if (uri.startsWith(CONTENT_HEAD_MARKER)) {
+    const path = b64urlDecode(uri.slice(CONTENT_HEAD_MARKER.length));
+    return path !== null ? { kind: "head", path } : null;
+  }
+  if (uri.startsWith(CONTENT_SNAP_MARKER)) {
+    const segments = uri.slice(CONTENT_SNAP_MARKER.length).split("/");
+    if (segments.length !== 4) return null;
+    const [sessionID, turnId, path, part] = segments as [string, string, string, string];
+    const dSession = b64urlDecode(sessionID);
+    const dTurn = b64urlDecode(turnId);
+    const dPath = b64urlDecode(path);
+    if (dSession === null || dTurn === null || dPath === null) return null;
+    if (part !== "before" && part !== "after") return null;
+    return { kind: "snap", sessionID: dSession, turnId: dTurn, path: dPath, part };
+  }
+  return null;
+}
+
+function b64url(value: string): string {
+  return Buffer.from(value, "utf-8").toString("base64url");
+}
+
+function b64urlDecode(value: string): string | null {
+  if (value.length === 0) return null;
+  // base64url alphabet check — rejects path separators and junk, which is
+  // what keeps a malformed ref from being mis-split into other segments.
+  if (!/^[A-Za-z0-9_-]+={0,2}$/.test(value)) return null;
+  const text = Buffer.from(value, "base64url").toString("utf-8");
+  return text.length > 0 ? text : null;
+}
+
+/**
+ * Line diff stats for two file contents (port of the ahp-acp-gateway
+ * implementation, plan §14.10): CRLF-normalized, trailing newline ignored,
+ * common prefix/suffix stripped, then an LCS DP over the middle with a
+ * 40 000-cell cap (falls back to counting the whole middle when exceeded).
+ */
+export function computeLineDiffStats(
+  oldText: string | null | undefined,
+  newText: string | null | undefined,
+): { added: number; removed: number } {
+  const splitLines = (text: string | null | undefined): string[] => {
+    if (!text) return [];
+    const normalized = text.replace(/\r\n/g, "\n");
+    const lines = normalized.split("\n");
+    if (lines.length > 0 && lines[lines.length - 1] === "") {
+      lines.pop();
+    }
+    return lines;
+  };
+  const oldLines = splitLines(oldText);
+  const newLines = splitLines(newText);
+  if (oldLines.length === 0) {
+    return { added: newLines.length, removed: 0 };
+  }
+  if (newLines.length === 0) {
+    return { added: 0, removed: oldLines.length };
+  }
+  let prefix = 0;
+  const minLen = Math.min(oldLines.length, newLines.length);
+  while (prefix < minLen && oldLines[prefix] === newLines[prefix]) {
+    prefix++;
+  }
+  let suffix = 0;
+  while (
+    suffix < minLen - prefix &&
+    oldLines[oldLines.length - 1 - suffix] === newLines[newLines.length - 1 - suffix]
+  ) {
+    suffix++;
+  }
+  const oldMid = oldLines.slice(prefix, oldLines.length - suffix);
+  const newMid = newLines.slice(prefix, newLines.length - suffix);
+  if (oldMid.length * newMid.length > 40_000) {
+    return { added: newMid.length, removed: oldMid.length };
+  }
+  const dp = new Uint32Array((oldMid.length + 1) * (newMid.length + 1));
+  const width = newMid.length + 1;
+  for (let i = 1; i <= oldMid.length; i++) {
+    const oldLine = oldMid[i - 1]!;
+    for (let j = 1; j <= newMid.length; j++) {
+      const idx = i * width + j;
+      if (oldLine === newMid[j - 1]) {
+        dp[idx] = dp[(i - 1) * width + (j - 1)]! + 1;
+      } else {
+        const up = dp[(i - 1) * width + j]!;
+        const left = dp[i * width + (j - 1)]!;
+        dp[idx] = up >= left ? up : left;
+      }
+    }
+  }
+  const lcs = dp[oldMid.length * width + newMid.length]!;
+  return {
+    added: Math.max(0, newMid.length - lcs),
+    removed: Math.max(0, oldMid.length - lcs),
+  };
+}
+
+/** The single operation this host advertises (plan §11 Phase 2). */
+export const DISCARD_OPERATION_ID = "discard-changes";
+
+/**
+ * The `discard-changes` operation (gateway-identical shape): restores one
+ * file from the changeset's "before" content — HEAD for uncommitted/session
+ * changes, the turn's pre-edit snapshot for turn changes.
+ */
+export function discardOperation(): ChangesetOperation {
+  return {
+    id: DISCARD_OPERATION_ID,
+    label: "Discard Changes",
+    confirmation: "Are you sure you want to discard changes to this file?",
+    icon: "discard",
+    scopes: [ChangesetOperationScope.Resource],
+    status: ChangesetOperationStatus.Idle,
+  };
+}
+
+/**
+ * The session channel's changeset catalogue: the session-wide changeset
+ * only (the protocol's "session" changeKind — all changes the agent has
+ * produced; approximated by the working tree vs HEAD, plan §14.10).
+ */
+export function sessionChangesetCatalog(sessionID: string): Changeset[] {
+  return [
+    {
+      label: "Session Changes",
+      uriTemplate: sessionChangesetURI(sessionID),
+      changeKind: "session",
+      capabilities: { review: {} },
+    },
+  ];
+}
+
+/**
+ * The chat channel's changeset catalogue: uncommitted changes, the
+ * session-wide changeset, and the per-turn template (`{turnId}` expands
+ * against the chat's turns — the protocol's standard template shapes).
+ */
+export function chatChangesetCatalog(sessionID: string): Changeset[] {
+  return [
+    {
+      label: "Uncommitted Changes",
+      uriTemplate: uncommittedChangesetURI(sessionID),
+      changeKind: "uncommitted",
+      capabilities: { review: {} },
+    },
+    {
+      label: "Session Changes",
+      uriTemplate: sessionChangesetURI(sessionID),
+      changeKind: "session",
+      capabilities: { review: {} },
+    },
+    {
+      label: "Turn Changes",
+      uriTemplate: turnChangesetURI(sessionID, "{turnId}"),
+      changeKind: "turn",
+      capabilities: { review: {} },
+    },
+  ];
+}
+
+/** Carry a file's previous `reviewed` flag into a rebuilt entry (gateway behavior). */
+function withReviewed(file: ChangesetFile, reviewed: boolean | undefined): ChangesetFile {
+  return reviewed === undefined ? file : { ...file, reviewed };
+}
+
+/**
+ * `ChangesetFile` entries for the working-tree diff (the `uncommitted` and
+ * `session` changesets share this approximation, plan §14.10):
+ *  - added → `after` only, live `file://` content ref;
+ *  - deleted → `before` only, HEAD content ref;
+ *  - modified → live `file://` after + HEAD before.
+ * `id` is the `file://` URI (the target of `invokeChangesetOperation`).
+ */
+export function buildWorkingChangesetFiles(input: {
+  diffs: readonly FacadeDiffFile[];
+  reviewedById: ReadonlyMap<string, boolean>;
+}): ChangesetFile[] {
+  const out: ChangesetFile[] = [];
+  for (const f of input.diffs) {
+    if (f.path.length === 0) continue;
+    const id = fileUri(f.path);
+    const edit: FileEdit =
+      f.status === "added"
+        ? {
+            after: { uri: id, content: { uri: id } },
+            diff: { added: f.additions, removed: 0 },
+          }
+        : f.status === "deleted"
+          ? {
+              before: { uri: id, content: { uri: headContentRef(f.path) } },
+              diff: { added: 0, removed: f.deletions },
+            }
+          : {
+              before: { uri: id, content: { uri: headContentRef(f.path) } },
+              after: { uri: id, content: { uri: id } },
+              diff: { added: f.additions, removed: f.deletions },
+            };
+    out.push(withReviewed({ id, edit }, input.reviewedById.get(id)));
+  }
+  return out;
+}
+
+/**
+ * `ChangesetFile` entries for one turn's captured file changes:
+ *  - both sides use opaque snapshot content refs (the "after" is what the
+ *    host read from disk at turn end — strictly correct even if a later
+ *    turn edits the same file again);
+ *  - `before === null` → the turn added the file; `after === null` → the
+ *    turn deleted it; `before === after` → dropped (no net change).
+ */
+export function buildTurnChangesetFiles(input: {
+  sessionID: string;
+  turnId: string;
+  /** absPath → captured {before, after} (null = file absent on that side). */
+  files: ReadonlyMap<string, { before: string | null; after: string | null }>;
+  reviewedById: ReadonlyMap<string, boolean>;
+}): ChangesetFile[] {
+  const out: ChangesetFile[] = [];
+  for (const [absPath, snap] of input.files) {
+    if (snap.before === snap.after) continue;
+    const id = fileUri(absPath);
+    const beforeRef = snapContentRef(input.sessionID, input.turnId, absPath, "before");
+    const afterRef = snapContentRef(input.sessionID, input.turnId, absPath, "after");
+    const edit: FileEdit =
+      snap.before === null
+        ? {
+            after: { uri: id, content: { uri: afterRef } },
+            diff: computeLineDiffStats(null, snap.after),
+          }
+        : snap.after === null
+          ? {
+              before: { uri: id, content: { uri: beforeRef } },
+              diff: computeLineDiffStats(snap.before, null),
+            }
+          : {
+              before: { uri: id, content: { uri: beforeRef } },
+              after: { uri: id, content: { uri: afterRef } },
+              diff: computeLineDiffStats(snap.before, snap.after),
+            };
+    out.push(withReviewed({ id, edit }, input.reviewedById.get(id)));
+  }
+  return out;
 }

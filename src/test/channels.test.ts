@@ -4,8 +4,12 @@ import {
   ROOT_CHANNEL,
   channelKind,
   chatChannelURI,
+  parseChangesetChannel,
   sessionChannelURI,
+  sessionChangesetURI,
   sessionIDOf,
+  turnChangesetURI,
+  uncommittedChangesetURI,
 } from "../channels.js";
 
 describe("channelKind", () => {
@@ -13,6 +17,16 @@ describe("channelKind", () => {
     expect(channelKind("ahp-root://")).toBe("root");
     expect(channelKind("ahp-session:/s-1")).toBe("session");
     expect(channelKind("ahp-chat:/s-1")).toBe("chat");
+  });
+
+  it("classifies changeset URIs — the marker wins over the owner prefixes", () => {
+    expect(channelKind("ahp-chat:/s-1/changeset/uncommitted")).toBe("changeset");
+    expect(channelKind("ahp-session:/s-1/changeset/session")).toBe("changeset");
+    expect(channelKind("ahp-chat:/s-1/changeset/turn/turn-1")).toBe("changeset");
+    // The marker check runs BEFORE the session/chat prefix checks, so a
+    // changeset URI is never misread as the session channel before the
+    // marker (createSession rejects such session suffixes).
+    expect(channelKind("ahp-session:/s-1/changeset/session")).not.toBe("session");
   });
 
   it("rejects empty ids and foreign schemes", () => {
@@ -33,6 +47,58 @@ describe("session URI helpers", () => {
     expect(sessionIDOf("ahp-chat:/s-1")).toBe("s-1");
     expect(sessionIDOf(ROOT_CHANNEL)).toBeNull();
     expect(sessionIDOf("bogus://x")).toBeNull();
+  });
+});
+
+describe("changeset URI parsing and builders", () => {
+  it("parses the three kinds (owner must be a valid session/chat URI)", () => {
+    expect(parseChangesetChannel(uncommittedChangesetURI("s-1"))).toEqual({
+      ownerUri: chatChannelURI("s-1"),
+      sessionID: "s-1",
+      kind: "uncommitted",
+    });
+    expect(parseChangesetChannel(sessionChangesetURI("s-1"))).toEqual({
+      ownerUri: sessionChannelURI("s-1"),
+      sessionID: "s-1",
+      kind: "session",
+    });
+    expect(parseChangesetChannel(turnChangesetURI("s-1", "turn-7"))).toEqual({
+      ownerUri: chatChannelURI("s-1"),
+      sessionID: "s-1",
+      kind: "turn",
+      turnId: "turn-7",
+    });
+  });
+
+  it("round-trips the builders", () => {
+    expect(uncommittedChangesetURI("s-1")).toBe("ahp-chat:/s-1/changeset/uncommitted");
+    expect(sessionChangesetURI("s-1")).toBe("ahp-session:/s-1/changeset/session");
+    expect(turnChangesetURI("s-1", "turn-7")).toBe("ahp-chat:/s-1/changeset/turn/turn-7");
+  });
+
+  it("rejects malformed URIs", () => {
+    // no marker / marker at the start / non-changeset URIs
+    expect(parseChangesetChannel("ahp-session:/s-1")).toBeNull();
+    expect(parseChangesetChannel("ahp-chat:/s-1/changeset")).toBeNull();
+    expect(parseChangesetChannel("/changeset/uncommitted")).toBeNull();
+    expect(parseChangesetChannel(ROOT_CHANNEL)).toBeNull();
+    // unknown kind
+    expect(parseChangesetChannel("ahp-chat:/s-1/changeset/staged")).toBeNull();
+    // turn with empty or slashed id
+    expect(parseChangesetChannel("ahp-chat:/s-1/changeset/turn/")).toBeNull();
+    expect(parseChangesetChannel("ahp-chat:/s-1/changeset/turn/a/b")).toBeNull();
+    // owner that is not a session/chat channel
+    expect(parseChangesetChannel("bogus://x/changeset/session")).toBeNull();
+    expect(parseChangesetChannel("ahp-root:///changeset/session")).toBeNull();
+  });
+
+  it("rejects owners that themselves contain the marker (no live session channel ever does)", () => {
+    // lastIndexOf isolates the owner "ahp-session:/a/changeset/x", but the
+    // marker-priority rule classifies that owner as a changeset URI, so it
+    // is not a valid session/chat channel and the whole parse fails. Live
+    // owners can never contain the marker (createSession rejects such
+    // suffixes; opencode session ids never do).
+    expect(parseChangesetChannel("ahp-session:/a/changeset/x/changeset/session")).toBeNull();
   });
 });
 
@@ -61,6 +127,29 @@ describe("ChannelRegistry: subscribe", () => {
     expect(reg.subscribe(1, sessionChannelURI("s-1"))).toEqual({ ok: true });
     expect(reg.subscribe(1, chatChannelURI("s-1"))).toEqual({ ok: true });
     expect(reg.subscriptionsOf(1)).toEqual(["ahp-session:/s-1", "ahp-chat:/s-1"]);
+  });
+
+  it("subscribes changeset channels when the owner session is live", () => {
+    const reg = new ChannelRegistry();
+    reg.addSession("s-1");
+    expect(reg.subscribe(1, uncommittedChangesetURI("s-1"))).toEqual({ ok: true });
+    expect(reg.subscribe(1, sessionChangesetURI("s-1"))).toEqual({ ok: true });
+    expect(reg.subscribe(1, turnChangesetURI("s-1", "turn-1"))).toEqual({ ok: true });
+  });
+
+  it("rejects changeset channels for dead sessions", () => {
+    const reg = new ChannelRegistry();
+    expect(reg.subscribe(1, uncommittedChangesetURI("nope"))).toEqual({ ok: false, reason: "no-such-session" });
+    reg.addSession("s-1");
+    reg.removeSession("s-1");
+    expect(reg.subscribe(1, sessionChangesetURI("s-1"))).toEqual({ ok: false, reason: "no-such-session" });
+  });
+
+  it("rejects unparseable changeset URIs as unknown", () => {
+    const reg = new ChannelRegistry();
+    reg.addSession("s-1");
+    // marker present but the owner is not a session/chat channel
+    expect(reg.subscribe(1, "bogus://x/changeset/session")).toEqual({ ok: false, reason: "unknown-uri" });
   });
 
   it("re-subscribing the same URI is idempotent", () => {

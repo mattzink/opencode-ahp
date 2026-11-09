@@ -1,11 +1,27 @@
 import { describe, expect, it } from "vitest";
-import type { AgentCustomization, DirectoryCustomization } from "@microsoft/agent-host-protocol";
+import {
+  ChangesetOperationScope,
+  ChangesetOperationStatus,
+  type AgentCustomization,
+  type DirectoryCustomization,
+} from "@microsoft/agent-host-protocol";
 import {
   agentDirectoryCustomization,
   agentUri,
+  buildTurnChangesetFiles,
+  buildWorkingChangesetFiles,
+  chatChangesetCatalog,
+  computeLineDiffStats,
+  DISCARD_OPERATION_ID,
+  discardOperation,
+  fileUri,
+  headContentRef,
   mapAgentCustomizations,
   mapCatalog,
   mapV2Event,
+  parseContentRef,
+  sessionChangesetCatalog,
+  snapContentRef,
   type FacadeAgent,
   type FacadeProvider,
 } from "../bridge.js";
@@ -768,5 +784,258 @@ describe("mapV2Event", () => {
       expect(mapV2Event({ id: "e" })).toBeNull();
       expect(mapV2Event({ id: "e", type: 7, data: { sessionID: "s" } })).toBeNull();
     });
+  });
+});
+
+// ── Phase 2: changesets ───────────────────────────────────────────────────
+
+describe("changeset catalogues", () => {
+  it("session catalog: the session-wide changeset only", () => {
+    const catalog = sessionChangesetCatalog("s-1");
+    expect(catalog).toEqual([
+      {
+        label: "Session Changes",
+        uriTemplate: "ahp-session:/s-1/changeset/session",
+        changeKind: "session",
+        capabilities: { review: {} },
+      },
+    ]);
+  });
+
+  it("chat catalog: uncommitted + session + the per-turn template", () => {
+    const catalog = chatChangesetCatalog("s-1");
+    expect(catalog.map((c) => [c.label, c.uriTemplate, c.changeKind])).toEqual([
+      ["Uncommitted Changes", "ahp-chat:/s-1/changeset/uncommitted", "uncommitted"],
+      ["Session Changes", "ahp-session:/s-1/changeset/session", "session"],
+      ["Turn Changes", "ahp-chat:/s-1/changeset/turn/{turnId}", "turn"],
+    ]);
+    for (const c of catalog) expect(c.capabilities).toEqual({ review: {} });
+  });
+});
+
+describe("content refs", () => {
+  it("builds file:// URIs for the ChangesetFile id / live-disk side", () => {
+    expect(fileUri("/tmp/opencode/ahp-scratch/project-lan/a.txt")).toBe(
+      "file:///tmp/opencode/ahp-scratch/project-lan/a.txt",
+    );
+  });
+
+  it("head + snap refs round-trip through parseContentRef", () => {
+    const head = headContentRef("/tmp/repo/a.txt");
+    expect(head).toMatch(/^ahp-content:\/\/head\//);
+    expect(parseContentRef(head)).toEqual({ kind: "head", path: "/tmp/repo/a.txt" });
+
+    for (const part of ["before", "after"] as const) {
+      const snap = snapContentRef("ses_1", "turn-9", "/tmp/repo/deep/dir/a file.txt", part);
+      expect(snap).toMatch(new RegExp(`^ahp-content://snap/.*${part}$`));
+      expect(parseContentRef(snap)).toEqual({
+        kind: "snap",
+        sessionID: "ses_1",
+        turnId: "turn-9",
+        path: "/tmp/repo/deep/dir/a file.txt",
+        part,
+      });
+    }
+  });
+
+  it("snap ref segments are opaque (no raw path separators leak in)", () => {
+    const ref = snapContentRef("ses/1", "turn/9", "/a/b/c.txt", "before");
+    // only the four intended segments + the marker — slashes inside the
+    // encoded values must not add segments
+    const segments = ref.slice("ahp-content://snap/".length).split("/");
+    expect(segments).toHaveLength(4);
+    expect(parseContentRef(ref)).not.toBeNull();
+  });
+
+  it("rejects junk refs", () => {
+    expect(parseContentRef("ahp-content://head/")).toBeNull();
+    expect(parseContentRef("ahp-content://head/../../etc/passwd")).toBeNull();
+    expect(parseContentRef("ahp-content://snap/abc/def/ghi")).toBeNull(); // 3 segments
+    expect(parseContentRef("ahp-content://snap/abc/def/ghi/jkl/mno")).toBeNull(); // 5
+    expect(parseContentRef("ahp-content://snap/abc/def/ghi/both")).toBeNull(); // bad part
+    expect(parseContentRef("ahp-content://head/a/../b")).toBeNull(); // raw separator in segment
+    expect(parseContentRef("file:///x")).toBeNull();
+    expect(parseContentRef("https://x")).toBeNull();
+  });
+});
+
+describe("computeLineDiffStats", () => {
+  it("null/empty sides are pure adds/removes", () => {
+    expect(computeLineDiffStats(null, "a\nb\nc")).toEqual({ added: 3, removed: 0 });
+    expect(computeLineDiffStats("", "a\nb")).toEqual({ added: 2, removed: 0 });
+    expect(computeLineDiffStats("a\nb\nc", null)).toEqual({ added: 0, removed: 3 });
+    expect(computeLineDiffStats(null, null)).toEqual({ added: 0, removed: 0 });
+  });
+
+  it("counts changed lines in the middle (prefix/suffix preserved)", () => {
+    const old = "a\nb\nOLD\nd\ne";
+    const next = "a\nb\nNEW\nNEW2\nd\ne";
+    expect(computeLineDiffStats(old, next)).toEqual({ added: 2, removed: 1 });
+  });
+
+  it("normalizes CRLF and ignores the trailing newline", () => {
+    const old = "a\r\nb\r\nc";
+    const next = "a\nb\nc\n";
+    expect(computeLineDiffStats(old, next)).toEqual({ added: 0, removed: 0 });
+  });
+
+  it("falls back to whole-middle counting above the 40 000-cell cap", () => {
+    // 300 distinct old lines vs 300 distinct new lines → 90 000 > 40 000
+    const old = Array.from({ length: 300 }, (_, i) => `o${i}`).join("\n");
+    const next = Array.from({ length: 300 }, (_, i) => `n${i}`).join("\n");
+    expect(computeLineDiffStats(old, next)).toEqual({ added: 300, removed: 300 });
+  });
+});
+
+describe("discard operation", () => {
+  it("has the gateway-identical shape (resource-scoped, idle)", () => {
+    expect(discardOperation()).toEqual({
+      id: DISCARD_OPERATION_ID,
+      label: "Discard Changes",
+      confirmation: "Are you sure you want to discard changes to this file?",
+      icon: "discard",
+      scopes: [ChangesetOperationScope.Resource],
+      status: ChangesetOperationStatus.Idle,
+    });
+    expect(DISCARD_OPERATION_ID).toBe("discard-changes");
+  });
+});
+
+describe("buildWorkingChangesetFiles", () => {
+  const diff = (d: Partial<import("../bridge.js").FacadeDiffFile> & { path: string; status: "added" | "deleted" | "modified" }) => ({
+    path: d.path,
+    additions: d.additions ?? 0,
+    deletions: d.deletions ?? 0,
+    status: d.status,
+  });
+
+  it("added files: after only (live disk ref), no before", () => {
+    const files = buildWorkingChangesetFiles({ diffs: [diff({ path: "/r/new.txt", status: "added", additions: 4 })], reviewedById: new Map() });
+    expect(files).toEqual([
+      {
+        id: "file:///r/new.txt",
+        edit: {
+          after: { uri: "file:///r/new.txt", content: { uri: "file:///r/new.txt" } },
+          diff: { added: 4, removed: 0 },
+        },
+      },
+    ]);
+  });
+
+  it("deleted files: before only (HEAD ref), no after", () => {
+    const files = buildWorkingChangesetFiles({ diffs: [diff({ path: "/r/gone.txt", status: "deleted", deletions: 7 })], reviewedById: new Map() });
+    expect(files).toEqual([
+      {
+        id: "file:///r/gone.txt",
+        edit: {
+          before: { uri: "file:///r/gone.txt", content: { uri: headContentRef("/r/gone.txt") } },
+          diff: { added: 0, removed: 7 },
+        },
+      },
+    ]);
+  });
+
+  it("modified files: live disk after + HEAD before, with the diff stats", () => {
+    const files = buildWorkingChangesetFiles({ diffs: [diff({ path: "/r/mod.txt", status: "modified", additions: 2, deletions: 1 })], reviewedById: new Map() });
+    expect(files).toEqual([
+      {
+        id: "file:///r/mod.txt",
+        edit: {
+          before: { uri: "file:///r/mod.txt", content: { uri: headContentRef("/r/mod.txt") } },
+          after: { uri: "file:///r/mod.txt", content: { uri: "file:///r/mod.txt" } },
+          diff: { added: 2, removed: 1 },
+        },
+      },
+    ]);
+  });
+
+  it("preserves the reviewed flag by file id and skips empty paths", () => {
+    const reviewedById = new Map([["file:///r/mod.txt", true]]);
+    const files = buildWorkingChangesetFiles({
+      diffs: [diff({ path: "", status: "added" }), diff({ path: "/r/mod.txt", status: "modified" })],
+      reviewedById,
+    });
+    expect(files).toEqual([
+      {
+        id: "file:///r/mod.txt",
+        reviewed: true,
+        edit: {
+          before: { uri: "file:///r/mod.txt", content: { uri: headContentRef("/r/mod.txt") } },
+          after: { uri: "file:///r/mod.txt", content: { uri: "file:///r/mod.txt" } },
+          diff: { added: 0, removed: 0 },
+        },
+      },
+    ]);
+  });
+});
+
+describe("buildTurnChangesetFiles", () => {
+  const snap = (files: Record<string, { before: string | null; after: string | null }>) =>
+    new Map(Object.entries(files));
+
+  it("drops before === after (no net change in the turn)", () => {
+    const files = buildTurnChangesetFiles({
+      sessionID: "s",
+      turnId: "t1",
+      files: snap({ "/r/same.txt": { before: "x", after: "x" } }),
+      reviewedById: new Map(),
+    });
+    expect(files).toEqual([]);
+  });
+
+  it("added in the turn: after only, with the snap refs and line stats", () => {
+    const files = buildTurnChangesetFiles({
+      sessionID: "s",
+      turnId: "t1",
+      files: snap({ "/r/new.txt": { before: null, after: "a\nb\n" } }),
+      reviewedById: new Map(),
+    });
+    expect(files).toEqual([
+      {
+        id: "file:///r/new.txt",
+        edit: {
+          after: { uri: "file:///r/new.txt", content: { uri: snapContentRef("s", "t1", "/r/new.txt", "after") } },
+          diff: { added: 2, removed: 0 },
+        },
+      },
+    ]);
+  });
+
+  it("deleted in the turn: before only", () => {
+    const files = buildTurnChangesetFiles({
+      sessionID: "s",
+      turnId: "t1",
+      files: snap({ "/r/gone.txt": { before: "a\nb", after: null } }),
+      reviewedById: new Map(),
+    });
+    expect(files).toEqual([
+      {
+        id: "file:///r/gone.txt",
+        edit: {
+          before: { uri: "file:///r/gone.txt", content: { uri: snapContentRef("s", "t1", "/r/gone.txt", "before") } },
+          diff: { added: 0, removed: 2 },
+        },
+      },
+    ]);
+  });
+
+  it("modified in the turn: both snap refs + line stats, reviewed preserved", () => {
+    const files = buildTurnChangesetFiles({
+      sessionID: "s",
+      turnId: "t1",
+      files: snap({ "/r/mod.txt": { before: "a\nOLD\nc", after: "a\nNEW\nc" } }),
+      reviewedById: new Map([["file:///r/mod.txt", true]]),
+    });
+    expect(files).toEqual([
+      {
+        id: "file:///r/mod.txt",
+        reviewed: true,
+        edit: {
+          before: { uri: "file:///r/mod.txt", content: { uri: snapContentRef("s", "t1", "/r/mod.txt", "before") } },
+          after: { uri: "file:///r/mod.txt", content: { uri: snapContentRef("s", "t1", "/r/mod.txt", "after") } },
+          diff: { added: 1, removed: 1 },
+        },
+      },
+    ]);
   });
 });

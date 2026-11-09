@@ -4,11 +4,12 @@ OpenCode v2 plugin that hosts the **Agent Host Protocol (AHP) 1.0.0**
 in-process so opencode is a native agent in the **VS Code Agents window** —
 on this machine and (MVP scope) on other machines over the local LAN.
 
-> **Status: Phase 1 — MVP complete.** Sessions, model + agent pickers,
-> streaming, tool calls, permission prompts, steering/queue, and usage are
-> live-verified over the LAN with VS Code 1.145.2 (real Agents window ↔
-> host). The full plan and wire findings live in
-> [`plan.md`](plan.md).
+> **Status: Phase 2 — parity complete.** Sessions, model + agent pickers,
+> streaming, tool calls, permission prompts, steering/queue, usage,
+> **changesets (uncommitted / session / per-turn diffs with
+> `discard-changes`)**, and reconnect replay are live-verified over the
+> LAN with VS Code 1.145.2 (real Agents window ↔ host). The full plan and
+> wire findings live in [`plan.md`](plan.md).
 
 ## What you get
 
@@ -29,8 +30,14 @@ In the Agents window, an `opencode` host with:
   approval prompt; approve runs the tool, deny blocks it.
 - **Steering + queue** — a message sent mid-turn steers the active turn or
   queues for the next one (AHP `pendingMessageSet`).
+- **Changesets** — per-session diff channels (uncommitted, session, and
+  per-turn) backed by the location's git state: live `file://` refs,
+  `git show HEAD:` before-refs, and in-memory turn snapshots; the
+  `discard-changes` operation restores a file. Requires the location
+  directory to be a git repository (otherwise the changesets are empty);
+  opt out with `capabilities.changesets: false`.
 
-Not yet (Phase 2+): changesets/file diffs, native `wss://` TLS, cancelling
+Not yet (Phase 3+): native `wss://` TLS (off-LAN transports), cancelling
 a queued message, the `always` permission reply.
 
 ## Requirements
@@ -89,7 +96,7 @@ sibling of `src/index.ts` (checkouts only — copy
 | `keepAlive` | `true` | Keep the opencode location loaded against its idle timeout (`experimental.location_idle_timeout`, default 60 min) by periodically touching an internal anchor session — with this on, **no `location_idle_timeout` config entry is needed**. The anchor (`opencode-ahp (keep-alive)`) is a real opencode session: it shows in the TUI session list but is hidden from AHP clients (opencode's plugin surface cannot archive it) |
 | `keepAliveIntervalMinutes` | `10` | Minutes between keep-alive touches; keep well below the effective idle timeout |
 | `replayWindow` | `1000` | Per-channel actions kept for reconnect replay; older gaps → fresh snapshot |
-| `capabilities` | `{ changesets: false, terminals: false, automations: false }` | Advertised in `initialize` — never advertise what we don't implement |
+| `capabilities` | `{ changesets: true, terminals: false, automations: false }` | Advertised in `initialize` — never advertise what we don't implement. Set `changesets` to `false` to disable the diff channels (the session/chat snapshots then carry no changeset catalogues and changeset URIs resolve to nothing) |
 
 ## Remote access (local LAN — MVP)
 

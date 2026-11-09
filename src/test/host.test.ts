@@ -21,14 +21,26 @@ import {
   type SessionState,
 } from "@microsoft/agent-host-protocol";
 import {
+  DISCARD_OPERATION_ID,
+  fileUri,
+  headContentRef,
   mapV2Event,
+  snapContentRef,
   type FacadeAgent,
+  type FacadeDiffFile,
   type FacadeEvent,
   type FacadeProvider,
   type FacadeSession,
   type OpencodeFacade,
 } from "../bridge.js";
-import { ROOT_CHANNEL, sessionChannelURI, chatChannelURI } from "../channels.js";
+import {
+  ROOT_CHANNEL,
+  sessionChannelURI,
+  chatChannelURI,
+  sessionChangesetURI,
+  turnChangesetURI,
+  uncommittedChangesetURI,
+} from "../channels.js";
 import { ERROR_INVALID_PARAMS } from "../handshake.js";
 import { ERROR_NO_PROVIDER, ERROR_SESSION_EXISTS, Host } from "../host.js";
 
@@ -115,6 +127,18 @@ class FakeFacade implements OpencodeFacade {
   permissionReplies: { sessionID: string; requestID: string; decision: "once" | "reject" }[] = [];
   createCalls: ({ id?: string; model?: { providerID: string; modelID: string; variant?: string } } | undefined)[] = [];
   getSessionsCalls: string[] = [];
+  // ── Phase 2: changesets ─────────────────────────────────────────────────
+  /** The working-tree diff `vcsDiffWorking` serves (absolute paths). */
+  diffFiles: FacadeDiffFile[] = [];
+  /** File content on "disk" (absPath → content; absent = the file is gone). */
+  disk = new Map<string, string>();
+  /** File content in HEAD (absPath → content; absent = not in HEAD). */
+  head = new Map<string, string>();
+  discardCalls: string[] = [];
+  writeCalls: { path: string; content: string }[] = [];
+  deleteCalls: string[] = [];
+  /** When set, vcsDiffWorking throws (the changeset errors out). */
+  diffError: string | null = null;
 
   private queue: FacadeEvent[] = [];
   private waiters: Array<() => void> = [];
@@ -205,6 +229,35 @@ class FakeFacade implements OpencodeFacade {
       signal.removeEventListener("abort", onAbort);
     }
   }
+  // ── Phase 2: changesets ─────────────────────────────────────────────────
+  async vcsDiffWorking(): Promise<readonly FacadeDiffFile[]> {
+    if (this.diffError !== null) throw new Error(this.diffError);
+    return this.diffFiles;
+  }
+  async gitHeadFile(absPath: string): Promise<string | null> {
+    return this.head.get(absPath) ?? null;
+  }
+  async readFile(absPath: string): Promise<string | null> {
+    return this.disk.get(absPath) ?? null;
+  }
+  async writeFile(absPath: string, content: string): Promise<void> {
+    this.writeCalls.push({ path: absPath, content });
+    this.disk.set(absPath, content);
+  }
+  async deleteFile(absPath: string): Promise<void> {
+    this.deleteCalls.push(absPath);
+    this.disk.delete(absPath);
+  }
+  /** Discard one file: drop it from the working diff and restore the disk
+   * content from HEAD (deleted when the file is untracked, like the real
+   * facade). */
+  async discardFile(absPath: string): Promise<void> {
+    this.discardCalls.push(absPath);
+    this.diffFiles = this.diffFiles.filter((d) => d.path !== absPath);
+    const headContent = this.head.get(absPath);
+    if (headContent !== undefined) this.disk.set(absPath, headContent);
+    else this.disk.delete(absPath);
+  }
 }
 
 interface Harness {
@@ -220,7 +273,7 @@ interface Harness {
   stop: () => void;
 }
 
-function makeHarness(): Harness {
+function makeHarness(opts?: { changesets?: boolean }): Harness {
   const facade = new FakeFacade();
   const frames: Frame[] = [];
   const host = new Host({
@@ -228,6 +281,7 @@ function makeHarness(): Harness {
     facade,
     replayWindow: 100,
     defaultDirectory: "/tmp/opencode/ahp-scratch/project-lan",
+    changesets: opts?.changesets ?? true,
     send: (socketId, message) => frames.push({ socketId, message: message as Record<string, any> }),
     log: () => {},
   });
@@ -1170,6 +1224,636 @@ describe("external sessions", () => {
     expect(counts[counts.length - 1]!.action.activeSessions).toBe(1);
     h.stop();
   }, 10000);
+});
+
+// ── Phase 2: changesets ───────────────────────────────────────────────────
+
+/** The harness location directory (HostOptions.defaultDirectory). */
+const DIR = "/tmp/opencode/ahp-scratch/project-lan";
+
+function startTurn(h: Harness, chatURI: string, turnId: string, seq = 1, text = "go"): void {
+  h.send(1, "dispatchAction", {
+    channel: chatURI,
+    clientSeq: seq,
+    action: {
+      type: "chat/turnStarted",
+      turnId,
+      startedAt: new Date().toISOString(),
+      message: { text, origin: { kind: "user" } },
+    },
+  });
+}
+
+async function resourceRead(h: Harness, params: Record<string, unknown>, id: number): Promise<Record<string, any>> {
+  h.send(1, "resourceRead", params, id);
+  await waitFor(() => h.frames.some((f) => f.socketId === 1 && f.message.id === id), `resourceRead (${id})`);
+  return h.frames.find((f) => f.socketId === 1 && f.message.id === id)!.message;
+}
+
+async function invokeOp(h: Harness, params: Record<string, unknown>, id: number): Promise<Record<string, any>> {
+  h.send(1, "invokeChangesetOperation", params, id);
+  await waitFor(() => h.frames.some((f) => f.socketId === 1 && f.message.id === id), `invokeChangesetOperation (${id})`);
+  return h.frames.find((f) => f.socketId === 1 && f.message.id === id)!.message;
+}
+
+/** Subscribe to a changeset URI and return the snapshot state (null when absent). */
+function changesetSnapshot(h: Harness, uri: string, id: number): Promise<Record<string, any> | null> {
+  return subscribe(h, 1, uri, id).then((res) => {
+    const snap = res["result"]?.["snapshot"] as Record<string, any> | undefined;
+    return snap?.["state"] ?? null;
+  });
+}
+
+describe("changeset catalogues", () => {
+  const SES = "ses_cat";
+
+  it("createSession seeds the session catalogue (1 entry) and the chat catalogue (3 entries)", async () => {
+    const h = makeHarness();
+    h.init(1, "c1");
+    await waitInit(h, 1);
+    await createSession(h, 1, sessionChannelURI(SES), { provider: "gpuz" });
+
+    const session = await sessionSnapshotState(h, 1, sessionChannelURI(SES), 300);
+    expect(session.changesets?.map((c) => [c.label, c.uriTemplate, c.changeKind])).toEqual([
+      ["Session Changes", sessionChangesetURI(SES), "session"],
+    ]);
+
+    const chat = await chatSnapshotState(h, 1, chatChannelURI(SES), 301);
+    expect(chat.changesets?.map((c) => [c.label, c.uriTemplate, c.changeKind])).toEqual([
+      ["Uncommitted Changes", uncommittedChangesetURI(SES), "uncommitted"],
+      ["Session Changes", sessionChangesetURI(SES), "session"],
+      ["Turn Changes", turnChangesetURI(SES, "{turnId}"), "turn"],
+    ]);
+    for (const c of session.changesets ?? []) expect(c.capabilities).toEqual({ review: {} });
+    h.stop();
+  });
+
+  it("externally registered sessions get catalogues too (applied directly to the fresh stores)", async () => {
+    const h = makeHarness();
+    h.init(1, "c1");
+    await waitInit(h, 1);
+    const t0 = Date.now() - 5000;
+    h.facade.sessions.set("ses_ext", { sessionID: "ses_ext", title: "TUI session", time: { created: t0, updated: t0 } });
+    h.facade.push({ type: "session.created", sessionID: "ses_ext", title: "TUI session" });
+    await waitFor(
+      () => h.notification("root/sessionAdded", 1) !== undefined,
+      "root/sessionAdded for the external session",
+      3000,
+    );
+    const session = await sessionSnapshotState(h, 1, sessionChannelURI("ses_ext"), 302);
+    expect(session.changesets?.map((c) => c.changeKind)).toEqual(["session"]);
+    const chat = await chatSnapshotState(h, 1, chatChannelURI("ses_ext"), 303);
+    expect(chat.changesets?.map((c) => c.changeKind)).toEqual(["uncommitted", "session", "turn"]);
+    h.stop();
+  }, 10000);
+
+  it("rejects a session suffix containing the changeset marker", async () => {
+    const h = makeHarness();
+    h.init(1, "c1");
+    await waitInit(h, 1);
+    const res = await createSession(h, 1, "ahp-session:/x/changeset/session", { provider: "gpuz" });
+    expect(res.error?.code).toBe(ERROR_INVALID_PARAMS);
+    h.stop();
+  });
+});
+
+describe("changeset subscribe and refresh", () => {
+  const SES = "ses_sub";
+
+  it("subscribe (uncommitted): computes to ready with the working diff and the discard operation", async () => {
+    const h = makeHarness();
+    h.init(1, "c1");
+    await waitInit(h, 1);
+    await createSession(h, 1, sessionChannelURI(SES), { provider: "gpuz" });
+    const uri = uncommittedChangesetURI(SES);
+    h.facade.diffFiles = [{ path: `${DIR}/mod.txt`, additions: 2, deletions: 1, status: "modified" }];
+    h.facade.head.set(`${DIR}/mod.txt`, "a\nOLD\n");
+
+    const state = await changesetSnapshot(h, uri, 310);
+    expect(state!.status).toBe("ready");
+    expect(state!.files).toEqual([
+      {
+        id: fileUri(`${DIR}/mod.txt`),
+        edit: {
+          before: { uri: fileUri(`${DIR}/mod.txt`), content: { uri: headContentRef(`${DIR}/mod.txt`) } },
+          after: { uri: fileUri(`${DIR}/mod.txt`), content: { uri: fileUri(`${DIR}/mod.txt`) } },
+          diff: { added: 2, removed: 1 },
+        },
+      },
+    ]);
+    expect(state!.operations?.map((o: any) => o.id)).toEqual([DISCARD_OPERATION_ID]);
+
+    await waitForAction(h, uri, "changeset/contentChanged");
+    const sc = await waitForAction(h, uri, "changeset/statusChanged");
+    expect(sc.action.status).toBe("ready");
+    h.stop();
+  });
+
+  it("subscribe with an empty diff: ready with no files and no operations", async () => {
+    const h = makeHarness();
+    h.init(1, "c1");
+    await waitInit(h, 1);
+    await createSession(h, 1, sessionChannelURI(SES), { provider: "gpuz" });
+    const state = await changesetSnapshot(h, uncommittedChangesetURI(SES), 311);
+    expect(state!.status).toBe("ready");
+    expect(state!.files).toEqual([]);
+    expect(state!.operations).toBeUndefined();
+    h.stop();
+  });
+
+  it("subscribe when the diff fails: error status, then recovers on re-subscribe", async () => {
+    const h = makeHarness();
+    h.init(1, "c1");
+    await waitInit(h, 1);
+    await createSession(h, 1, sessionChannelURI(SES), { provider: "gpuz" });
+    const uri = sessionChangesetURI(SES);
+    h.facade.diffError = "git exploded";
+    const failed = await changesetSnapshot(h, uri, 312);
+    expect(failed!.status).toBe("error");
+    expect(failed!.error).toMatchObject({ errorType: "changeset-computation", message: "git exploded" });
+
+    h.facade.diffError = null;
+    h.facade.diffFiles = [{ path: `${DIR}/new.txt`, additions: 3, deletions: 0, status: "added" }];
+    const recovered = await changesetSnapshot(h, uri, 313);
+    expect(recovered!.status).toBe("ready");
+    expect(recovered!.files).toHaveLength(1);
+    h.stop();
+  });
+
+  it("subscribe to a changeset of a dead session is rejected (-32001)", async () => {
+    const h = makeHarness();
+    h.init(1, "c1");
+    await waitInit(h, 1);
+    const res = await subscribe(h, 1, uncommittedChangesetURI("nope"), 314);
+    expect(res.error?.code).toBe(-32001);
+    h.stop();
+  });
+});
+
+describe("turn changesets (before-capture)", () => {
+  const SES = "ses_turn";
+  const TARGET = `${DIR}/target.txt`;
+  const BEFORE = "line1\nline2\n";
+  const AFTER = "line1\nline2\nline3\n";
+
+  /** Create a session, start turn t1, and drive a `write` tool targeting
+   * `target.txt` (relative path — resolved against the location dir). */
+  async function driveTurn(h: Harness): Promise<string> {
+    const chatURI = chatChannelURI(SES);
+    await subscribe(h, 1, chatURI, 320);
+    h.facade.disk.set(TARGET, BEFORE);
+    startTurn(h, chatURI, "t1");
+    await waitFor(() => h.facade.promptCalls.length === 1, "prompt");
+    h.facade.push({ type: "tool.input.started", sessionID: SES, assistantMessageID: "m1", id: "tc1", name: "write" });
+    h.facade.push({
+      type: "tool.input.ended",
+      sessionID: SES,
+      assistantMessageID: "m1",
+      id: "tc1",
+      text: JSON.stringify({ path: "target.txt", content: AFTER }),
+    });
+    // Barrier: the awaited before-capture reads the disk when the pump
+    // processes tool.input.ended — but this test's synchronous body runs
+    // to completion before any pump microtask, so a disk mutation done
+    // here would already be visible to the capture. The usage event's
+    // chat/usage action is emitted only after the capture completes.
+    h.facade.push({
+      type: "usage.updated",
+      sessionID: SES,
+      tokens: { input: 1, output: 1, reasoning: 0, cache: { read: 0, write: 0 } },
+    });
+    await waitForAction(h, chatURI, "chat/usage");
+    // Now the tool "executes" (disk gets the new content) and the turn
+    // ends. The pump is sequential: execution.succeeded is processed
+    // after the capture.
+    h.facade.disk.set(TARGET, AFTER);
+    h.facade.diffFiles = [{ path: TARGET, additions: 1, deletions: 0, status: "modified" }];
+    h.facade.push({ type: "execution.succeeded", sessionID: SES });
+    await waitForAction(h, chatURI, "chat/turnComplete");
+    return chatURI;
+  }
+
+  it("captures the pre-edit content and serves the turn diff with snap refs", async () => {
+    const h = makeHarness();
+    h.init(1, "c1");
+    await waitInit(h, 1);
+    await createSession(h, 1, sessionChannelURI(SES), { provider: "gpuz" });
+    await driveTurn(h);
+
+    const uri = turnChangesetURI(SES, "t1");
+    const state = await changesetSnapshot(h, uri, 321);
+    expect(state!.status).toBe("ready");
+    expect(state!.files).toEqual([
+      {
+        id: fileUri(TARGET),
+        edit: {
+          before: { uri: fileUri(TARGET), content: { uri: snapContentRef(SES, "t1", TARGET, "before") } },
+          after: { uri: fileUri(TARGET), content: { uri: snapContentRef(SES, "t1", TARGET, "after") } },
+          diff: { added: 1, removed: 0 },
+        },
+      },
+    ]);
+    h.stop();
+  });
+
+  it("refreshes the subscribed uncommitted changeset at turn end", async () => {
+    const h = makeHarness();
+    h.init(1, "c1");
+    await waitInit(h, 1);
+    await createSession(h, 1, sessionChannelURI(SES), { provider: "gpuz" });
+    const uncommittedURI = uncommittedChangesetURI(SES);
+    // Subscribe with an empty working diff first…
+    const first = await changesetSnapshot(h, uncommittedURI, 322);
+    expect(first!.files).toEqual([]);
+    // …then drive a turn whose tool "writes" the file (diff appears).
+    await driveTurn(h);
+    const cc = await waitForAction(h, uncommittedURI, "changeset/contentChanged");
+    expect(cc.action.files).toHaveLength(1);
+    expect(cc.action.files[0].id).toBe(fileUri(TARGET));
+    h.stop();
+  });
+
+  it("serves the captured before/after content through resourceRead", async () => {
+    const h = makeHarness();
+    h.init(1, "c1");
+    await waitInit(h, 1);
+    await createSession(h, 1, sessionChannelURI(SES), { provider: "gpuz" });
+    await driveTurn(h);
+    await changesetSnapshot(h, turnChangesetURI(SES, "t1"), 323);
+
+    const before = await resourceRead(h, { uri: snapContentRef(SES, "t1", TARGET, "before"), encoding: "utf-8" }, 324);
+    expect(before.result).toEqual({ data: BEFORE, encoding: "utf-8" });
+    const after = await resourceRead(h, { uri: snapContentRef(SES, "t1", TARGET, "after"), encoding: "utf-8" }, 325);
+    expect(after.result).toEqual({ data: AFTER, encoding: "utf-8" });
+    h.stop();
+  });
+
+  it("discarding a turn file restores the pre-edit snapshot", async () => {
+    const h = makeHarness();
+    h.init(1, "c1");
+    await waitInit(h, 1);
+    await createSession(h, 1, sessionChannelURI(SES), { provider: "gpuz" });
+    await driveTurn(h);
+    const uri = turnChangesetURI(SES, "t1");
+    await changesetSnapshot(h, uri, 326);
+
+    const res = await invokeOp(
+      h,
+      { channel: uri, operationId: DISCARD_OPERATION_ID, target: { kind: "resource", resource: fileUri(TARGET) } },
+      327,
+    );
+    expect(res.error).toBeUndefined();
+    expect(res.result.message).toBe(`Discarded changes to ${TARGET}`);
+    expect(h.facade.writeCalls).toEqual([{ path: TARGET, content: BEFORE }]);
+    expect(h.facade.disk.get(TARGET)).toBe(BEFORE);
+
+    const running = await waitForAction(h, uri, "changeset/operationStatusChanged", (a) => a.action.status === "running");
+    expect(running.action.operationId).toBe(DISCARD_OPERATION_ID);
+    const idle = await waitForAction(h, uri, "changeset/operationStatusChanged", (a) => a.action.status === "idle");
+    expect(idle.action.operationId).toBe(DISCARD_OPERATION_ID);
+    // The turn changeset is the turn's record — it still shows the change.
+    const state = await changesetSnapshot(h, uri, 328);
+    expect(state!.files).toHaveLength(1);
+    h.stop();
+  });
+
+  it("first capture per file wins (later edits in the same turn don't overwrite it)", async () => {
+    const h = makeHarness();
+    h.init(1, "c1");
+    await waitInit(h, 1);
+    await createSession(h, 1, sessionChannelURI(SES), { provider: "gpuz" });
+    const chatURI = chatChannelURI(SES);
+    await subscribe(h, 1, chatURI, 329);
+    h.facade.disk.set(TARGET, BEFORE);
+    startTurn(h, chatURI, "t1");
+    await waitFor(() => h.facade.promptCalls.length === 1, "prompt");
+
+    // Barrier: a usage event is processed (and its chat/usage emitted) only
+    // AFTER the pump has fully processed the events pushed before it —
+    // including the awaited before-capture of the preceding tool.input.ended.
+    const usage = () =>
+      h.facade.push({
+        type: "usage.updated",
+        sessionID: SES,
+        tokens: { input: 1, output: 1, reasoning: 0, cache: { read: 0, write: 0 } },
+      });
+    const usageCount = () => h.actionsOn(chatURI).filter((a) => a.action.type === "chat/usage").length;
+
+    // Edit 1: capture 1 reads the disk (BEFORE) when the pump processes it.
+    h.facade.push({ type: "tool.input.started", sessionID: SES, assistantMessageID: "m1", id: "tc1", name: "edit" });
+    h.facade.push({
+      type: "tool.input.ended",
+      sessionID: SES,
+      assistantMessageID: "m1",
+      id: "tc1",
+      text: JSON.stringify({ path: "target.txt", oldString: "line2", newString: "line2 a" }),
+    });
+    usage();
+    await waitFor(() => usageCount() === 1, "capture 1 complete");
+    // Edit 1 "executes": the disk changes to the post-edit content.
+    h.facade.disk.set(TARGET, BEFORE + "edit1\n");
+    // Edit 2: capture 2 must NOT overwrite the stored before-content.
+    h.facade.push({ type: "tool.input.started", sessionID: SES, assistantMessageID: "m1", id: "tc2", name: "edit" });
+    h.facade.push({
+      type: "tool.input.ended",
+      sessionID: SES,
+      assistantMessageID: "m1",
+      id: "tc2",
+      text: JSON.stringify({ path: "target.txt", oldString: "line2 a", newString: "line2 b" }),
+    });
+    usage();
+    await waitFor(() => usageCount() === 2, "capture 2 complete");
+    h.facade.push({ type: "execution.succeeded", sessionID: SES });
+    await waitForAction(h, chatURI, "chat/turnComplete");
+    const before = await resourceRead(h, { uri: snapContentRef(SES, "t1", TARGET, "before"), encoding: "utf-8" }, 330);
+    expect(before.result.data).toBe(BEFORE);
+    h.stop();
+  });
+
+  it("does not capture tools outside the location directory or non-snapshot tools", async () => {
+    const h = makeHarness();
+    h.init(1, "c1");
+    await waitInit(h, 1);
+    await createSession(h, 1, sessionChannelURI(SES), { provider: "gpuz" });
+    const chatURI = chatChannelURI(SES);
+    await subscribe(h, 1, chatURI, 331);
+    startTurn(h, chatURI, "t1");
+    await waitFor(() => h.facade.promptCalls.length === 1, "prompt");
+    // Path escaping the location dir via ../
+    h.facade.push({ type: "tool.input.started", sessionID: SES, assistantMessageID: "m1", id: "tc1", name: "write" });
+    h.facade.push({
+      type: "tool.input.ended",
+      sessionID: SES,
+      assistantMessageID: "m1",
+      id: "tc1",
+      text: JSON.stringify({ path: "../../etc/evil.txt", content: "x" }),
+    });
+    // A tool whose name is not file-mutating
+    h.facade.push({ type: "tool.input.started", sessionID: SES, assistantMessageID: "m1", id: "tc2", name: "bash" });
+    h.facade.push({ type: "tool.input.ended", sessionID: SES, assistantMessageID: "m1", id: "tc2", text: JSON.stringify({ command: "ls" }) });
+    h.facade.push({ type: "execution.succeeded", sessionID: SES });
+    await waitForAction(h, chatURI, "chat/turnComplete");
+    const state = await changesetSnapshot(h, turnChangesetURI(SES, "t1"), 332);
+    expect(state!.files).toEqual([]);
+    h.stop();
+  });
+});
+
+describe("resourceRead", () => {
+  const SES = "ses_read";
+  const FILE = `${DIR}/readme.txt`;
+
+  async function ready(h: Harness): Promise<void> {
+    h.init(1, "c1");
+    await waitInit(h, 1);
+    await createSession(h, 1, sessionChannelURI(SES), { provider: "gpuz" });
+  }
+
+  it("reads a file:// inside the location (utf-8 and base64)", async () => {
+    const h = makeHarness();
+    await ready(h);
+    h.facade.disk.set(FILE, "hello\n");
+    const utf8 = await resourceRead(h, { uri: fileUri(FILE), encoding: "utf-8" }, 340);
+    expect(utf8.result).toEqual({ data: "hello\n", encoding: "utf-8" });
+    const b64 = await resourceRead(h, { uri: fileUri(FILE) }, 341);
+    expect(b64.result).toEqual({ data: Buffer.from("hello\n").toString("base64"), encoding: "base64" });
+    h.stop();
+  });
+
+  it("rejects a file:// outside the location (-32009) and a missing file (-32008)", async () => {
+    const h = makeHarness();
+    await ready(h);
+    const outside = await resourceRead(h, { uri: fileUri("/etc/passwd") }, 342);
+    expect(outside.error?.code).toBe(-32009);
+    const missing = await resourceRead(h, { uri: fileUri(`${DIR}/nope.txt`) }, 343);
+    expect(missing.error?.code).toBe(-32008);
+    const empty = await resourceRead(h, { uri: "" }, 344);
+    expect(empty.error?.code).toBe(ERROR_INVALID_PARAMS);
+    h.stop();
+  });
+
+  it("serves ahp-content://head from git HEAD and rejects untracked (-32008)", async () => {
+    const h = makeHarness();
+    await ready(h);
+    h.facade.head.set(FILE, "HEAD version\n");
+    const ok = await resourceRead(h, { uri: headContentRef(FILE), encoding: "utf-8" }, 345);
+    expect(ok.result.data).toBe("HEAD version\n");
+    const untracked = await resourceRead(h, { uri: headContentRef(`${DIR}/untracked.txt`), encoding: "utf-8" }, 346);
+    expect(untracked.error?.code).toBe(-32008);
+    h.stop();
+  });
+
+  it("rejects foreign and malformed content refs (-32008)", async () => {
+    const h = makeHarness();
+    await ready(h);
+    for (const [uri, id] of [
+      ["ahp-content://head/../../etc/passwd", 347],
+      ["ahp-content://snap/abc/def/ghi", 348],
+      ["https://example.com/x", 349],
+    ] as const) {
+      const res = await resourceRead(h, { uri, encoding: "utf-8" }, id);
+      expect(res.error?.code).toBe(-32008);
+    }
+    h.stop();
+  });
+});
+
+describe("invokeChangesetOperation", () => {
+  const SES = "ses_op";
+  const FILE = `${DIR}/mod.txt`;
+  const URI = () => uncommittedChangesetURI(SES);
+
+  async function readyWithFile(h: Harness): Promise<void> {
+    h.init(1, "c1");
+    await waitInit(h, 1);
+    await createSession(h, 1, sessionChannelURI(SES), { provider: "gpuz" });
+    h.facade.diffFiles = [{ path: FILE, additions: 1, deletions: 1, status: "modified" }];
+    h.facade.head.set(FILE, "a\nOLD\n");
+    h.facade.disk.set(FILE, "a\nNEW\n");
+    await changesetSnapshot(h, URI(), 350);
+  }
+
+  it("discards a file (running → idle) and refreshes the changeset to empty", async () => {
+    const h = makeHarness();
+    await readyWithFile(h);
+    const res = await invokeOp(
+      h,
+      { channel: URI(), operationId: DISCARD_OPERATION_ID, target: { kind: "resource", resource: fileUri(FILE) } },
+      351,
+    );
+    expect(res.error).toBeUndefined();
+    expect(res.result.message).toBe(`Discarded changes to ${FILE}`);
+    expect(h.facade.discardCalls).toEqual([FILE]);
+    expect(h.facade.disk.get(FILE)).toBe("a\nOLD\n"); // restored from HEAD
+
+    await waitForAction(h, URI(), "changeset/operationStatusChanged", (a) => a.action.status === "running");
+    const cc = h.actionsOn(URI()).filter((a) => a.action.type === "changeset/contentChanged");
+    expect(cc[cc.length - 1]!.action.files).toEqual([]);
+    const oc = h.actionsOn(URI()).filter((a) => a.action.type === "changeset/operationsChanged");
+    expect(oc[oc.length - 1]!.action.operations).toBeUndefined();
+    await waitForAction(h, URI(), "changeset/operationStatusChanged", (a) => a.action.status === "idle");
+
+    const state = await changesetSnapshot(h, URI(), 352);
+    expect(state!.files).toEqual([]);
+    expect(state!.operations).toBeUndefined();
+    h.stop();
+  });
+
+  it("reports unknown operations (-32601), missing files and bad targets (-32602)", async () => {
+    const h = makeHarness();
+    await readyWithFile(h);
+    const unknown = await invokeOp(h, { channel: URI(), operationId: "nope", target: { kind: "resource", resource: fileUri(FILE) } }, 353);
+    expect(unknown.error?.code).toBe(-32601);
+    const missing = await invokeOp(
+      h,
+      { channel: URI(), operationId: DISCARD_OPERATION_ID, target: { kind: "resource", resource: fileUri(`${DIR}/other.txt`) } },
+      354,
+    );
+    expect(missing.error?.code).toBe(-32602);
+    const range = await invokeOp(h, { channel: URI(), operationId: DISCARD_OPERATION_ID, target: { kind: "range" } }, 355);
+    expect(range.error?.code).toBe(-32602);
+    h.stop();
+  });
+
+  it("rejects paths outside the location (-32009)", async () => {
+    const h = makeHarness();
+    h.init(1, "c1");
+    await waitInit(h, 1);
+    // Fresh session + store whose (repo-wide working-tree approximation)
+    // diff contains a file outside the location directory.
+    await createSession(h, 1, sessionChannelURI(SES), { provider: "gpuz" });
+    h.facade.diffFiles = [{ path: "/outside/mod.txt", additions: 1, deletions: 0, status: "modified" }];
+    await changesetSnapshot(h, URI(), 356);
+    const res = await invokeOp(
+      h,
+      { channel: URI(), operationId: DISCARD_OPERATION_ID, target: { kind: "resource", resource: fileUri("/outside/mod.txt") } },
+      357,
+    );
+    expect(res.error?.code).toBe(-32009);
+    expect(h.facade.discardCalls).toEqual([]);
+    h.stop();
+  });
+
+  it("reports no such changeset when the store was never created (-32001)", async () => {
+    const h = makeHarness();
+    h.init(1, "c1");
+    await waitInit(h, 1);
+    await createSession(h, 1, sessionChannelURI(SES), { provider: "gpuz" });
+    const res = await invokeOp(
+      h,
+      { channel: URI(), operationId: DISCARD_OPERATION_ID, target: { kind: "resource", resource: fileUri(FILE) } },
+      358,
+    );
+    expect(res.error?.code).toBe(-32001);
+    h.stop();
+  });
+});
+
+describe("changeset/filesReviewChanged", () => {
+  const SES = "ses_review";
+  const FILE = `${DIR}/mod.txt`;
+
+  it("echoes the toggle and the next refresh preserves the reviewed flag", async () => {
+    const h = makeHarness();
+    h.init(1, "c1");
+    await waitInit(h, 1);
+    await createSession(h, 1, sessionChannelURI(SES), { provider: "gpuz" });
+    const uri = uncommittedChangesetURI(SES);
+    const chatURI = chatChannelURI(SES);
+    h.facade.diffFiles = [{ path: FILE, additions: 1, deletions: 1, status: "modified" }];
+    await changesetSnapshot(h, uri, 360);
+    await subscribe(h, 1, chatURI, 361);
+
+    h.send(1, "dispatchAction", {
+      channel: uri,
+      clientSeq: 1,
+      action: { type: "changeset/filesReviewChanged", files: [fileUri(FILE)], reviewed: true },
+    });
+    const echo = await waitForAction(h, uri, "changeset/filesReviewChanged");
+    expect(echo.rejectionReason).toBeUndefined();
+    expect(echo.origin).toEqual({ clientId: "c1", clientSeq: 1 });
+
+    // A turn end refreshes the (subscribed) uncommitted changeset; the
+    // rebuilt file list must keep the reviewed flag.
+    startTurn(h, chatURI, "t1", 2);
+    await waitFor(() => h.facade.promptCalls.length === 1, "prompt");
+    h.facade.diffFiles = [
+      { path: FILE, additions: 1, deletions: 1, status: "modified" },
+      { path: `${DIR}/other.txt`, additions: 1, deletions: 0, status: "added" },
+    ];
+    h.facade.push({ type: "execution.succeeded", sessionID: SES });
+    const cc = await waitForAction(h, uri, "changeset/contentChanged", (a) => a.action.files.length === 2);
+    expect(cc.action.files.find((f: any) => f.id === fileUri(FILE)).reviewed).toBe(true);
+    expect(cc.action.files.find((f: any) => f.id === fileUri(`${DIR}/other.txt`)).reviewed).toBeUndefined();
+    h.stop();
+  });
+
+  it("rejects the toggle on a changeset that was never subscribed", async () => {
+    const h = makeHarness();
+    h.init(1, "c1");
+    await waitInit(h, 1);
+    await createSession(h, 1, sessionChannelURI(SES), { provider: "gpuz" });
+    const uri = sessionChangesetURI(SES); // never subscribed → no store
+    h.send(1, "dispatchAction", {
+      channel: uri,
+      clientSeq: 1,
+      action: { type: "changeset/filesReviewChanged", files: [fileUri(FILE)], reviewed: true },
+    });
+    const echo = await waitForAction(h, uri, "changeset/filesReviewChanged");
+    expect(echo.rejectionReason).toMatch(/no such changeset/);
+    h.stop();
+  });
+});
+
+describe("changeset teardown and capability gate", () => {
+  const SES = "ses_gate";
+
+  it("session removal dispatches changeset/cleared for live changesets", async () => {
+    const h = makeHarness();
+    h.init(1, "c1");
+    await waitInit(h, 1);
+    await createSession(h, 1, sessionChannelURI(SES), { provider: "gpuz" });
+    const uri = uncommittedChangesetURI(SES);
+    await changesetSnapshot(h, uri, 370);
+    h.facade.push({ type: "session.deleted", sessionID: SES });
+    await waitFor(() => h.notification("root/sessionRemoved", 1) !== undefined, "root/sessionRemoved");
+    const cleared = h.actionsOn(uri).filter((a) => a.action.type === "changeset/cleared");
+    expect(cleared).toHaveLength(1);
+    const sub = await subscribe(h, 1, uri, 371);
+    expect(sub.error?.code).toBe(-32001);
+    h.stop();
+  });
+
+  it("with the capability off: no catalogues, null snapshots, content refs not found, operations rejected", async () => {
+    const h = makeHarness({ changesets: false });
+    h.init(1, "c1");
+    await waitInit(h, 1);
+    await createSession(h, 1, sessionChannelURI(SES), { provider: "gpuz" });
+    const session = await sessionSnapshotState(h, 1, sessionChannelURI(SES), 372);
+    expect(session.changesets).toBeUndefined();
+    const chat = await chatSnapshotState(h, 1, chatChannelURI(SES), 373);
+    expect(chat.changesets).toBeUndefined();
+
+    // The registry still knows the owner session is live, but the host
+    // refuses to serve the channel → empty subscribe result.
+    const res = await subscribe(h, 1, uncommittedChangesetURI(SES), 374);
+    expect(res.result).toEqual({});
+
+    const read = await resourceRead(h, { uri: headContentRef(`${DIR}/x.txt`), encoding: "utf-8" }, 375);
+    expect(read.error?.code).toBe(-32008);
+
+    const op = await invokeOp(
+      h,
+      {
+        channel: uncommittedChangesetURI(SES),
+        operationId: DISCARD_OPERATION_ID,
+        target: { kind: "resource", resource: fileUri(`${DIR}/x.txt`) },
+      },
+      376,
+    );
+    expect(op.error?.code).toBe(-32001);
+    h.stop();
+  });
 });
 
 // ── action-stream helpers ─────────────────────────────────────────────────

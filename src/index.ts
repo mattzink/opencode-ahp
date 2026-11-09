@@ -25,8 +25,12 @@
  * Every failure path logs and stays up: a bad client connection or a
  * bridge error must never take down the opencode server (R2).
  */
+import { execFile } from "node:child_process";
+import { mkdir, readFile as fsReadFile, rm, writeFile as fsWriteFile } from "node:fs/promises";
+import { dirname, isAbsolute, join, relative } from "node:path";
 import { readFileSync } from "node:fs";
 import { fileURLToPath } from "node:url";
+import { promisify } from "node:util";
 import { Plugin } from "@opencode/plugin";
 // Type-only import of the plugin context. The package's root entry
 // intentionally re-exports no `Context` (it is only ever observed as the
@@ -140,6 +144,44 @@ function isHiddenSessionEvent(event: unknown, hiddenSessionID: string): boolean 
   return isRecord(data) && data["sessionID"] === hiddenSessionID;
 }
 
+// ── Phase 2: changeset git helpers (plan §14.10) ──────────────────────────
+//
+// The plugin `ctx` has no "file content at HEAD" or "discard one file"
+// surface (`ctx.vcs` only diffs), so the facade shells out to `git` in the
+// location directory. Every helper degrades to null/[] on any failure — a
+// VCS hiccup must never throw into the host (R2).
+
+const execFileAsync = promisify(execFile);
+
+/** Run `git <args…>` in `cwd` and return stdout. Throws on non-zero exit. */
+async function git(cwd: string, args: string[]): Promise<string> {
+  // 64 MiB buffer: file contents can be large; a buffer overflow must read
+  // as "failed" (→ null/[]), not hang the host.
+  const { stdout } = await execFileAsync("git", args, { cwd, maxBuffer: 64 * 1024 * 1024 });
+  return stdout;
+}
+
+/** The git repo root containing `cwd`, or null when it is not inside one. */
+async function gitRepoRoot(cwd: string): Promise<string | null> {
+  try {
+    const out = (await git(cwd, ["rev-parse", "--show-toplevel"])).trim();
+    return out.length > 0 ? out : null;
+  } catch {
+    return null;
+  }
+}
+
+/** The repo-root-relative path of `absPath`, or null when outside the repo. */
+function repoRelative(root: string, absPath: string): string | null {
+  const rel = relative(root, absPath);
+  if (rel.length === 0 || rel.startsWith("..") || isAbsolute(rel)) return null;
+  return rel;
+}
+
+function isEnoent(err: unknown): boolean {
+  return (err as NodeJS.ErrnoException | null)?.code === "ENOENT";
+}
+
 /**
  * The narrow opencode surface the bridge needs (plan §3.2, §14.7, §11).
  *
@@ -163,6 +205,24 @@ function isHiddenSessionEvent(event: unknown, hiddenSessionID: string): boolean 
  * version may map).
  */
 function implementFacade(ctx: Context, hiddenSessionID: string | null): OpencodeFacade {
+  const locationDir = ctx.location.directory;
+
+  const readTextFile = async (absPath: string): Promise<string | null> => {
+    try {
+      return await fsReadFile(absPath, "utf-8");
+    } catch (err) {
+      if (isEnoent(err)) return null; // absent → null (caller decides)
+      throw err; // other errors propagate (host maps them)
+    }
+  };
+  const removeFile = async (absPath: string): Promise<void> => {
+    try {
+      await rm(absPath);
+    } catch (err) {
+      if (!isEnoent(err)) throw err; // already gone → no-op
+    }
+  };
+
   return {
     async listCatalog() {
       const [providers, models] = await Promise.all([ctx.provider.list(), ctx.model.list()]);
@@ -285,6 +345,65 @@ function implementFacade(ctx: Context, hiddenSessionID: string | null): Opencode
         if (mapped !== null) yield mapped;
       }
     },
+    // ── Phase 2: changesets (plan §14.10) ────────────────────────────────
+    async vcsDiffWorking() {
+      const root = await gitRepoRoot(locationDir);
+      if (root === null) return []; // not a git repo → no working diff
+      try {
+        // `ctx.vcs.diff` returns `{ location, data: FileDiff.Info[] }` with
+        // repo-root-relative `file` paths — join to the repo root for the
+        // facade's absolute-path contract.
+        const res = await ctx.vcs.diff({ mode: "working", untracked: "files" });
+        return res.data.map((d) => ({
+          path: join(root, d.file),
+          additions: d.additions,
+          deletions: d.deletions,
+          status: d.status,
+        }));
+      } catch {
+        return []; // R2: degrade to empty, never throw
+      }
+    },
+    async gitHeadFile(absPath: string) {
+      const root = await gitRepoRoot(locationDir);
+      if (root === null) return null;
+      const rel = repoRelative(root, absPath);
+      if (rel === null) return null;
+      try {
+        return await git(root, ["show", `HEAD:${rel}`]);
+      } catch {
+        return null; // no HEAD / not tracked / failed → absent
+      }
+    },
+    async readFile(absPath: string) {
+      return readTextFile(absPath);
+    },
+    async writeFile(absPath: string, content: string) {
+      await mkdir(dirname(absPath), { recursive: true });
+      await fsWriteFile(absPath, content, "utf-8");
+    },
+    async deleteFile(absPath: string) {
+      await removeFile(absPath);
+    },
+    async discardFile(absPath: string) {
+      const root = await gitRepoRoot(locationDir);
+      const rel = root !== null ? repoRelative(root, absPath) : null;
+      if (root === null || rel === null) {
+        await removeFile(absPath); // not in a repo → just delete
+        return;
+      }
+      try {
+        await git(root, ["ls-files", "--error-unmatch", "--", rel]);
+      } catch {
+        await removeFile(absPath); // untracked (or staged-new) → delete
+        return;
+      }
+      try {
+        await git(root, ["checkout", "HEAD", "--", rel]);
+      } catch {
+        await removeFile(absPath); // in the index but not in HEAD → delete
+      }
+    },
   };
 }
 
@@ -364,6 +483,7 @@ export default Plugin.define({
         facade: implementFacade(ctx, hiddenSessionID),
         replayWindow: opts.replayWindow,
         defaultDirectory: ctx.location.directory,
+        changesets: opts.capabilities.changesets,
         send: (socketId, message) => {
           listener?.sendTo({ id: socketId }, JSON.stringify(message));
         },

@@ -144,14 +144,15 @@ describe("resolveOptions: validation and fallback (no throw)", () => {
       automations: false,
     });
     // ctx partial entry does not clobber the other file flags
+    // (changesets falls back to the built-in, now true since Phase 2)
     expect(resolveOptions({ capabilities: { terminals: false } }, FILE).capabilities).toEqual({
-      changesets: false,
+      changesets: true,
       terminals: false,
       automations: false,
     });
     // invalid leaf values are dropped per leaf
     expect(resolveOptions({ capabilities: { changesets: "yes" } }, FILE).capabilities).toEqual({
-      changesets: false,
+      changesets: true,
       terminals: true,
       automations: false,
     });

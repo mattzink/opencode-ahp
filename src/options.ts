@@ -71,7 +71,9 @@ export const BUILTIN_OPTIONS: Options = {
   keepAlive: true,
   keepAliveIntervalMinutes: 10,
   replayWindow: 1000,
-  capabilities: { changesets: false, terminals: false, automations: false },
+  // Phase 2: changesets are on by default (opt out with
+  // `capabilities.changesets: false`).
+  capabilities: { changesets: true, terminals: false, automations: false },
 };
 
 export function isRecord(v: unknown): v is Record<string, unknown> {

@@ -35,8 +35,13 @@
  * *notifications* in AHP 1.0.0 (ephemeral, not replayed) — only
  * `root/activeSessionsChanged` is a sequencer action.
  */
+import { resolve as resolvePath } from "node:path";
+import { fileURLToPath } from "node:url";
 import {
   ActionType,
+  ChangesetOperationScope,
+  ChangesetOperationStatus,
+  ChangesetStatus,
   PendingMessageKind,
   ReconnectResultType,
   ResponsePartKind,
@@ -54,6 +59,8 @@ import {
   type ChatToolCallConfirmedAction,
   type ChatTurnCancelledAction,
   type ChatTurnStartedAction,
+  type ChangesetAction,
+  type ChangesetFilesReviewChangedAction,
   type ErrorResponsePart,
   type Implementation,
   type Message,
@@ -75,14 +82,21 @@ import {
   agentDirectoryCustomization,
   agentIDFromUri,
   buildSessionSummary,
+  buildTurnChangesetFiles,
+  buildWorkingChangesetFiles,
+  chatChangesetCatalog,
   chatSummaryOf,
   displayNameFor,
+  discardOperation,
+  fileUri,
   initialChatState,
   initialSessionState,
   invocationMessageFor,
   mapCatalog,
   mapAgentCustomizations,
+  parseContentRef,
   pastTenseMessageFor,
+  sessionChangesetCatalog,
   userMessage,
   type FacadeDelivery,
   type FacadeEvent,
@@ -90,15 +104,28 @@ import {
   type FacadeSession,
   type OpencodeFacade,
 } from "./bridge.js";
-import { ChannelRegistry, ROOT_CHANNEL, channelKind, chatChannelURI, sessionChannelURI, sessionIDOf } from "./channels.js";
+import {
+  ChannelRegistry,
+  ROOT_CHANNEL,
+  channelKind,
+  chatChannelURI,
+  parseChangesetChannel,
+  sessionChannelURI,
+  sessionChangesetURI,
+  sessionIDOf,
+  turnChangesetURI,
+  uncommittedChangesetURI,
+} from "./channels.js";
 import { ERROR_INVALID_PARAMS, handleInitialize } from "./handshake.js";
 import { isRecord } from "./options.js";
 import { Sequencer } from "./seq.js";
 import {
   createChatStateStore,
+  createChangesetStateStore,
   createRootStateStore,
   createSessionStateStore,
   type ChatStateStore,
+  type ChangesetStateStore,
   type RootStateStore,
   type SessionStateStore,
 } from "./state.js";
@@ -110,6 +137,8 @@ export const ERROR_INTERNAL = -32603;
 export const ERROR_SESSION_NOT_FOUND = -32001;
 export const ERROR_NO_PROVIDER = -32002;
 export const ERROR_SESSION_EXISTS = -32003;
+export const ERROR_NOT_FOUND = -32008;
+export const ERROR_PERMISSION_DENIED = -32009;
 
 // ActionType / ReconnectResultType are `declare const enum` in the package
 // but are also real runtime objects (verified against the published dist),
@@ -177,6 +206,16 @@ interface SessionRecord {
   toolForPermission: Map<string, string>;
   /** The most recent `session.inbox.enqueued` (external/TUI prompt tracking). */
   lastInbox: { text: string; delivery: string } | null;
+  // ── Phase 2: changesets ────────────────────────────────────────────────
+  /** Live changeset stores, keyed by changeset URI (created on subscribe). */
+  changesets: Map<string, ChangesetStateStore>;
+  /**
+   * Per-turn file snapshots for the turn changesets: turnId → absPath →
+   * captured {before (pre-edit disk read), after (disk at turn end)}.
+   * `null` = the file was absent on that side. Kept until the session is
+   * removed (content refs + discard-restore read them, plan §14.10).
+   */
+  turnSnapshots: Map<string, Map<string, { before: string | null; after: string | null }>>;
 }
 
 export interface HostOptions {
@@ -185,6 +224,8 @@ export interface HostOptions {
   replayWindow: number;
   /** The opencode instance's working directory (InitializeResult.defaultDirectory). */
   defaultDirectory?: string;
+  /** Advertise + serve the changeset channels (catalogues, snapshots, discard). */
+  changesets: boolean;
   /** Deliver a JSON-serializable frame to a connection. */
   send: (socketId: number, message: unknown) => void;
   /** Close one connection (a superseded duplicate clientId). */
@@ -203,6 +244,14 @@ const RECONNECT_DEFAULT_VERSION = "1.0.0";
 const EXTERNAL_REGISTER_GRACE_MS = 250;
 /** Default page size for `listSessions` (AHP `PaginatedParams.limit`). */
 const LIST_SESSIONS_DEFAULT_LIMIT = 100;
+/**
+ * The file-mutating opencode tools whose inputs carry a target path — the
+ * turn-changeset before-capture watches only these (`tool.input.ended`
+ * fires before execution, so the pre-edit content is still on disk).
+ */
+const SNAPSHOT_TOOLS = new Set(["write", "edit", "apply", "patch"]);
+/** The tool-input keys that carry a file path (checked in order). */
+const SNAPSHOT_PATH_KEYS = ["path", "file_path", "filePath", "file"] as const;
 
 export class Host {
   private readonly seq: Sequencer;
@@ -372,6 +421,12 @@ export class Host {
         break;
       case "createSession":
         await this.handleCreateSession(socketId, msg);
+        break;
+      case "resourceRead":
+        await this.handleResourceRead(socketId, msg);
+        break;
+      case "invokeChangesetOperation":
+        await this.handleInvokeChangesetOperation(socketId, msg);
         break;
       case "setClientManagedSettingsPermissions":
         // VS Code-specific post-init notification (plan §14.7): the
@@ -577,6 +632,14 @@ export class Host {
       return;
     }
     const suffix = sessionIDOf(channel) as string;
+    // A suffix containing the changeset marker would make this session
+    // channel string-identical to the changeset URI of the session before
+    // the marker — the changeset kind would win (channelKind), making the
+    // session channel un-subscribable. Reject it instead.
+    if (suffix.includes("/changeset/")) {
+      this.sendError(socketId, msg.id, ERROR_INVALID_PARAMS, "channel suffix must not contain \"/changeset/\"");
+      return;
+    }
     for (const rec of this.sessions.values()) {
       if (rec.channel === channel) {
         this.sendError(socketId, msg.id, ERROR_SESSION_EXISTS, "Session already exists");
@@ -670,6 +733,8 @@ export class Host {
       permissionForTool: new Map(),
       toolForPermission: new Map(),
       lastInbox: null,
+      changesets: new Map(),
+      turnSnapshots: new Map(),
     };
     this.sessions.set(created.sessionID, rec);
     this.byChannel.set(channel, rec);
@@ -690,6 +755,19 @@ export class Host {
       channel,
       action: { type: ActionType.SessionDefaultChatChanged, defaultChat: chatChannelURI(created.sessionID) },
     });
+    // Phase 2: advertise the changeset catalogues (session channel: the
+    // session-wide changeset; chat channel: uncommitted + session + the
+    // per-turn template).
+    if (this.opts.changesets) {
+      this.publish({
+        channel,
+        action: { type: ActionType.SessionChangesetsChanged, changesets: sessionChangesetCatalog(created.sessionID) },
+      });
+      this.publish({
+        channel: chatChannelURI(created.sessionID),
+        action: { type: ActionType.ChatChangesetsChanged, changesets: chatChangesetCatalog(created.sessionID) },
+      });
+    }
     // Root: active-session count (action, replayed) + sessionAdded (notification).
     this.publish({
       channel: ROOT_CHANNEL,
@@ -778,6 +856,16 @@ export class Host {
     }
 
     const kind = channelKind(channel);
+    if (kind === "changeset") {
+      // The only client-dispatchable changeset action is the per-file
+      // review toggle — echo it through the official reducer.
+      if (stateAction.type === ActionType.ChangesetFilesReviewChanged) {
+        this.dispatchChangesetFilesReviewChanged(channel, stateAction, origin);
+      } else {
+        this.echo(channel, stateAction, origin, `unsupported action on changeset channel: ${String(action.type)}`);
+      }
+      return;
+    }
     if (kind !== "session" && kind !== "chat") {
       this.echo(channel, stateAction, origin, `unsupported action on ${channelKind(channel)} channel: ${String(action.type)}`);
       return;
@@ -1054,7 +1142,28 @@ export class Host {
     // The opencode `session.execution.interrupted` event finds no active
     // turn after the echo finalized it (skipped); run the queued/steering
     // handoff now, on the host side.
-    this.finishTurn(rec);
+    await this.finishTurn(rec);
+  }
+
+  /**
+   * `changeset/filesReviewChanged` (the only client-dispatchable changeset
+   * action): validate the channel resolves to a live store, then echo —
+   * the official reducer toggles `reviewed` per matched file id.
+   */
+  private dispatchChangesetFilesReviewChanged(channel: string, action: StateAction, origin: ActionOrigin | undefined): void {
+    const a = action as ChangesetFilesReviewChangedAction;
+    if (!Array.isArray(a.files) || !a.files.every((f) => typeof f === "string") || typeof a.reviewed !== "boolean") {
+      this.echo(channel, action, origin, "invalid changeset/filesReviewChanged params");
+      return;
+    }
+    const parsed = parseChangesetChannel(channel);
+    const rec = parsed !== null ? this.sessions.get(parsed.sessionID) : undefined;
+    const store = rec !== undefined ? rec.changesets.get(channel) : undefined;
+    if (rec === undefined || store === undefined) {
+      this.echo(channel, action, origin, "no such changeset");
+      return;
+    }
+    this.echo(channel, action, origin);
   }
 
   private async dispatchTitleChanged(rec: SessionRecord, action: StateAction, origin: ActionOrigin | undefined): Promise<void> {
@@ -1160,7 +1269,7 @@ export class Host {
           channel: chatURI,
           action: { type: ActionType.ChatTurnComplete, turnId: rec.currentTurnId, duration: this.turnDuration(rec) },
         });
-        this.finishTurn(rec);
+        await this.finishTurn(rec);
         return;
       case "execution.failed":
         if (rec.currentTurnId === null) return;
@@ -1172,7 +1281,7 @@ export class Host {
           channel: chatURI,
           action: { type: ActionType.ChatError, turnId: rec.currentTurnId, duration: this.turnDuration(rec), part },
         });
-        this.finishTurn(rec);
+        await this.finishTurn(rec);
         return;
       case "execution.interrupted":
         // Skipped when the client's own `chat/turnCancelled` echo already
@@ -1182,7 +1291,7 @@ export class Host {
           channel: chatURI,
           action: { type: ActionType.ChatTurnCancelled, turnId: rec.currentTurnId, duration: this.turnDuration(rec) },
         });
-        this.finishTurn(rec);
+        await this.finishTurn(rec);
         return;
       case "step.started":
         rec.turnModelRef = `${ev.model.providerID}/${ev.model.modelID}`;
@@ -1256,6 +1365,11 @@ export class Host {
         return;
       case "tool.input.ended":
         rec.toolInput.set(ev.id, ev.text);
+        // Phase 2: for file-mutating tools, capture the pre-edit file
+        // content now (the event fires before execution — the last safe
+        // point). Awaited in the sequential pump so the capture is
+        // complete before `execution.*` can end the turn.
+        if (this.opts.changesets) await this.captureTurnBefore(rec, ev.id, ev.text);
         return;
       case "tool.progress":
         // First sign the tool is actually running (opencode auto-approved):
@@ -1403,8 +1517,13 @@ export class Host {
    * during the turn, and auto-start the next turn from the queue (the
    * queued prompt was already sent with `delivery: "queue"` — opencode
    * starts it automatically; this only updates the AHP state).
+   *
+   * Phase 2: then refresh the session's changesets — the turn's captured
+   * "after" content is read from disk here, and the uncommitted/session/
+   * turn changesets recompute (async: awaits the facade).
    */
-  private finishTurn(rec: SessionRecord): void {
+  private async finishTurn(rec: SessionRecord): Promise<void> {
+    const endedTurnId = rec.currentTurnId;
     rec.currentTurnId = null;
     rec.turnStartedAt = null;
     const state = rec.chatStore.state;
@@ -1425,6 +1544,373 @@ export class Host {
     } else if (rec.lastInbox !== null && rec.lastInbox.delivery === "queue") {
       // A queued prompt from outside AHP (e.g. the TUI).
       this.startTurn(rec, userMessage(rec.lastInbox.text));
+    }
+    if (this.opts.changesets && endedTurnId !== null) {
+      await this.refreshTurnChangesets(rec, endedTurnId);
+    }
+  }
+
+  // ── Phase 2: changesets ────────────────────────────────────────────────
+
+  /**
+   * Capture the pre-edit content of a file-mutating tool's target file for
+   * the current turn's changeset (first capture per file wins — the
+   * pre-turn content survives later edits in the same turn). No-op when
+   * the tool is not file-mutating, the input carries no parseable path,
+   * or the path resolves outside the location directory.
+   */
+  private async captureTurnBefore(rec: SessionRecord, toolCallId: string, inputJson: string): Promise<void> {
+    const turnId = rec.currentTurnId;
+    const toolName = rec.toolName.get(toolCallId);
+    if (turnId === null || toolName === undefined || !SNAPSHOT_TOOLS.has(toolName)) return;
+    let parsed: unknown;
+    try {
+      parsed = JSON.parse(inputJson);
+    } catch {
+      return;
+    }
+    if (!isRecord(parsed)) return;
+    const rawPath = SNAPSHOT_PATH_KEYS.map((k) => parsed[k]).find((v) => typeof v === "string" && (v as string).length > 0);
+    if (typeof rawPath !== "string") return;
+    const absPath = this.resolveSnapshotPath(rawPath);
+    if (absPath === null) {
+      this.log(`turn snapshot: ${toolName} target ${rawPath} is outside the location directory; not captured`);
+      return;
+    }
+    let before: string | null;
+    try {
+      before = await this.opts.facade.readFile(absPath);
+    } catch (err) {
+      this.log(`turn snapshot: read of ${absPath} failed: ${errorMessage(err)}`);
+      return;
+    }
+    // The pump is sequential, so the turn cannot have ended between the
+    // call and the await — but the record may be gone (session deleted).
+    if (rec.currentTurnId !== turnId || !this.sessions.has(rec.sessionID)) return;
+    const turnFiles = rec.turnSnapshots.get(turnId) ?? new Map();
+    if (!turnFiles.has(absPath)) turnFiles.set(absPath, { before, after: null });
+    rec.turnSnapshots.set(turnId, turnFiles);
+  }
+
+  /** Resolve a tool-input path against the location directory (must stay inside it). */
+  private resolveSnapshotPath(rawPath: string): string | null {
+    const dir = this.opts.defaultDirectory;
+    if (dir === undefined) return null;
+    const absPath = resolvePath(dir, rawPath);
+    return isPathInside(absPath, dir) ? absPath : null;
+  }
+
+  /** Get-or-create the changeset store for a URI (fresh stores start computing). */
+  private changesetStore(rec: SessionRecord, uri: string): ChangesetStateStore {
+    let store = rec.changesets.get(uri);
+    if (store === undefined) {
+      store = createChangesetStateStore({ status: ChangesetStatus.Computing, files: [] });
+      rec.changesets.set(uri, store);
+    }
+    return store;
+  }
+
+  /** The store's current per-file review flags, keyed by file id. */
+  private reviewedById(store: ChangesetStateStore): Map<string, boolean> {
+    const out = new Map<string, boolean>();
+    for (const f of store.state.files) {
+      if (typeof f.reviewed === "boolean") out.set(f.id, f.reviewed);
+    }
+    return out;
+  }
+
+  /**
+   * Recompute one changeset and publish the delta (gateway's
+   * `updateChangesetChannel` pattern): `changeset/contentChanged` when the
+   * file list changed (the discard operation is (re)attached while files
+   * exist, and cleared when they vanish), then `changeset/statusChanged`
+   * to ready when the status was not ready. A failed computation publishes
+   * `changeset/statusChanged` with an error.
+   */
+  private async refreshChangeset(rec: SessionRecord, uri: string): Promise<void> {
+    const parsed = parseChangesetChannel(uri);
+    if (parsed === null) return;
+    const store = this.changesetStore(rec, uri);
+    let files;
+    try {
+      if (parsed.kind === "turn") {
+        files = buildTurnChangesetFiles({
+          sessionID: parsed.sessionID,
+          turnId: parsed.turnId ?? "",
+          files: rec.turnSnapshots.get(parsed.turnId ?? "") ?? new Map(),
+          reviewedById: this.reviewedById(store),
+        });
+      } else {
+        const diffs = await this.opts.facade.vcsDiffWorking();
+        files = buildWorkingChangesetFiles({ diffs, reviewedById: this.reviewedById(store) });
+      }
+    } catch (err) {
+      this.publish({
+        channel: uri,
+        action: {
+          type: ActionType.ChangesetStatusChanged,
+          status: ChangesetStatus.Error,
+          error: { errorType: "changeset-computation", message: errorMessage(err) },
+        },
+      });
+      return;
+    }
+    const state = store.state;
+    const hadFiles = state.files.length > 0;
+    const hasFiles = files.length > 0;
+    if (JSON.stringify(state.files) !== JSON.stringify(files)) {
+      this.publish({
+        channel: uri,
+        action: {
+          type: ActionType.ChangesetContentChanged,
+          files,
+          ...(hasFiles ? { operations: [discardOperation()] } : {}),
+        },
+      });
+      // operations persist across contentChanged — clear them explicitly
+      // when the changeset empties out.
+      if (!hasFiles && state.operations !== undefined && state.operations.length > 0) {
+        this.publish({ channel: uri, action: { type: ActionType.ChangesetOperationsChanged, operations: undefined } });
+      }
+    }
+    if (!hadFiles && hasFiles && state.operations === undefined) {
+      // contentChanged above already attached the operation; this branch
+      // is unreachable unless the reducer drops it — kept as a guard.
+      this.publish({ channel: uri, action: { type: ActionType.ChangesetOperationsChanged, operations: [discardOperation()] } });
+    }
+    if (state.status !== ChangesetStatus.Ready) {
+      this.publish({ channel: uri, action: { type: ActionType.ChangesetStatusChanged, status: ChangesetStatus.Ready } });
+    }
+  }
+
+  /**
+   * At a turn terminal: read the disk into each captured file's `after`
+   * (a file deleted during the turn stays null → "deleted"), then refresh
+   * the uncommitted, session, and ended-turn changesets — only the ones a
+   * client has subscribed (unsubscribed changesets cost no seq).
+   */
+  private async refreshTurnChangesets(rec: SessionRecord, turnId: string): Promise<void> {
+    const turnFiles = rec.turnSnapshots.get(turnId);
+    if (turnFiles !== undefined) {
+      for (const [absPath, snap] of turnFiles) {
+        if (snap.after === null) {
+          try {
+            snap.after = await this.opts.facade.readFile(absPath);
+          } catch {
+            snap.after = null;
+          }
+        }
+      }
+    }
+    for (const uri of [
+      uncommittedChangesetURI(rec.sessionID),
+      sessionChangesetURI(rec.sessionID),
+      turnChangesetURI(rec.sessionID, turnId),
+    ]) {
+      if (rec.changesets.has(uri)) await this.refreshChangeset(rec, uri);
+    }
+  }
+
+  /**
+   * `resourceRead` (AHP root command): serve file content for the URIs
+   * this host advertises in changesets —
+   *  - `file://` → live disk, confined to the location directory;
+   *  - `ahp-content://head/…` → the file's HEAD content;
+   *  - `ahp-content://snap/…` → a turn's captured before/after content.
+   * Errors: -32008 (not found), -32009 (path outside the location).
+   */
+  private async handleResourceRead(socketId: number, msg: RpcMessage): Promise<void> {
+    const params = isRecord(msg.params) ? msg.params : {};
+    const uri = params["uri"];
+    if (typeof uri !== "string" || uri.length === 0) {
+      this.sendError(socketId, msg.id, ERROR_INVALID_PARAMS, "resourceRead requires a content URI");
+      return;
+    }
+    const encoding: "base64" | "utf-8" = params["encoding"] === "utf-8" ? "utf-8" : "base64";
+    if (uri.startsWith("file://")) {
+      let absPath: string;
+      try {
+        absPath = fileURLToPath(uri);
+      } catch {
+        this.sendError(socketId, msg.id, ERROR_NOT_FOUND, `not found: ${uri}`);
+        return;
+      }
+      if (this.opts.defaultDirectory !== undefined && !isPathInside(absPath, this.opts.defaultDirectory)) {
+        this.sendError(socketId, msg.id, ERROR_PERMISSION_DENIED, "path is outside the location directory");
+        return;
+      }
+      let content: string | null;
+      try {
+        content = await this.opts.facade.readFile(absPath);
+      } catch (err) {
+        this.sendError(socketId, msg.id, ERROR_PERMISSION_DENIED, `read failed: ${errorMessage(err)}`);
+        return;
+      }
+      if (content === null) {
+        this.sendError(socketId, msg.id, ERROR_NOT_FOUND, `not found: ${uri}`);
+        return;
+      }
+      this.sendFrame(socketId, { jsonrpc: "2.0", id: msg.id ?? null, result: this.encodeContent(content, encoding) });
+      return;
+    }
+    // Opaque content refs require the changesets capability.
+    if (!this.opts.changesets) {
+      this.sendError(socketId, msg.id, ERROR_NOT_FOUND, `not found: ${uri}`);
+      return;
+    }
+    const ref = parseContentRef(uri);
+    if (ref === null) {
+      this.sendError(socketId, msg.id, ERROR_NOT_FOUND, `not found: ${uri}`);
+      return;
+    }
+    if (ref.kind === "head") {
+      if (this.opts.defaultDirectory !== undefined && !isPathInside(ref.path, this.opts.defaultDirectory)) {
+        this.sendError(socketId, msg.id, ERROR_PERMISSION_DENIED, "path is outside the location directory");
+        return;
+      }
+      let content: string | null;
+      try {
+        content = await this.opts.facade.gitHeadFile(ref.path);
+      } catch (err) {
+        this.sendError(socketId, msg.id, ERROR_INTERNAL, `HEAD read failed: ${errorMessage(err)}`);
+        return;
+      }
+      if (content === null) {
+        this.sendError(socketId, msg.id, ERROR_NOT_FOUND, `not in HEAD: ${ref.path}`);
+        return;
+      }
+      this.sendFrame(socketId, { jsonrpc: "2.0", id: msg.id ?? null, result: this.encodeContent(content, encoding) });
+      return;
+    }
+    // snap — in-memory turn snapshot of a live session.
+    const rec = this.sessions.get(ref.sessionID);
+    if (rec === undefined) {
+      this.sendError(socketId, msg.id, ERROR_NOT_FOUND, "no such session");
+      return;
+    }
+    const snap = rec.turnSnapshots.get(ref.turnId)?.get(ref.path);
+    const content = snap === undefined ? null : ref.part === "before" ? snap.before : snap.after;
+    if (content === null) {
+      this.sendError(socketId, msg.id, ERROR_NOT_FOUND, `not found: ${uri}`);
+      return;
+    }
+    this.sendFrame(socketId, { jsonrpc: "2.0", id: msg.id ?? null, result: this.encodeContent(content, encoding) });
+  }
+
+  /** Encode content for a `resourceRead` result (utf-8 or base64). */
+  private encodeContent(content: string, encoding: "base64" | "utf-8") {
+    return {
+      data: encoding === "utf-8" ? content : Buffer.from(content, "utf-8").toString("base64"),
+      encoding,
+    };
+  }
+
+  /**
+   * `invokeChangesetOperation`: the host's only operation is
+   * `discard-changes` (resource-scoped) — restore one file from the
+   * changeset's "before" content. Status flows through the
+   * `changeset/operationStatusChanged` stream; the JSON-RPC result carries
+   * a human-readable message.
+   */
+  private async handleInvokeChangesetOperation(socketId: number, msg: RpcMessage): Promise<void> {
+    const params = isRecord(msg.params) ? msg.params : {};
+    const channel = params["channel"];
+    const operationId = params["operationId"];
+    if (typeof channel !== "string" || channel.length === 0 || typeof operationId !== "string" || operationId.length === 0) {
+      this.sendError(socketId, msg.id, ERROR_INVALID_PARAMS, "invokeChangesetOperation requires channel + operationId");
+      return;
+    }
+    const parsed = parseChangesetChannel(channel);
+    if (parsed === null) {
+      this.sendError(socketId, msg.id, ERROR_INVALID_PARAMS, `not a changeset channel: ${channel}`);
+      return;
+    }
+    const rec = this.sessions.get(parsed.sessionID);
+    if (rec === undefined) {
+      this.sendError(socketId, msg.id, ERROR_SESSION_NOT_FOUND, "no such session");
+      return;
+    }
+    const store = rec.changesets.get(channel);
+    if (store === undefined) {
+      this.sendError(socketId, msg.id, ERROR_SESSION_NOT_FOUND, `no such changeset: ${channel}`);
+      return;
+    }
+    const op = store.state.operations?.find((o) => o.id === operationId);
+    if (op === undefined) {
+      this.sendError(socketId, msg.id, ERROR_METHOD_NOT_FOUND, `unknown operation: ${operationId}`);
+      return;
+    }
+    if (!op.scopes.includes(ChangesetOperationScope.Resource)) {
+      this.sendError(socketId, msg.id, ERROR_INVALID_PARAMS, `operation ${operationId} is not resource-scoped`);
+      return;
+    }
+    const target = params["target"];
+    if (!isRecord(target) || target["kind"] !== "resource" || typeof target["resource"] !== "string") {
+      this.sendError(socketId, msg.id, ERROR_INVALID_PARAMS, "resource-scoped operation requires a resource target");
+      return;
+    }
+    let absPath: string;
+    try {
+      absPath = fileURLToPath(target["resource"] as string);
+    } catch {
+      this.sendError(socketId, msg.id, ERROR_INVALID_PARAMS, "target.resource must be a file URI");
+      return;
+    }
+    if (!store.state.files.some((f) => f.id === fileUri(absPath))) {
+      this.sendError(socketId, msg.id, ERROR_INVALID_PARAMS, `no such file in changeset: ${target["resource"]}`);
+      return;
+    }
+    if (this.opts.defaultDirectory !== undefined && !isPathInside(absPath, this.opts.defaultDirectory)) {
+      this.sendError(socketId, msg.id, ERROR_PERMISSION_DENIED, "path is outside the location directory");
+      return;
+    }
+    this.publish({
+      channel,
+      action: { type: ActionType.ChangesetOperationStatusChanged, operationId, status: ChangesetOperationStatus.Running },
+    });
+    try {
+      if (parsed.kind === "turn" && parsed.turnId !== undefined) {
+        await this.restoreTurnFile(rec, parsed.turnId, absPath);
+      } else {
+        await this.opts.facade.discardFile(absPath);
+      }
+    } catch (err) {
+      this.publish({
+        channel,
+        action: {
+          type: ActionType.ChangesetOperationStatusChanged,
+          operationId,
+          status: ChangesetOperationStatus.Error,
+          error: { errorType: "operation-failed", message: errorMessage(err) },
+        },
+      });
+      this.sendError(socketId, msg.id, ERROR_INTERNAL, errorMessage(err));
+      return;
+    }
+    await this.refreshChangeset(rec, channel);
+    this.publish({
+      channel,
+      action: { type: ActionType.ChangesetOperationStatusChanged, operationId, status: ChangesetOperationStatus.Idle },
+    });
+    this.sendFrame(socketId, {
+      jsonrpc: "2.0",
+      id: msg.id ?? null,
+      result: { message: `Discarded changes to ${absPath}` },
+    });
+  }
+
+  /**
+   * Restore one file from a turn's before-snapshot: the file was added by
+   * the turn (before === null) → delete it; otherwise write the pre-edit
+   * content back.
+   */
+  private async restoreTurnFile(rec: SessionRecord, turnId: string, absPath: string): Promise<void> {
+    const snap = rec.turnSnapshots.get(turnId)?.get(absPath);
+    const before = snap?.before ?? null;
+    if (before === null) {
+      await this.opts.facade.deleteFile(absPath);
+    } else {
+      await this.opts.facade.writeFile(absPath, before);
     }
   }
 
@@ -1538,6 +2024,12 @@ export class Host {
     sessionStore.apply({ type: ActionType.SessionReady });
     sessionStore.apply({ type: ActionType.SessionChatAdded, summary: chatSummaryOf(chatStore.state) });
     sessionStore.apply({ type: ActionType.SessionDefaultChatChanged, defaultChat: chatChannelURI(fs.sessionID) });
+    // Phase 2: advertise the changeset catalogues directly on the fresh
+    // stores (registration is server-side bookkeeping — no seq, no actions).
+    if (this.opts.changesets) {
+      sessionStore.apply({ type: ActionType.SessionChangesetsChanged, changesets: sessionChangesetCatalog(fs.sessionID) });
+      chatStore.apply({ type: ActionType.ChatChangesetsChanged, changesets: chatChangesetCatalog(fs.sessionID) });
+    }
     const rec: SessionRecord = {
       sessionID: fs.sessionID,
       channel,
@@ -1556,6 +2048,8 @@ export class Host {
       permissionForTool: new Map(),
       toolForPermission: new Map(),
       lastInbox: null,
+      changesets: new Map(),
+      turnSnapshots: new Map(),
     };
     this.sessions.set(fs.sessionID, rec);
     this.byChannel.set(channel, rec);
@@ -1571,6 +2065,14 @@ export class Host {
 
   /** Drop a session record and announce the removal on the root channel. */
   private removeRecord(rec: SessionRecord): void {
+    // Phase 2: every live changeset URI is about to become un-subscribable —
+    // dispatch `changeset/cleared` (protocol case 2) before the teardown so
+    // subscribers release their references.
+    for (const uri of rec.changesets.keys()) {
+      this.publish({ channel: uri, action: { type: ActionType.ChangesetCleared } });
+    }
+    rec.changesets.clear();
+    rec.turnSnapshots.clear();
     this.sessions.delete(rec.sessionID);
     this.byChannel.delete(rec.channel);
     this.byChannel.delete(chatChannelURI(rec.sessionID));
@@ -1597,6 +2099,20 @@ export class Host {
   private async snapshotFor(uri: string): Promise<Snapshot | null> {
     const kind = channelKind(uri);
     if (kind === "unknown") return null;
+    if (kind === "changeset") {
+      if (!this.opts.changesets) return null;
+      const parsed = parseChangesetChannel(uri);
+      if (parsed === null) return null;
+      const rec = this.sessions.get(parsed.sessionID);
+      if (rec === undefined) return null;
+      const store = this.changesetStore(rec, uri);
+      // First subscribe (or a failed computation) triggers the computation;
+      // subsequent subscribes return the last completed state.
+      if (store.state.status === ChangesetStatus.Computing || store.state.status === ChangesetStatus.Error) {
+        await this.refreshChangeset(rec, uri);
+      }
+      return { resource: uri, state: store.state, fromSeq: this.seq.seq };
+    }
     if (kind !== "root") {
       const rec = this.byChannel.get(uri);
       if (rec === undefined) return null;
@@ -1655,6 +2171,13 @@ export class Host {
       const kind = channelKind(draft.channel);
       if (kind === "root") {
         this.state.apply(draft.action as RootAction);
+      } else if (kind === "changeset") {
+        // Changeset stores live on the record (keyed by URI), resolved
+        // through the parsed owner session.
+        const parsed = parseChangesetChannel(draft.channel);
+        const rec = parsed !== null ? this.sessions.get(parsed.sessionID) : undefined;
+        const store = rec !== undefined ? rec.changesets.get(draft.channel) : undefined;
+        if (store !== undefined) store.apply(draft.action as ChangesetAction);
       } else {
         // byChannel, not sessions.get(sessionIDOf(…)): the channel suffix
         // is not always the opencode session id (client-chosen suffixes).
@@ -1792,4 +2315,16 @@ function mapToolResultContent(content: readonly { type: string; text?: string }[
     }
   }
   return out;
+}
+
+/**
+ * True when `child` is `parent` itself or strictly inside it (both resolved
+ * first, so relative segments and `..` cannot escape the comparison). Used
+ * to confine turn-snapshot paths and `resourceRead`/`invokeChangesetOperation`
+ * targets to the location directory.
+ */
+function isPathInside(child: string, parent: string): boolean {
+  const a = resolvePath(child);
+  const b = resolvePath(parent);
+  return a === b || a.startsWith(b + "/");
 }

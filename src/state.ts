@@ -6,14 +6,18 @@
  *
  *  - root channel: `rootReducer` (Phase 0);
  *  - session channels: `sessionReducer` (Phase 1);
- *  - chat channels: `chatReducer` (Phase 1).
+ *  - chat channels: `chatReducer` (Phase 1);
+ *  - changeset channels: `changesetReducer` (Phase 2).
  */
 import {
   chatReducer,
+  changesetReducer,
   rootReducer,
   sessionReducer,
   type ChatAction,
   type ChatState,
+  type ChangesetAction,
+  type ChangesetState,
   type RootAction,
   type RootState,
   type SessionAction,
@@ -39,6 +43,13 @@ export interface ChatStateStore {
   readonly state: ChatState;
   /** Apply a chat-channel action through the official reducer. */
   apply(action: ChatAction): ChatState;
+}
+
+export interface ChangesetStateStore {
+  /** Current changeset state (the `…/changeset/…` snapshot payload). */
+  readonly state: ChangesetState;
+  /** Apply a changeset-channel action through the official reducer. */
+  apply(action: ChangesetAction): ChangesetState;
 }
 
 export function createRootStateStore(initial: RootState): RootStateStore {
@@ -75,6 +86,19 @@ export function createChatStateStore(initial: ChatState): ChatStateStore {
     },
     apply(action: ChatAction): ChatState {
       state = chatReducer(state, action);
+      return state;
+    },
+  };
+}
+
+export function createChangesetStateStore(initial: ChangesetState): ChangesetStateStore {
+  let state: ChangesetState = initial;
+  return {
+    get state(): ChangesetState {
+      return state;
+    },
+    apply(action: ChangesetAction): ChangesetState {
+      state = changesetReducer(state, action);
       return state;
     },
   };

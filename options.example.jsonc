@@ -51,6 +51,10 @@
   // "replayWindow": 1000,
 
   // What initialize advertises — never advertise what we don't implement.
-  // changesets flips to true in Phase 2 (D2).
+  // Default: { "changesets": true, "terminals": false, "automations": false }.
+  // Set "changesets": false to disable the diff channels (no changeset
+  // catalogues in the session/chat snapshots; changeset URIs resolve to
+  // nothing). Changesets require the location directory to be a git
+  // repository.
   // "capabilities": { "changesets": false, "terminals": false, "automations": false }
 }

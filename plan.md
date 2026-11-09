@@ -134,7 +134,7 @@ hooks.
 | Changesets (uncommitted / session / per-turn diffs) | `ctx.vcs.status()` / `ctx.vcs.diff()` | ✅ direct |
 | Model picker / session options | model + mode configuration | ✅ direct |
 | Custom-agent picker (Build/Plan/…) | `ctx.agent` (`list` / `get`) + `agent.updated` event | ✅ direct → `AgentCustomization` children + `Message.agent` (§14.7); catalog side **implemented** (Phase 0 increment, 2026-11-07) — `AgentInfo.customizations` carries the workspace agent container; `Message.agent` → prompt agent lands with Phase 1 sessions |
-| Client-provided tools | `ctx.tool.transform` | ✅ direct (Phase 3) |
+| Client-provided tools | `ctx.tool.transform` | ✅ direct (Phase 4) |
 | Terminals | — | ❌ no PTY/terminal API (AHP-optional; peers use pipe-backed or omit) |
 | Automations | — | ❌ gap (1.1-draft territory) |
 | Multiple chats per session | one chat per session | ❌ gap (matches pi-ahp / ahp-acp-gateway) |
@@ -584,7 +584,7 @@ tests; `pnpm test` = `vitest run`. Toolchain (node 26 + pnpm) from
 `pnpm install --frozen-lockfile`, then typecheck + vitest on push/PR
 (§10).
 
-### 9.3 Conformance (Phase 2)
+### 9.3 Conformance (Phase 3)
 
 The official AHP conformance fixtures
 (`microsoft/agent-host-protocol` → `types/test-cases`) run against our
@@ -624,8 +624,8 @@ host over WebSocket. Exit criterion: green for every capability in
 12. (Phase 2) Changesets: prompt that edits files → uncommitted/session
     diffs appear; `discard-changes` works.
 
-**Exit criteria:** MVP = items 1–11; parity = item 12 plus §9.3
-conformance green.
+**Exit criteria:** MVP = items 1–11 (Phase 1); parity = item 12
+(Phase 2); §9.3 conformance green = Phase 3.
 
 ---
 
@@ -791,21 +791,39 @@ Working order (house pattern: pure modules + tests first, wiring last):
 **Exit criteria:** daily-drivable from a second PC on the LAN (D3); no
 lost messages on normal disconnect/reconnect.
 
-### Phase 2 — Parity (AHP 1.0.0 conformance)
+### Phase 2 — Parity (changesets + reconciliation)
 
 - **Changesets** (deferred from Phase 1 per D2): uncommitted / session /
   per-turn diff channels from `ctx.vcs` (mirror ahp-acp-gateway's channel
-  set incl. `discard-changes`).
+  set incl. `discard-changes`), the `invokeChangesetOperation` command,
+  and `resourceRead` for the `ContentRef` file contents behind the diffs.
 - Full **write-ahead reconciliation**: reconnect replay window + snapshot
-  fallback; optimistic client actions reconciled against host state.
+  fallback; optimistic client actions reconciled against host state
+  (replay vs snapshot fallback verified live — §14.10).
+
+**Exit criteria:** E2E item 12 (changesets: prompt that edits files →
+uncommitted/session diffs appear; `discard-changes` works) plus
+reconnect under dropped-link scenarios (E2E item 7) verified live.
+
+**Status (2026-11-08): exit criteria MET, live-verified** (LAN host
+10.0.1.107:8767, `scripts/ahp-phase2.mjs`). Uncommitted/session/turn
+changesets with catalogue entries + review capabilities, `resourceRead`
+for all content-ref kinds, `discard-changes` (file restored from HEAD,
+changeset refreshed), and a mid-turn link drop → **replay** (the turn
+completed during the gap; `turnComplete` arrived via the replay, exactly
+once). 208/208 tests green, typecheck clean. Findings in §14.10.
+Remaining: user commit/push → CI publish; flip the LAN host config back
+to the npm spec and re-verify.
+
+### Phase 3 — Conformance & transport (carved out of Phase 2, 2026-11-08)
+
 - **Run the official conformance suite** (§9.3) and fix gaps.
-- Native `wss://` termination (post-MVP; only needed for off-LAN
-  transports — D3).
+- Native `wss://` termination (only needed for off-LAN transports — D3).
 
-**Exit criteria:** conformance green for all advertised capabilities;
-reconnect test passes under dropped-link scenarios (E2E item 12).
+**Exit criteria:** conformance green for all advertised capabilities; a
+`wss://` endpoint usable for an off-LAN transport.
 
-### Phase 3 — Extensions
+### Phase 4 — Extensions
 
 - Client-provided tools via `ctx.tool.transform`.
 - Multi-chat per session (if/when opencode's API allows).
@@ -1354,6 +1372,177 @@ to the 1.1.0 draft — the installed 1.0.0 dist is the only ground truth).
 (8 files — the 38-event fixture replay in `host.test.ts` covers the
 reasoning/tool/markdown/usage/terminal path end-to-end through the real
 reducers; `keep-alive.test.ts` covers the §15 keep-alive module).
+
+---
+
+### 14.10 Phase 2 implementation findings (2026-11-08)
+
+Changesets + write-ahead reconciliation, live-verified on the LAN host
+(10.0.1.107:8767) with `scripts/ahp-phase2.mjs` (E2E items 12 + 7).
+
+**Changeset channel grammar & catalogues**
+
+- URI shape: `<ownerUri>/changeset/{uncommitted|session|turn/<turnId>}`,
+  where the owner is `ahp-chat:/<sessionID>` (uncommitted/turn) or
+  `ahp-session:/<sessionID>` (session). `parseChangesetChannel` splits on
+  the **last** `/changeset/` occurrence.
+- `channelKind` gives the marker **priority**: any URI containing
+  `/changeset/` is kind `changeset`, even if it looks session/chat-shaped.
+  Therefore `createSession` rejects channel suffixes containing
+  `/changeset/` (otherwise the session channel would be un-subscribable),
+  and owners that themselves contain the marker are rejected by the
+  parser.
+- Catalogues ride the session/chat snapshots: the session state carries
+  one entry (`session`), the chat state carries three
+  (`uncommitted`, `session`, `turn` with the `{turnId}` template). Every
+  entry carries `changeKind` + `capabilities: { review: {} }`.
+  **Catalog-at-creation is unobservable through the action stream**:
+  `publish()` only broadcasts to existing subscribers, so a client learns
+  the catalogues from the initial snapshot responses (subscribe after
+  createSession). External registration (the event-pump path) applies
+  catalogues directly to the fresh store instead.
+
+**Changeset URIs are keyed by the opencode session ID, not the
+client-chosen channel suffix (live finding)**
+
+- `snapshotFor`'s changeset branch resolves
+  `this.sessions.get(parsed.sessionID)` — the map is keyed by the
+  opencode-minted `ses_…` id. A client-created session
+  (`ahp-session:/lan-phase2-1794…`) has its chat URI at
+  `ahp-chat:/ses_…` (opencode id), and its changeset catalogues point at
+  `ahp-chat:/ses_…/changeset/uncommitted` /
+  `ahp-session:/ses_…/changeset/session`.
+- The channel registry holds **both** keys (`addSession(suffix)` and
+  `addSession(created.sessionID)`), and `byChannel` holds the client
+  channel + the chat URI (opencode id) only. So with a non-`ses` client
+  suffix, the session changeset URI
+  (`ahp-session:/ses_…/changeset/session`) is a *separate* session-owned
+  channel, parallel to the chat channel — consistent with `publish()`'s
+  resolution, which finds the record through `byChannel`.
+- Clients must follow the catalogue `uriTemplate`s (the probe does);
+  hand-rolling changeset URIs from the client-chosen suffix 404s.
+
+**Diff source: the vcs.working approximation**
+
+- `ctx.vcs.diff({ mode: "working", untracked: "files" })` returns
+  `{ location, data: FileDiff.Info[] }` — a **wrapper** (not a bare
+  array), with `data[].file` **repo-root-relative** (not
+  location-relative). The facade joins `location` (repo root) with each
+  `file`; a `null` location (not a repo) yields `[]`.
+- **Repo-wide scope caveat:** when the location is a *subdirectory* of a
+  larger repo, the diff includes files **outside** the location. The host
+  guards against this with `isPathInside` checks on resourceRead targets
+  and on discard targets.
+- The installed dist types prove the seam: the facade's VCS domain is
+  `VcsDomain extends Omit<VcsApi, "init">` — `init` is the only
+  VcsApi member the plugin surface does not provide.
+
+**Turn changesets: the pre-edit before-capture**
+
+- Captured **awaited in the sequential pump** at `tool.input.ended` for
+  the file-writing tools `{write, edit, "apply", "patch"}`. The pump is a
+  single sequential async loop, so the capture completes before the
+  tool's `execution.succeeded` is processed — the snapshot is the true
+  pre-edit content.
+- The path is extracted from the tool input (`path` / `file_path` /
+  `filePath` / `file` keys), resolved against the location's
+  `defaultDirectory`, and must stay inside it (outside → skip).
+  **First capture per file wins** (later edits in the same turn do not
+  overwrite the before-snapshot).
+- Snapshots are retained on the session record until session removal
+  (memory caveat for long sessions with many file edits — accepted for
+  MVP; turn changesets are the durable record of what each turn did).
+
+**Content refs**
+
+- Live side (uncommitted/session diffs): `file://` — uri and content are
+  the same live path.
+- Before side (uncommitted/session diffs):
+  `ahp-content://head/<b64url(absPath)>` — served via
+  `git show HEAD:<repoRootRelativePath>` (untracked file → -32008
+  resource-not-found).
+- Turn sides:
+  `ahp-content://snap/<b64url(session)>/<b64url(turn)>/<b64url(absPath)>/<before|after>`
+  — served from the in-memory capture (the after side is the disk content
+  at capture+execution time).
+- `b64urlDecode` validates `/^[A-Za-z0-9_-]+={0,2}$/`; anything else (and
+  path traversal, e.g. `ahp-content://head/../../etc/passwd`) → -32008.
+  `file://` targets outside the location → -32009.
+
+**Refresh model**
+
+- `subscribe` recomputes a changeset store **only** when its status is
+  `Computing` or `Error`; a `ready` store never recomputes on
+  re-subscribe (the last completed state is returned).
+- Every turn terminal refreshes **only** the URIs in `rec.changesets`
+  (the ones that store has computed — no eager computation of changesets
+  nobody subscribed).
+- `refreshChangeset` publishes on failure a
+  `changeset/statusChanged` error (`errorType: "changeset-computation"`);
+  on success it publishes `changeset/contentChanged` **only when the
+  files JSON changed** (the discard operation is attached in the same
+  action while files exist), an explicit
+  `changeset/operationsChanged { operations: undefined }` when they
+  vanish, and `changeset/statusChanged` ready when not already ready.
+  A subsequent refresh also re-publishes operations when only the file
+  set shrank back to non-empty (the action carries the full file list
+  with the operation list attached).
+
+**Operations: discard-changes**
+
+- `invokeChangesetOperation` is resource-scoped
+  (`target: { kind: "resource", resource: <fileRef> }`) with the
+  operation idle in the operation list.
+- Validation chain (in order): params shape → URI parse → **live
+  session** (-32001) → **live store** (-32001) → **known operation**
+  (-32601) → target scope (resource) → target kind + file-in-store
+  (-32602) → **path inside location** (-32009) → perform discard.
+- Discard semantics: uncommitted/session → tracked file `git checkout
+  HEAD -- <file>` (facade `discardFile`, fallback `rm` for
+  delete/renamed cases); untracked → `rm`. Turn changesets → restore the
+  captured before-snapshot (or delete the file when before is null).
+- Success: `changeset/operationStatusChanged` running → idle + a store
+  refresh (the file drops out of the changeset) + result
+  `{ message: "Discarded changes to <path>" }`. Failure: the operation
+  transitions to `error` with a message, and the command responds
+  -32603.
+- **Discard on a turn changeset diverges from the reference
+  gateway** (`/tmp/opencode/ahp-investigation/ahp-acp-gateway`): there,
+  the turn changeset is a read-only record. Here it restores the
+  pre-turn snapshot (the file may have been edited by later turns —
+  accepted: the operation is scoped to one file and the state is
+  computed, not a replay).
+
+**Reconnect/replay (live-verified, E2E item 7)**
+
+- `ReconnectResultType` values are **lowercase** on the wire: `"replay"`
+  / `"snapshot"` (the const enum's string values, not the member names).
+- `seq.since(lastSeen)` returns only `serverSeq > lastSeen` (strictly
+  greater — the boundary action itself is not re-sent).
+- A client **survives socket close**: `onClose` nulls the record's
+  `socketId` but does not evict (MVP gap vs the spec's eviction
+  expectation). `reconnect` with the same `clientId` therefore finds the
+  record and can replay — verified after a full close, not just a
+  transient drop.
+- Replayed envelopes ride the **`reconnect` response**
+  (`result.actions`), not as `action` frames. A client must merge them
+  into state, **de-duped by serverSeq**: the probe uses the
+  turnStarted-echo seq as the boundary, so actions already observed
+  live between the boundary and the drop are *re-sent* by the replay
+  (their seqs are `> boundary`) and would otherwise apply twice.
+- Live run: the turn **completed during the gap**; `chat/turnComplete`
+  was delivered entirely through the replay, exactly once (no duplicate
+  turn), and the re-subscribed chat snapshot showed both turns.
+
+**Test status:** `pnpm typecheck` clean; `pnpm test` 208/208 green
+(8 files — 156 baseline + 52 new Phase 2 tests: changeset parsing
+(`channels.test.ts`), the state store (`state.test.ts`), bridge diff
+builders/content-refs/catalogues, and the host route/refresh/discard
+suites incl. a `driveTurn` before-capture race fixed with a
+`usage.updated` barrier — the synchronous test body runs to completion
+before any pump microtask, so the disk mutation to the AFTER content
+must be ordered *after* the awaited before-capture via the captured
+event's `chat/usage` action).
 
 ---
 
