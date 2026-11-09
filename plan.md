@@ -88,6 +88,13 @@ subprocess hop entirely.
 - Multi-user / multi-tenant policy, sandboxing.
 - Windows-first deployment polish (build for Linux first, verify
   cross-platform later).
+- **Turn/message history hydration** — reconstructing past turns after a
+  location reload from `ctx.session.context` via AHP's `fetchTurns` /
+  `chat/turnsLoaded`. **Future work, not a v1/MVP extension** (it is
+  extension-scale, and the current VS Code client never requests it). The
+  gap, the durable-data source, and the AHP wire path are documented in
+  §14.14; it is the only previous-feature durability item worth scheduling
+  once the MVP extensions are done.
 
 ---
 
@@ -2180,7 +2187,7 @@ marker.
 
 **Findings, ranked by value.**
 
-**1. Turn/message history hydration — the one real gap (a new extension;
+**1. Turn/message history hydration — the one real gap (host-side work;
 no marker needed).**
 - After a reload every re-registered chat starts from
   `initialChatState` → `turns: []` (bridge.ts). The host loads **no**
@@ -2222,8 +2229,9 @@ no marker needed).**
 - **No marker is needed for the content.** The marker only carries
   identity/binding (which opencode session ↔ which AHP chat/channel); the
   turn *content* is recovered directly from `ctx.session.context` for the
-  bound session. So this is a new Phase 4 extension, not an extension of
-  the marker.
+  bound session. So this is host-side work (future work, **not** a
+  v1/MVP extension — see the Decision below), not an extension of the
+  marker.
 - Sub-item — **historical per-turn changesets are *not* fully
   recoverable.** `ctx.vcs.diff`'s `mode` is `working | branch | committed`
   with a single `base` reference; there is no mode that diffs two snapshot
@@ -2307,7 +2315,7 @@ only if it becomes a real ask.**
   - **Content already durable in opencode and recoverable through the
     existing plugin API** — the real gap is that the host never hydrates
     it. The only candidate worth scheduling is **turn-history hydration**
-    (finding 1): a new Phase 4 extension using `ctx.session.context` + AHP's
+    (finding 1): hydrate turns from `ctx.session.context` + AHP's
     `fetchTurns` / `chat/turnsLoaded` / `turnsNextCursor`, with **no marker
     change**.
   - **Ephemeral-by-design state** (active clients, in-flight turns,
@@ -2315,6 +2323,99 @@ only if it becomes a real ask.**
     limitations (findings 2, 3, 4).
 - **No previous feature needs a new marker.** The one worth doing is turn
   hydration, which is extension-scale work, not a marker addition.
+
+**Decision (2026-11-09, user).** Turn-history hydration is **future work,
+not a v1/MVP extension** — tracked in the §2 Non-goals (v1) list. It stays
+the only previous-feature durability item worth scheduling once the MVP
+extensions are done; the marker strategy needs no change to support it.
+
+### 14.15 Elicitation (AHP input requests) ↔ opencode `question` tool (2026-11-09)
+
+**Investigation for Phase 4 extension 3 ("Elicitation completion").
+Findings only — nothing implemented.**
+
+**What elicitation is (AHP 1.0.0, verified from the installed dist).**
+Elicitation is the host asking the *user* for structured input mid-turn —
+gathering a preference, clarifying an instruction, getting a decision, or
+having them review a URL. In the protocol it is an **"input request"** on
+the chat channel, and it is **distinct from tool-call confirmation**:
+
+- The host inserts an `InputRequestResponsePart` into the turn's response
+  stream via `chat/inputRequested`. The part carries a
+  `ChatInputRequest { id, message?, url?, questions?, answers? }` — `url?`
+  is for URL-style elicitations (a link to review/open).
+- `questions[]` are typed: **text** (format / min / max / default),
+  **number/integer** (min / max / default), **boolean** (default),
+  **single-select** (options + freeform), **multi-select** (options +
+  min / max + freeform); each has an `id` used as the key in `answers`.
+- Client actions: `chat/inputAnswerChanged` (sync answer drafts) and
+  `chat/inputCompleted` (submit: **`accept` | `decline` | `cancel`**).
+- The part **updates in place** (stable stream position), so the whole Q&A
+  is durable in the turn transcript and backfillable via `fetchTurns`; if
+  the turn ends unanswered the part simply stays with `response` absent.
+- **Session-level mirror:** an unresolved chat input request also surfaces
+  as a `SessionChatInputRequest` (kind `ChatInput`) via
+  `session/inputNeededSet` / `session/inputNeededRemoved`, so a client can
+  see/answer it without subscribing to the chat. `SessionInputRequestKind`
+  = `chatInput` | `toolConfirmation` | `toolClientExecution`; `chatInput`
+  is documented as "a user-facing elicitation mirrored from an unresolved
+  chat response part."
+
+**opencode's elicitation surface (verified from opencode source).**
+opencode has a native **`question` tool**
+(`packages/core/src/tool/plugin/question.ts`) — it is **model-initiated**
+(the model decides to ask), not host-initiated:
+
+- Input is `questions[]` of `{ question, header, options[], multiple? }`.
+- Execute is gated by `permission.assert({ action: "question",
+  resources: ["*"] })` (a permissioned action, like any tool call).
+- It then calls the **Form** system — `forms.ask({ sessionID, title,
+  metadata, fields })` — which presents the questions and **blocks** on a
+  `Deferred` until answered or dismissed. Each question is mapped to a
+  `Form.Field` (`type: "multiselect" | "string"`, options, `custom: true`).
+- On answer it returns the answers to the model as tool output; on
+  dismissal it raises `CancelledError` (or a model-facing `ToolFailure` if
+  the dismissal carries a message).
+
+**The load-bearing constraint (verified).** The bridge has an asymmetric
+shape:
+
+- **Detection is easy (and durable).** A `question` tool call is an
+  ordinary tool call in the turn, and the host already handles tool-call
+  events for every tool — so it can recognize the `question` tool by name
+  and surface its input as `chat/inputRequested` to AHP clients.
+- **Settlement is the gap.** The blocked `question` tool can only be
+  resolved by `forms.reply({ id, answer })` (or `forms.cancel`) — but the
+  **Form service is NOT on the plugin surface** (there is no `ctx.form`;
+  `Form.Interface` = `create/ask/get/list/state/reply/cancel`, none
+  exposed to plugins). So a remote AHP client's answer **cannot be routed
+  back into opencode** through any plugin API.
+- **Form events are live-only.** `form.created` / `form.replied` /
+  `form.cancelled` are **ephemeral** (not durable — not replayed on
+  reload/reconnect) but **are server events** (`EventManifest.
+  ServerDefinitions` includes `Form.Event.Definitions`), so the host can
+  observe them live on the plugin event stream but not recover them
+  later. The durable, replayable signal is the `question` **tool call**,
+  not the Form.
+- **Implication for extension 3:** surfacing an elicitation to AHP clients
+  (detect `question` → `chat/inputRequested`, and mirror at session level
+  via `inputNeededSet`) is well within the existing surface. Completing it
+  — feeding the AHP client's `accept`/answer back so the `question` tool
+  unblocks — has **no plugin-side path today**. Options to explore when
+  starting: (a) an opencode feature request exposing a Form reply surface
+  to plugins (parallel to the D7 `session.update` `archived` gap); (b) a
+  host-side elicitation that bypasses the Form (the host owns the request
+  and answer, then injects the answer back into the model as a follow-up
+  prompt) — workable but changes the turn shape; (c) accept that
+  elicitation is answered in the opencode UI (TUI) only, and AHP clients
+  see it read-only. This is a real design decision, not a thin mapping.
+
+**Current status (verified from `src/host.ts`).** The host handles
+`SessionInputRequestKind.ToolConfirmation` (host.ts:1640, 2153) and
+`ToolClientExecution` (host.ts:2046); it does **not** handle `ChatInput`
+— hence "Elicitation = ⚠️ partial" in the §3.2 capability table and
+"Elicitation completion" as Phase 4 extension 3 (scoped alongside the
+terminal channel, both gated on opencode exposing the right surface).
 
 ---
 
