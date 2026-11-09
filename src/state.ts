@@ -7,13 +7,15 @@
  *  - root channel: `rootReducer` (Phase 0);
  *  - session channels: `sessionReducer` (Phase 1);
  *  - chat channels: `chatReducer` (Phase 1);
- *  - changeset channels: `changesetReducer` (Phase 2).
+ *  - changeset channels: `changesetReducer` (Phase 2);
+ *  - terminal channels: `terminalReducer` (Phase 4 extension 3).
  */
 import {
   chatReducer,
   changesetReducer,
   rootReducer,
   sessionReducer,
+  terminalReducer,
   type ChatAction,
   type ChatState,
   type ChangesetAction,
@@ -22,6 +24,8 @@ import {
   type RootState,
   type SessionAction,
   type SessionState,
+  type TerminalAction,
+  type TerminalState,
 } from "@microsoft/agent-host-protocol";
 
 export interface RootStateStore {
@@ -50,6 +54,13 @@ export interface ChangesetStateStore {
   readonly state: ChangesetState;
   /** Apply a changeset-channel action through the official reducer. */
   apply(action: ChangesetAction): ChangesetState;
+}
+
+export interface TerminalStateStore {
+  /** Current terminal state (the `ahp-terminal:/…` snapshot payload). */
+  readonly state: TerminalState;
+  /** Apply a terminal-channel action through the official reducer. */
+  apply(action: TerminalAction): TerminalState;
 }
 
 export function createRootStateStore(initial: RootState): RootStateStore {
@@ -99,6 +110,19 @@ export function createChangesetStateStore(initial: ChangesetState): ChangesetSta
     },
     apply(action: ChangesetAction): ChangesetState {
       state = changesetReducer(state, action);
+      return state;
+    },
+  };
+}
+
+export function createTerminalStateStore(initial: TerminalState): TerminalStateStore {
+  let state: TerminalState = initial;
+  return {
+    get state(): TerminalState {
+      return state;
+    },
+    apply(action: TerminalAction): TerminalState {
+      state = terminalReducer(state, action);
       return state;
     },
   };

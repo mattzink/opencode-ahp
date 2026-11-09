@@ -95,6 +95,12 @@ subprocess hop entirely.
   gap, the durable-data source, and the AHP wire path are documented in
   §14.14; it is the only previous-feature durability item worth scheduling
   once the MVP extensions are done.
+- **Terminals beyond the synthetic command terminals** — the
+  persistent-pty read-only mirror (§14.16 option b) and
+  client-interactive terminals (option d, which needs an opencode pty
+  plugin surface). **Post-MVP** (decision 2026-11-09, §14.16); the MVP
+  terminal scope is option (c) only — synthetic `isPty: false`
+  terminals from `shell`-tool executions, read-only.
 
 ---
 
@@ -142,7 +148,7 @@ hooks.
 | Model picker / session options | model + mode configuration | ✅ direct |
 | Custom-agent picker (Build/Plan/…) | `ctx.agent` (`list` / `get`) + `agent.updated` event | ✅ direct → `AgentCustomization` children + `Message.agent` (§14.7); catalog side **implemented** (Phase 0 increment, 2026-11-07) — `AgentInfo.customizations` carries the workspace agent container; `Message.agent` → prompt agent lands with Phase 1 sessions |
 | Client-provided tools | `ctx.tool.transform` | ✅ direct (Phase 4) |
-| Terminals | — | ❌ no PTY/terminal API (AHP-optional; peers use pipe-backed or omit) |
+| Terminals | `ctx.experimental.terminal.read` only (read-only screen snapshot of the session's selected terminal; no create / write / attach / list on the plugin ctx) | ⚠️ read-only surface (AHP-optional — not capability-negotiated in 1.0.0); **MVP scope = option (c)** synthetic `isPty: false` shell-command terminals, read-only; mirror (b) + interactive (d) deferred post-MVP — §14.16 |
 | Automations | — | ❌ gap (1.1-draft territory) |
 | Multiple chats per session | one chat per session | ❌ gap (matches pi-ahp / ahp-acp-gateway) |
 | Elicitation | partial | ⚠️ partial |
@@ -524,7 +530,7 @@ defaults.
 | `tls` | `{ keyPath, certPath }` \| null | `null` | Native TLS via `Bun.serve` → `wss://` for off-LAN transports (§5.3) |
 | `healthPath` | string | `"/healthz"` | Plain-HTTP health endpoint (no auth) |
 | `replayWindow` | number | `1000` | Per-channel actions kept for reconnect replay; older gaps → fresh snapshot (§6.3) |
-| `capabilities` | object | `{ changesets: false, terminals: false, automations: false }` | What is advertised in `initialize` — never advertise what we don't implement. `changesets` flips to `true` in Phase 2 (D2) |
+| `capabilities` | object | `{ changesets: true, terminals: true, automations: false }` | Host-side switches — never advertise what we don't implement (in AHP 1.0.0 none is a wire field — §14.16). `changesets` flipped to `true` in Phase 2 (D2); `terminals` flipped to `true` with the Phase 4 extension 3 build (§14.17) |
 
 ### 8.3 Installation mechanics (avoids double-load)
 
@@ -563,9 +569,12 @@ Pure modules, no OpenCode runtime — all green before wiring the live
 - `options.test.ts` — resolution precedence matrix (ctx.options ▸
   sibling file ▸ defaults), JSONC stripping (comments, trailing commas),
   missing/malformed file.
-- `handshake.test.ts` — negotiation matrix: client 1.0.x → accept; older /
-  unknown → reject with supported list; 1.1-draft → reject (we pin 1.0.0);
-  capability intersection (changesets on/off, terminals always off).
+- `handshake.test.ts` — param validation (channel, clientId,
+  protocolVersions shape); version negotiation (1.0.x accepted, newer 1.x
+  offers echoed, 0.9.x baseline accepted, 0.8.x/2.x rejected with the
+  supported list); result shape (serverSeq, serverInfo, defaultDirectory,
+  initialSubscriptions resolution). AHP 1.0.0 has no capability fields —
+  the capability switches are host-side options (§14.16).
 - `transport.test.ts` — token matrix (missing / wrong / correct, via query
   and via Bearer); Origin matrix (allow-all-with-token, allowlist, VS Code
   desktop Origin values); path routing (`/ahp` vs `/healthz` vs 404);
@@ -847,13 +856,18 @@ user commit/push → CI publish.
 
 - Client-provided tools via `ctx.tool.transform`.
 - Multi-chat per session (if/when opencode's API allows).
-- Elicitation completion; terminal channel (if opencode ever exposes a PTY
-  surface).
+- Elicitation completion (§14.15); terminal channel — **decision
+  (2026-11-09): MVP implements option (c) only** — synthetic
+  `isPty: false` terminals from `shell`-tool executions, read-only. The
+  persistent-pty mirror (b) and the pty plugin-surface feature request
+  (d) are deferred post-MVP (§14.16, §2 Non-goals).
 - Automations / AHP 1.1 features once they stabilize.
 
 **Status (2026-11-09): extensions 1 + 2 done, live-verified; extension 2
 includes restart durability (metadata markers, §14.13.1) — verified
-across a location reload.**
+across a location reload. Extension 3's terminal half (option (c),
+§14.16) is implemented and live-verified (§14.17); its elicitation half
+(§14.15) still awaits the user's call on the Form-settlement gap.**
 
 *Extension 1 (client-provided tools)* —
 `scripts/ahp-client-tools.mjs` against the LAN host, provider
@@ -2416,6 +2430,406 @@ shape:
 — hence "Elicitation = ⚠️ partial" in the §3.2 capability table and
 "Elicitation completion" as Phase 4 extension 3 (scoped alongside the
 terminal channel, both gated on opencode exposing the right surface).
+
+### 14.16 Terminals (AHP terminal channel) ↔ opencode PTY subsystem (2026-11-09)
+
+**Investigation for Phase 4 extension 3 ("terminal channel").
+Findings only — nothing implemented.**
+
+**AHP 1.0.0 terminal contract (verified from the installed dist).**
+Terminals are a first-class, optional channel type (`ahp-terminal:`):
+
+- **Root catalog:** `RootState.terminals?: TerminalInfo[]` — an *optional*
+  field (absence = host has no terminals) — plus
+  `root/terminalsChanged` (full-replacement semantics).
+  `TerminalInfo { resource, title, claim, lifecycle }`.
+- **Not capability-negotiated:** 1.0.0's `AgentCapabilities` carries only
+  `multipleChats` + `multipleWorkingDirectories` — there is **no
+  `terminals` field**. Terminal discovery is purely the root-state
+  optionality. (The §3.1 draft-era note "optional, *negotiated*
+  capabilities: terminals, …" is not accurate for 1.0.0 terminals; likewise
+  our options' `capabilities.terminals` flag is a reserved switch — it maps
+  to no wire field in 1.0.0.)
+- **Commands (client → server):** `createTerminal { channel
+  (client-chosen URI), claim, name?, cwd?, cols?, rows? }` and
+  `disposeTerminal {}` (kills the process; updates the root list).
+- **Actions:** `terminal/data { data }` — **server-authoritative**
+  pty→client output (appended to content, may contain ANSI);
+  `terminal/input { data }` — **side-effect-only** client→pty (the reducer
+  treats it as a no-op). The two are deliberately split: "standard
+  write-ahead reconciliation is not safe for terminal I/O — a pty is a
+  stateful, mutable process." Plus `terminal/resized { cols, rows }`
+  (bidirectional), `terminal/claimed { claim }` (client-dispatchable),
+  `terminal/titleChanged` (bidirectional), `terminal/cwdChanged`,
+  `terminal/exited { exitCode? }`, `terminal/cleared` (client), and
+  shell-integration boundary actions:
+  `terminal/commandDetectionAvailable`, `terminal/commandExecuted
+  { commandId, commandLine, timestamp }`, `terminal/commandFinished
+  { commandId, exitCode?, durationMs? }`.
+- **Claims:** `{ kind: "client", clientId }` or `{ kind: "session",
+  session, chat, turnId?, toolCallId? }` — a session claim can be **scoped
+  to a chat / turn / tool call**.
+- **State:** `TerminalState { title, cwd?, cols?, rows?, content:
+  TerminalContentPart[], lifecycle: running | exited(+exitCode?), claim,
+  supportsCommandDetection?, isPty? }`. Content is typed parts:
+  `unclassified { value }` (raw VT) or `command { commandId, commandLine,
+  output, timestamp, isComplete, exitCode?, durationMs? }` (in-place
+  mutated at `commandFinished`).
+- **`isPty?: boolean` is the protocol's escape hatch:** when `false`,
+  "output is plain text and clients do not need to parse VT sequences."
+  A **pipe-backed plain-text terminal is representable** — load-bearing,
+  because opencode's agent command execution is exactly pipe-backed (below).
+
+**opencode's terminal substrate (verified from opencode source).** Three
+distinct layers:
+
+1. **Core `Pty` service** — full interactive pty:
+   `list / get / create / update / remove / write / attach → Attachment
+   { replay, cursor, onData, onEnd, write, activate, detach }`. Reached via
+   the server handlers (`pty.ts`) and a ticket-based WS attach
+   (`pty-socket.ts`, `connect.token`) — the TUI/web attach path,
+   **not plugin-reachable**.
+2. **`PersistentPty` — session-scoped, daemon-hosted.** The substrate of
+   the TUI's per-session "Terminal" pane. Runs in a **separate daemon
+   binary** (state under `<global.state>/pty`;
+   `binary.{bun,node,workerd}.ts`) with `handoff` / `shutdown` operations
+   so a new location process can adopt the daemon — **the user's
+   terminals outlive the location lifecycle** (they survive reload/
+   eviction). Core interface: `list(sessionID?) / get / create({ command?,
+   args, cwd?, title, env, cols?, rows? }) / write / resize / control /
+   input / read(sessionID, lines?) / remove / shutdown / handoff / attach`;
+   `Role = "controller" | "observer"` ("controller activity selects a
+   terminal; observer reads … do not"). Terminals are **created by the
+   user** (TUI `session-terminals.tsx` →
+   `persistentPty.create({ sessionID, args: [], cwd:
+   session.location.directory, title: "Terminal", env: {} })`) — they are
+   the user's shells, not the agent's.
+3. **The `Shell` subsystem — what the `shell` tool (agent command
+   execution) actually uses — is pipe-backed, not PTY.** It spawns one
+   command via `CrossSpawnSpawner`, "captures combined stdout/stderr" to
+   `info.file` (with `jobs.background` for long-running commands and
+   `AGENT=1` / `OPENCODE_SESSION_ID` env). No pty, no TTY, no resize.
+
+**The load-bearing constraint (verified).** The plugin surface exposes
+**only `ctx.experimental.terminal.read({ sessionID, lines? })`** — a
+**read-only screen snapshot** of the session's **currently selected**
+terminal: `{ ptyID, title, cwd, foregroundProcess, screen: { text, cols,
+rows, cursor } } | null` — screen *text* (rendered), not a raw VT stream.
+The full ctx domain list confirms: no `ctx.pty`, no `list`, no
+`create` / `write` / `resize` / `attach`; `ctx.shell` is hooks-only
+(before/after `shell`-tool invocations, no execution control). The
+**HTTP client API is much wider** (`PtyApi { list, create, get, update,
+remove, connect.token }` + `experimental.persistentPty { read, list,
+create, shutdown, handoff, get, update, snapshot, remove, connectToken,
+connect }`) — the server exposes all of it, but the plugin ctx
+deliberately picks only `read`.
+
+**Event durability:** `pty.created / pty.updated / pty.exited /
+pty.deleted` and `persistent-pty.added / .removed / .updated` are all
+**ephemeral** (not replayed on reload/reconnect) but **are server events**
+(`EventManifest.ServerDefinitions` includes both definitions), so the host
+can subscribe to them live via `ctx.event.subscribe({ types })` — the same
+shape as the §14.15 Form gap (durable/replayable: no; live-observable:
+yes).
+
+**Reference client:** the VS Code 1.145.2 extracts are *partial* here —
+the terminal service itself (`terminal/browser/agentHostTerminalService.ts`)
+was not extracted, but the remote agent-host contribution
+(`vscode-remoteAgentHostChatContribution.ts`) imports
+`IAgentHostTerminalService`, calls
+`reconnectTerminals(newConnection, oldClientId)` after a client
+re-connection (logging `recovered/total` and emitting
+`vscodeAgents.terminal/recovery` telemetry), and its comments reference
+terminal subscriptions and "buffer clear/replay flicker". So VS Code
+1.145.2 **does consume terminal channels** (at least on the remote
+agent-host path) — an earlier draft of this section claimed the opposite
+based only on extract coverage. Exact UI behavior (widget placement,
+`isPty: false` handling, whether it ever calls `createTerminal`) is
+unverified — the service file is not on hand.
+
+**Mapping asymmetry.** The AHP terminal channel assumes a
+server-hosted, **interactive, bidirectional, streaming** terminal (the
+client creates terminals, types into them via `terminal/input`, resizes,
+and receives a server-authoritative VT stream). What the plugin surface
+offers:
+
+- **Creation: not possible** — the plugin cannot create a `Pty` or
+  `PersistentPty` terminal, so every `createTerminal` must be rejected
+  (or the channel omitted entirely).
+- **Input: not possible** — there is no write path, so a remote client's
+  `terminal/input` has nowhere to go (the parallel of the §14.15
+  settlement gap).
+- **Listing: not possible** — no `list` on the ctx; `read(sessionID)`
+  reveals only the *selected* terminal.
+- **Streaming: degraded** — the best available is a *screen snapshot*
+  (rendered text) of one terminal; synthesizing `terminal/data` from it
+  requires diffing successive snapshots (lossy, and not a real VT stream).
+- **Lifecycle: live-only** — ephemeral events (detectable live, not
+  backfillable).
+- **Agent command execution ≠ terminals** — the `shell` tool is
+  pipe-backed; there is no pty to claim for a tool call.
+
+**Options for extension 3 (or a later extension).**
+
+- **(a) Omit — keep terminals off** (protocol-legal, MVP-consistent).
+  `terminals?` is optional; our root state simply omits it and the
+  terminal commands already answer -32601 (unhandled, host.ts:608). The
+  §3.2 row already records that peers "use pipe-backed or omit." Zero
+  risk; the status quo.
+- **(b) Read-only mirror of the session's persistent-pty** (the user's
+  TUI terminal). Live: subscribe `persistent-pty.added/removed/updated`
+  (ephemeral) + poll `experimental.terminal.read`, publishing
+  `ahp-terminal:` channels with the screen text as `unclassified` parts.
+  Honest on the data: `isPty: false` is *accurate about the payload*
+  (plain text, no VT parsing). Limits: the **selected terminal only**;
+  snapshot-based content (full-replace or diffed); no input (reject
+  `terminal/input` cleanly), no resize, no `createTerminal`. One nice
+  property: **reload-recoverable for the selected terminal** — the daemon
+  outlives the location, so a reloaded host can re-discover via
+  `read(sessionID)`; the only state worth persisting is the channel-URI
+  mapping (marker-strategy territory, §14.13.1, if we ever get there).
+- **(c) Synthetic pipe-backed terminals from `shell`-tool executions.**
+  Per shell tool call the host opens a synthetic `ahp-terminal:` channel
+  with the session claim scoped `{ session, chat, turnId, toolCallId }`
+  (exactly the shape the claim type anticipates), `isPty: false`, and
+  `command`-typed content parts (`commandLine` from the tool input, output
+  from the tool result, bracketed by `terminal/commandExecuted` /
+  `commandFinished`, `exitCode` from the result). No new opencode surface
+  needed beyond tool events the host already handles. Caveat: these are
+  *renderings of command executions*, not interactive terminals — clients
+  could misread them as type-into-me; best used read-only.
+- **(d) opencode feature request: a pty surface for plugins**
+  (`write` / `attach`, or at minimum `list` / `create` for
+  persistent-pty) — required **only** for fully *interactive* remote
+  terminals (client `terminal/input` → `persistentPty.write`). Parallel to
+  the §14.15 Form gap and the D7 `archived` gap; track as a request, not
+  a design assumption.
+
+**§3.2 correction (stale row).** The "Terminals — ❌ no PTY/terminal
+API" row predates this investigation and is factually wrong: opencode
+*does* have a PTY subsystem (full `Pty` service + session-scoped
+`PersistentPty` daemon) and the plugin surface *does* expose a read-only
+`ctx.experimental.terminal.read`. Corrected in place to point here.
+
+**Decision (2026-11-09, user).** The MVP terminal extension implements
+**option (c) only** — synthetic pipe-backed (`isPty: false`) terminals
+from `shell`-tool executions, read-only. **All other terminal options
+are deferred post-MVP**: the persistent-pty read-only mirror (b) is
+tracked in the §2 Non-goals (v1) list, and the pty plugin-surface
+feature request (d) stays a request to file later — it is needed only
+for *interactive* remote terminals (a client typing into a pty).
+Option (a) is moot once (c) lands. Implementation implications of (c):
+the terminal commands and client-dispatchable `terminal/*` actions
+(`input`, `resized`, `claimed`, `cleared`) need proper error handling
+instead of -32601 once `RootState.terminals` is non-empty; v1 scope is
+completed-command output only (no live streaming / file tailing),
+background shell calls excluded, and host-controlled retention so
+finished command terminals don't accumulate in the root catalog. Open
+verification item (probe before full build-out): confirm on the LAN
+server + VS Code that the Agents window renders *session-claimed*
+terminals — if it doesn't, record the client behavior as a §14 finding
+and reassess scope.
+
+**Current status (implemented 2026-11-09).** Option (c) is built and
+live-verified — see §14.17 for the implementation record and wire
+findings.
+
+### 14.17 Terminals (c) implementation record + wire findings (2026-11-09)
+
+**Scope.** Option (c) from §14.16: synthetic pipe-backed
+(`isPty: false`) `ahp-terminal:` channels rendered from `shell`-tool
+executions, read-only, completed-command output only. Gated by the
+`capabilities.terminals` option (host-side switch — off the wire in
+1.0.0, no capability field), **now on by default** (opt out with
+`capabilities.terminals: false`).
+
+**Implementation (all in `src/`, house pattern — pure modules + DI,
+official reducers).**
+
+- `channels.ts`: `channelKind` gains `"terminal"` (`ahp-terminal:/…`
+  prefix), `terminalChannelURI(toolCallId)` — the suffix is the opencode
+  tool call id, so the terminal correlates 1:1 with the `chat/toolCall*`
+  actions for the same call. The `ChannelRegistry` tracks live terminal
+  URIs (`addTerminal`/`removeTerminal`/`hasTerminal`); subscribing to an
+  unknown terminal URI fails with reason `no-such-terminal`.
+- `state.ts`: `TerminalStateStore` — wraps the official
+  `terminalReducer`, mirroring the other four store factories.
+- `host.ts`:
+  - **Open** — at the tool call's `tool.input.ended` (the command line is
+    only known there), when: capability on, an active turn exists, the
+    tool name is `shell` (or the legacy `bash` alias), the input parses
+    as a record with a non-empty `command` string, and
+    `background !== true` (background calls have no synchronous
+    completion — excluded). Initial state: `isPty: false`,
+    `supportsCommandDetection: true`, `lifecycle: running`,
+    `claim: { kind: "session", session, chat, turnId, toolCallId }`,
+    `cwd: file://` **directory URI** (trailing slash — RFC 8089; new
+    `directoryUri()` helper in `bridge.ts`). First action is
+    `terminal/commandExecuted` (commandId = toolCallId, the id is scoped
+    to the URI).
+  - **Finish** — at `tool.success` / `tool.failed`:
+    `terminal/data` (success: the tool's text content parts joined;
+    failure: the error message) → `terminal/commandFinished` (exitCode,
+    durationMs) → `terminal/exited`. **Runs before the turn guard** — a
+    command that completes after its turn was torn down still exits its
+    terminal. Idempotent (an exited terminal is left alone).
+  - **Exit codes** — `shellExitCodeOf()` reads the LAST text content
+    part: opencode appends a trailing `Exit code: N` notice part only
+    for non-zero exits/signals; a zero exit carries no notice. Signal
+    exits render `Exit code: 128+signum (SIGNAL)` (parses as the
+    numeric status); a non-numeric `Exit code:` value (e.g. `unknown`)
+    omits the field; `tool.failed` never carries a code.
+  - **Catalog (retention)** — the root `terminals` list membership is
+    *turn-scoped*: a terminal is listed while its turn is still its chat's
+    active turn (finished commands keep their exited-lifecycle row until
+    the turn ends), then `finishTurn` republishes
+    `root/terminalsChanged` (full replacement; may publish `[]`) dropping
+    the rows. The channel **state** outlives the turn — it stays
+    subscribable (snapshot + replay) until the owning chat/record is
+    removed; `removeChat` (chat disposal *and* record removal) first
+    exits still-running terminals (no exitCode — the command died) and
+    drops the records + registry entries.
+  - **Error handling** (the §14.16 decision — proper errors now that
+    terminals exist): `createTerminal` / `disposeTerminal` → new
+    `ERROR_NOT_SUPPORTED = -32010` with a read-only explanation (was
+    -32601); subscribe to a gone/unknown terminal → `ERROR_NOT_FOUND`
+    (-32008); every client-dispatchable `terminal/*` action
+    (`input`, `resized`, `claimed`, `titleChanged`, `cleared`) → the
+    standard rejection echo with reason `read-only terminal: …`
+    (write-ahead clients roll back on the reason), or
+    `no such terminal: …` for a torn-down channel. Non-dispatchable
+    terminal actions already fall through the shared dispatch pre-check.
+- `options.ts` / `index.ts`: `capabilities.terminals` default flipped
+  `false` → `true` and wired into `HostOptions.terminals`.
+
+**Wire findings (live probe, LAN host, 2026-11-09).** The probe
+(`/tmp/opencode/ahp-lan/probe-terminals.mjs`) runs one turn that executes
+`echo ahp-term-probe-$((20+3))` and verifies the full surface — all
+checks pass:
+
+- The catalog row appears on `root/terminalsChanged` mid-turn with the
+  session claim (session/chat/turnId/toolCallId) and running lifecycle;
+  it flips to `exited` (exitCode 0) when the command finishes and drops
+  at turn end; the terminal channel stays subscribable afterwards
+  (retention).
+- The terminal snapshot carries `isPty: false`,
+  `supportsCommandDetection: true`, the `file://` directory `cwd`, and
+  the complete `command` content part (output `ahp-term-probe-23\n`,
+  `isComplete: true`).
+- **Live actions only reach *current* subscribers** — the expected AHP
+  channel semantics (snapshot = catch-up): when the command finished
+  before the probe subscribed to the terminal channel, the
+  `data`/`commandFinished`/`exited` actions were not replayed to the new
+  subscriber; the snapshot carried the final state. A subscriber present
+  during execution sees the full stream
+  (`terminal/data → terminal/commandFinished → terminal/exited`).
+- `createTerminal`/`disposeTerminal` → -32010; unknown-terminal
+  subscribe → -32008; `terminal/input` dispatch → rejection echo
+  `read-only terminal: …` (the rejection reaches the dispatching socket
+  even without a subscription — the write-ahead rule from
+  `echo()`).
+
+**Environment notes (LAN test server).**
+
+- `POST /api/location/reload` **does not boot** an unloaded location
+  (protocol: it "acts on every *loaded* location"). Boot via
+  `GET /api/location?location[directory]=…`; `GET /api/session` is
+  served from persisted storage and also does not boot the runtime.
+- The provider's first-enabled model was a broken cached entry
+  (`incoai/Qwen3.8-27B-DFlash2-GGUF:Q4_K_M` — `failed: true` in the
+  llama.cpp registry) at probe time, so a session created without a
+  model selection failed its first turn (`chat/error`,
+  `provider.internal` 500). `createSession` always resolves the
+  provider's first enabled model (AHP 1.0.0 `CreateSessionParams` has no
+  model field — model choice rides `chat/turnStarted`
+  `message.model`); the probe pins `gpuz/qwen3.8-27b-q5xl` per turn.
+- The opencode REST base for this server is `/api/…` with Basic auth
+  `opencode:<password>` (the bare `:password` form 401s).
+
+**Test status.** 262/262 (9 new tests in `host.test.ts` under
+`"terminals (Phase 4 extension 3)"`: catalog + snapshot + full action
+stream, non-zero exit parsing + failure shape, background/non-shell
+exclusion, in-turn retention, read-only rejections, -32010/-32008,
+session-removal teardown, capability-off inertness). Typecheck clean.
+Live-verified on the LAN host as above.
+
+**Open item.** The §14.16 probe-first verification against the **VS Code
+Agents window** (does it render session-claimed terminals at all?) still
+needs PC B — the wire surface is confirmed; the client-side rendering is
+not. If VS Code does not render them, that is a §14 client-behavior
+finding and the scope reassessment per the decision stands. (Prerequisite
+fixed 2026-11-09: new sessions could not even be *started* from the
+composer — `resolveSessionConfig` gap, §14.18.)
+
+### 14.18 `resolveSessionConfig` is required to start a new session in VS Code (found + fixed 2026-11-09)
+
+**Symptom.** First prompt of a NEW session in the Agents window (VS Code
+1.145.2, PC B) → toast `Failed to start session: unknown method:
+resolveSessionCon…`. The host answered -32601 — the method was never
+routed (verified in git history: `resolveSessionConfig` never appears in
+any committed version of `host.ts`).
+
+**Root cause (VS Code 1.145.2 source, extracted).** `resolveSessionConfig`
+is an AHP 1.0.0 **root command** (`ResolveSessionConfigParams`
+`{channel: ahp-root://, provider?, workingDirectory?, config?}` →
+`ResolveSessionConfigResult {schema: SessionConfigSchema, values}`) that
+VS Code calls in two places:
+
+- `_startNewSessionBackend` — fires when the new-session composer OPENS
+  ("Resolving the session config (schema + defaults for the picker
+  chips) is part of viewing the new-session UI and **stays ungated**").
+  Failure here is swallowed (logged, `resolveConfig` catch returns
+  `true` non-strict) — the composer still renders.
+- `_sendNewSessionRequest` — the first send of a new session awaits
+  `waitForConfigurationReady(strict retry)`: when no config was ever
+  resolved (`!this._config` — always, against this host) it re-resolves
+  **strict** and the -32601 propagates as the "Failed to start session"
+  toast. **Fatal.**
+
+**Why it never surfaced before.** New-session sends from the composer
+were never actually executed: §14.7 (first VS Code connection, 2026-11-07)
+ended at "new-session input" where a start failure was *expected*
+(`createSession` itself was unimplemented then); Phase 1's live
+verification used `scripts/ahp-phase1.mjs` (script-driven) and the PC B
+confirmation was a picker **screenshot**, not a send. Sends in
+EXISTING sessions take the `acquireSessionConfig` path (session-state
+subscription read — no strict resolve) and worked fine, which is how the
+gap stayed hidden. The extracted `_sendNewSessionRequest` path exists in
+the 1.145.2 source, so this was a latent client requirement, not a
+client update.
+
+**Fix (host-side — the only side we own).** `handleResolveSessionConfig`
+in `host.ts`: validates the `ahp-root://` channel (-32602 otherwise) and
+answers the honest empty result:
+
+```json
+{ "schema": { "type": "object", "properties": {} }, "values": {} }
+```
+
+opencode collects **no** session-creation configuration — agent/model
+choice already rides the session-state customizations (the agent/model
+pickers) and the per-turn `message.agent`/`message.model` fields;
+`workingDirectory` is accepted and ignored (sessions run in the location
+directory — the pre-existing `createSession` behavior; the host
+advertises no `multipleWorkingDirectories`). The companion command
+`sessionConfigCompletions` (serves `enumDynamic` property values)
+stays unimplemented on purpose: with an empty schema the client-side
+guard ("property not advertised") makes it unreachable — never
+advertise what we don't implement.
+
+**Verification.** 3 new tests in `host.test.ts`
+(`resolveSessionConfig (AHP 1.0.0 root command, plan §14.18)`: empty
+result shape, -32602 on a non-root channel, full resolve → createSession
+→ first-send flow). 265/265 green, typecheck clean. Live probe
+(`/tmp/opencode/ahp-lan/probe-resolve-config.mjs`) mirrors the VS Code
+sequence exactly — composer resolve → createSession → strict pre-send
+resolve → first send running a shell command — all checks pass,
+including the §14.17 terminal wire flow (catalog row, exitCode 0,
+output `ahp-cfg-probe-23\n`).
+
+**Open item.** User retry on PC B: create a fresh session from the
+composer and send the echo prompt. That also settles the §14.17 open
+item — does the Agents window render the session-claimed terminal?
 
 ---
 

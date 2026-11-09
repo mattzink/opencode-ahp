@@ -13,8 +13,9 @@ export const ROOT_CHANNEL = "ahp-root://";
 const SESSION_PREFIX = "ahp-session:/";
 const CHAT_PREFIX = "ahp-chat:/";
 const CHANGASET_MARKER = "/changeset/";
+const TERMINAL_PREFIX = "ahp-terminal:/";
 
-export type ChannelKind = "root" | "session" | "chat" | "changeset" | "unknown";
+export type ChannelKind = "root" | "session" | "chat" | "changeset" | "terminal" | "unknown";
 
 export function channelKind(uri: string): ChannelKind {
   if (uri === ROOT_CHANNEL) return "root";
@@ -26,6 +27,8 @@ export function channelKind(uri: string): ChannelKind {
   if (uri.lastIndexOf(CHANGASET_MARKER) > 0) return "changeset";
   if (uri.startsWith(SESSION_PREFIX) && uri.length > SESSION_PREFIX.length) return "session";
   if (uri.startsWith(CHAT_PREFIX) && uri.length > CHAT_PREFIX.length) return "chat";
+  // Phase 4 extension 3: synthetic shell-command terminals (plan §14.16).
+  if (uri.startsWith(TERMINAL_PREFIX) && uri.length > TERMINAL_PREFIX.length) return "terminal";
   return "unknown";
 }
 
@@ -42,6 +45,17 @@ export function sessionChannelURI(sessionID: string): string {
  */
 export function chatChannelURI(sessionID: string): string {
   return CHAT_PREFIX + sessionID;
+}
+
+/**
+ * Channel URI of a synthetic shell-command terminal (Phase 4 extension 3,
+ * plan §14.16 option (c)). The suffix is the opencode tool call id —
+ * globally unique per tool invocation, so the URI is unambiguous and the
+ * terminal correlates 1:1 with the `chat/toolCall*` actions for the same
+ * call.
+ */
+export function terminalChannelURI(toolCallId: string): string {
+  return TERMINAL_PREFIX + toolCallId;
 }
 
 /** The session id behind a session/chat channel URI, or null. */
@@ -119,18 +133,21 @@ export function turnChangesetURI(chatChannel: string, turnId: string): string {
 
 export interface SubscribeOutcome {
   ok: boolean;
-  reason?: "unknown-uri" | "no-such-session";
+  reason?: "unknown-uri" | "no-such-session" | "no-such-terminal";
 }
 
 /**
  * Subscription bookkeeping keyed by transport socket id, plus the set of
- * live session ids (Phase 1).
+ * live session ids (Phase 1) and the set of live terminal channel URIs
+ * (Phase 4 extension 3 — the host adds/removes them as synthetic
+ * terminals are opened and torn down).
  */
 export class ChannelRegistry {
   private readonly subs = new Map<number, Set<string>>();
   private readonly sessions = new Set<string>();
+  private readonly terminals = new Set<string>();
 
-  /** Subscribe a socket to a channel; fails for unknown URIs or dead sessions. */
+  /** Subscribe a socket to a channel; fails for unknown URIs, dead sessions, or gone terminals. */
   subscribe(socketId: number, uri: string): SubscribeOutcome {
     const kind = channelKind(uri);
     if (kind === "unknown") return { ok: false, reason: "unknown-uri" };
@@ -140,10 +157,13 @@ export class ChannelRegistry {
         const parsed = parseChangesetChannel(uri);
         if (parsed === null) return { ok: false, reason: "unknown-uri" };
         id = parsed.sessionID;
+      } else if (kind === "terminal") {
+        if (!this.terminals.has(uri)) return { ok: false, reason: "no-such-terminal" };
+        id = null;
       } else {
         id = sessionIDOf(uri);
       }
-      if (id === null || !this.sessions.has(id)) return { ok: false, reason: "no-such-session" };
+      if (id !== null && !this.sessions.has(id)) return { ok: false, reason: "no-such-session" };
     }
     let set = this.subs.get(socketId);
     if (!set) {
@@ -187,5 +207,19 @@ export class ChannelRegistry {
 
   hasSession(sessionID: string): boolean {
     return this.sessions.has(sessionID);
+  }
+
+  // ── live terminals (Phase 4 extension 3: shell-command terminals) ─────
+
+  addTerminal(uri: string): void {
+    this.terminals.add(uri);
+  }
+
+  removeTerminal(uri: string): void {
+    this.terminals.delete(uri);
+  }
+
+  hasTerminal(uri: string): boolean {
+    return this.terminals.has(uri);
   }
 }

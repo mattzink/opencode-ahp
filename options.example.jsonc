@@ -52,11 +52,16 @@
   // Global actions kept for reconnect replay; older gaps → fresh snapshot.
   // "replayWindow": 1000,
 
-  // What initialize advertises — never advertise what we don't implement.
-  // Default: { "changesets": true, "terminals": false, "automations": false }.
-  // Set "changesets": false to disable the diff channels (no changeset
+  // Host-side capability switches — never advertise what we don't
+  // implement (in AHP 1.0.0 none of these is a wire field; discovery is
+  // the state's optionality).
+  // Default: { "changesets": true, "terminals": true, "automations": false }.
+  // "changesets": false disables the diff channels (no changeset
   // catalogues in the session/chat snapshots; changeset URIs resolve to
   // nothing). Changesets require the location directory to be a git
   // repository.
+  // "terminals": false disables the synthetic shell-command terminal
+  // channels (shell-tool calls open no ahp-terminal: channels and the
+  // root state carries no terminals list).
   // "capabilities": { "changesets": false, "terminals": false, "automations": false }
 }

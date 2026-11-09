@@ -39,6 +39,7 @@ import {
   sessionChannelURI,
   chatChannelURI,
   sessionChangesetURI,
+  terminalChannelURI,
   turnChangesetURI,
   uncommittedChangesetURI,
 } from "../channels.js";
@@ -318,7 +319,7 @@ interface Harness {
   stop: () => void;
 }
 
-function makeHarness(opts?: { changesets?: boolean }): Harness {
+function makeHarness(opts?: { changesets?: boolean; terminals?: boolean }): Harness {
   const facade = new FakeFacade();
   const frames: Frame[] = [];
   const host = new Host({
@@ -327,6 +328,7 @@ function makeHarness(opts?: { changesets?: boolean }): Harness {
     replayWindow: 100,
     defaultDirectory: "/tmp/opencode/ahp-scratch/project-lan",
     changesets: opts?.changesets ?? true,
+    terminals: opts?.terminals ?? true,
     send: (socketId, message) => frames.push({ socketId, message: message as Record<string, any> }),
     log: () => {},
   });
@@ -2901,6 +2903,319 @@ describe("chat-binding durability (Phase 4 extension 2, plan §14.13.1)", () => 
     startTurn(h, chatURI, "t-cn", 1, "channel check");
     await waitFor(() => h.facade.promptCalls.length === 1, "peer prompt");
     expect(h.facade.promptCalls[0]!.sessionID).toBe(peer);
+    h.stop();
+  });
+});
+
+// ── terminals (Phase 4 extension 3, plan §14.16 option (c)) ─────────────
+
+describe("terminals (Phase 4 extension 3)", () => {
+  const SES = "ses_term";
+  const TOOL = "tool_term_1";
+
+  /** Open a session, start a turn, and open the synthetic terminal for TOOL. */
+  async function openShellTerminal(h: Harness, command = "echo hello-ahp", input = JSON.stringify({ command })) {
+    const sessionURI = sessionChannelURI(SES);
+    const chatURI = chatChannelURI(SES);
+    await createSession(h, 1, sessionURI, { provider: "gpuz" });
+    await subscribe(h, 1, chatURI, 801);
+    startTurn(h, chatURI, "tT", 1, "run a command");
+    await waitFor(() => h.facade.promptCalls.length === 1, "prompt");
+    h.facade.push({ type: "tool.input.started", sessionID: SES, assistantMessageID: "msg_1", id: TOOL, name: "shell" });
+    h.facade.push({ type: "tool.input.ended", sessionID: SES, assistantMessageID: "msg_1", id: TOOL, text: input });
+    await waitFor(() => h.actionsOn(ROOT_CHANNEL).some((a) => a.action.type === "root/terminalsChanged"), "terminalsChanged");
+    return { sessionURI, chatURI, terminalURI: terminalChannelURI(TOOL) };
+  }
+
+  function lastCatalog(h: Harness): any[] {
+    const actions = h.actionsOn(ROOT_CHANNEL).filter((a) => a.action.type === "root/terminalsChanged");
+    return actions[actions.length - 1]!.action.terminals;
+  }
+
+  async function terminalSnapshotState(h: Harness, uri: string, id: number): Promise<Record<string, any>> {
+    return subscribe(h, 1, uri, id).then((res) => res["result"]["snapshot"]["state"]);
+  }
+
+  it("opens a synthetic terminal for a shell call: catalog row, snapshot shape, and the full action stream", async () => {
+    const h = makeHarness();
+    h.init(1, "c1");
+    await waitInit(h, 1);
+    const { sessionURI, chatURI, terminalURI } = await openShellTerminal(h);
+
+    // Root catalog: one row, session claim scoped to chat/turn/tool call,
+    // running lifecycle.
+    const row = lastCatalog(h)[0]!;
+    expect(row.resource).toBe(terminalURI);
+    expect(row.title).toBe("echo hello-ahp");
+    expect(row.claim).toEqual({ kind: "session", session: sessionURI, chat: chatURI, turnId: "tT", toolCallId: TOOL });
+    expect(row.lifecycle).toEqual({ status: "running" });
+
+    // Terminal snapshot: isPty: false, command-detection on, the
+    // commandExecuted part, the location cwd.
+    const state = await terminalSnapshotState(h, terminalURI, 810);
+    expect(state.isPty).toBe(false);
+    expect(state.supportsCommandDetection).toBe(true);
+    expect(state.title).toBe("echo hello-ahp");
+    expect(state.cwd).toBe(`file://${DIR}/`);
+    expect(state.claim).toEqual(row.claim);
+    expect(state.lifecycle).toEqual({ status: "running" });
+    expect(state.content).toEqual([
+      { type: "command", commandId: TOOL, commandLine: "echo hello-ahp", output: "", timestamp: expect.any(Number), isComplete: false },
+    ]);
+
+    // Completion: data → commandFinished (exitCode 0, duration) → exited.
+    h.facade.push({ type: "tool.success", sessionID: SES, id: TOOL, content: [{ type: "text", text: "hello-ahp\n" }] });
+    const finished = await waitForAction(h, terminalURI, "terminal/commandFinished");
+    expect(finished.action.commandId).toBe(TOOL);
+    expect(finished.action.exitCode).toBe(0);
+    expect(finished.action.durationMs).toBeGreaterThanOrEqual(0);
+    const exited = await waitForAction(h, terminalURI, "terminal/exited");
+    expect(exited.action.exitCode).toBe(0);
+
+    // The catalog row flips to the exited lifecycle while the turn runs.
+    await waitFor(() => lastCatalog(h)[0]?.lifecycle.status === "exited", "catalog lifecycle flip");
+    expect(lastCatalog(h)).toHaveLength(1);
+
+    // Final state: the command part is complete in place.
+    const done = await terminalSnapshotState(h, terminalURI, 811);
+    expect(done.lifecycle).toEqual({ status: "exited", exitCode: 0 });
+    expect(done.content[0]).toMatchObject({ type: "command", commandId: TOOL, isComplete: true, exitCode: 0, output: "hello-ahp\n", durationMs: expect.any(Number) });
+
+    // Retention: the turn end drops the catalog row, but the channel
+    // state stays subscribable (the chat still owns it).
+    h.facade.push({ type: "execution.succeeded", sessionID: SES });
+    await waitForAction(h, chatURI, "chat/turnComplete");
+    await waitFor(() => lastCatalog(h).length === 0, "catalog drop at turn end");
+    const retained = await terminalSnapshotState(h, terminalURI, 812);
+    expect(retained.lifecycle).toEqual({ status: "exited", exitCode: 0 });
+    h.stop();
+  });
+
+  it("parses a non-zero exit from the result notice; failures carry the error text and no exit code", async () => {
+    const h = makeHarness();
+    h.init(1, "c1");
+    await waitInit(h, 1);
+    const { terminalURI } = await openShellTerminal(h, "false", JSON.stringify({ command: "false" }));
+    // Subscribe to the terminal channel — host-originated terminal actions
+    // only reach subscribers (rejections are the write-ahead exception).
+    await subscribe(h, 1, terminalURI, 820);
+    h.facade.push({
+      type: "tool.success",
+      sessionID: SES,
+      id: TOOL,
+      content: [{ type: "text", text: "boom" }, { type: "text", text: "Exit code: 2" }],
+    });
+    const finished = await waitForAction(h, terminalURI, "terminal/commandFinished");
+    expect(finished.action.exitCode).toBe(2);
+    const data = await waitForAction(h, terminalURI, "terminal/data");
+    expect(data.action.data).toBe("boom\nExit code: 2");
+    h.stop();
+
+    const h2 = makeHarness();
+    h2.init(1, "c1");
+    await waitInit(h2, 1);
+    const { terminalURI: failedURI } = await openShellTerminal(h2, "nope", JSON.stringify({ command: "nope" }));
+    await subscribe(h2, 1, failedURI, 821);
+    h2.facade.push({ type: "tool.failed", sessionID: SES, id: TOOL, error: { type: "error", message: "Command failed" } });
+    const failedFinished = await waitForAction(h2, failedURI, "terminal/commandFinished");
+    expect(failedFinished.action.exitCode).toBeUndefined();
+    const failedData = await waitForAction(h2, failedURI, "terminal/data");
+    expect(failedData.action.data).toBe("Command failed");
+    const failedExited = await waitForAction(h2, failedURI, "terminal/exited");
+    expect(failedExited.action.exitCode).toBeUndefined();
+    h2.stop();
+  });
+
+  it("excludes background shell calls and non-shell tools", async () => {
+    const h = makeHarness();
+    h.init(1, "c1");
+    await waitInit(h, 1);
+    const { chatURI } = await openShellTerminal(h);
+    // A background call and a non-shell tool follow in the same turn —
+    // neither opens a terminal (the catalog keeps its single row).
+    h.facade.push({ type: "tool.input.started", sessionID: SES, assistantMessageID: "msg_2", id: "tool_bg", name: "shell" });
+    h.facade.push({
+      type: "tool.input.ended",
+      sessionID: SES,
+      assistantMessageID: "msg_2",
+      id: "tool_bg",
+      text: JSON.stringify({ command: "sleep 60", background: true }),
+    });
+    h.facade.push({ type: "tool.input.started", sessionID: SES, assistantMessageID: "msg_3", id: "tool_read", name: "read" });
+    h.facade.push({ type: "tool.input.ended", sessionID: SES, assistantMessageID: "msg_3", id: "tool_read", text: JSON.stringify({ path: "x" }) });
+    await new Promise((r) => setTimeout(r, 50)); // let the pump drain
+    expect(h.actionsOn(ROOT_CHANNEL).filter((a) => a.action.type === "root/terminalsChanged")).toHaveLength(1);
+    expect(lastCatalog(h)).toHaveLength(1);
+    h.facade.push({ type: "execution.succeeded", sessionID: SES });
+    await waitForAction(h, chatURI, "chat/turnComplete");
+    h.stop();
+  });
+
+  it("keeps every in-turn command listed (finished included) until the turn ends", async () => {
+    const h = makeHarness();
+    h.init(1, "c1");
+    await waitInit(h, 1);
+    const { chatURI } = await openShellTerminal(h, "first");
+    await subscribe(h, 1, terminalChannelURI(TOOL), 822);
+    // A second command in the same turn joins the catalog.
+    h.facade.push({ type: "tool.input.started", sessionID: SES, assistantMessageID: "msg_2", id: "tool_two", name: "shell" });
+    h.facade.push({ type: "tool.input.ended", sessionID: SES, assistantMessageID: "msg_2", id: "tool_two", text: JSON.stringify({ command: "second" }) });
+    await waitFor(() => lastCatalog(h).length === 2, "second catalog row");
+    // First command finishes — it STAYS listed (exited lifecycle) until
+    // the turn ends.
+    h.facade.push({ type: "tool.success", sessionID: SES, id: TOOL, content: [{ type: "text", text: "a\n" }] });
+    await waitForAction(h, terminalChannelURI(TOOL), "terminal/exited");
+    await waitFor(() => lastCatalog(h).length === 2, "first row retained while running turn");
+    const rows = lastCatalog(h);
+    expect(rows.map((r: any) => r.lifecycle.status).sort()).toEqual(["exited", "running"]);
+    h.facade.push({ type: "execution.succeeded", sessionID: SES });
+    await waitForAction(h, chatURI, "chat/turnComplete");
+    await waitFor(() => lastCatalog(h).length === 0, "both rows drop at turn end");
+    h.stop();
+  });
+
+  it("rejects client-dispatchable terminal actions with a read-only reason (and unknown channels with no such terminal)", async () => {
+    const h = makeHarness();
+    h.init(1, "c1");
+    await waitInit(h, 1);
+    const { terminalURI } = await openShellTerminal(h);
+    const dispatch = (seq: number, action: Record<string, unknown>, uri: string = terminalURI) =>
+      h.send(1, "dispatchAction", { channel: uri, clientSeq: seq, action });
+
+    dispatch(1, { type: "terminal/input", data: "ls\n" });
+    const input = await waitForAction(h, terminalURI, "terminal/input");
+    expect(input.rejectionReason).toMatch(/read-only terminal/);
+    dispatch(2, { type: "terminal/resized", cols: 80, rows: 24 });
+    const resized = await waitForAction(h, terminalURI, "terminal/resized");
+    expect(resized.rejectionReason).toMatch(/read-only terminal/);
+    dispatch(3, { type: "terminal/claimed", claim: { kind: "client", clientId: "c1" } });
+    const claimed = await waitForAction(h, terminalURI, "terminal/claimed");
+    expect(claimed.rejectionReason).toMatch(/read-only terminal/);
+    // A torn-down / never-opened channel gets the not-found reason.
+    dispatch(4, { type: "terminal/input", data: "x" }, "ahp-terminal:/gone");
+    const gone = await waitForAction(h, "ahp-terminal:/gone", "terminal/input");
+    expect(gone.rejectionReason).toMatch(/no such terminal/);
+    // The rejections never mutated the store.
+    const state = await terminalSnapshotState(h, terminalURI, 813);
+    expect(state.lifecycle).toEqual({ status: "running" });
+    expect(state.claim.kind).toBe("session");
+    h.stop();
+  });
+
+  it("answers createTerminal and disposeTerminal with a clean -32010 instead of -32601", async () => {
+    const h = makeHarness();
+    h.init(1, "c1");
+    await waitInit(h, 1);
+    h.send(1, "createTerminal", { channel: "ahp-terminal:/wanted", claim: { kind: "client", clientId: "c1" } }, 900);
+    await waitFor(() => h.frames.some((f) => f.message.id === 900), "createTerminal response");
+    expect(h.frames.find((f) => f.message.id === 900)!.message.error.code).toBe(-32010);
+    h.send(1, "disposeTerminal", { channel: "ahp-terminal:/wanted" }, 901);
+    await waitFor(() => h.frames.some((f) => f.message.id === 901), "disposeTerminal response");
+    expect(h.frames.find((f) => f.message.id === 901)!.message.error.code).toBe(-32010);
+    h.stop();
+  });
+
+  it("rejects subscribing to a terminal that does not exist with -32008", async () => {
+    const h = makeHarness();
+    h.init(1, "c1");
+    await waitInit(h, 1);
+    const res = await subscribe(h, 1, "ahp-terminal:/nope", 902);
+    expect(res.error?.code).toBe(-32008);
+    h.stop();
+  });
+
+  it("session removal exits running terminals and drops the channels", async () => {
+    const h = makeHarness();
+    h.init(1, "c1");
+    await waitInit(h, 1);
+    const { sessionURI, terminalURI } = await openShellTerminal(h);
+    await subscribe(h, 1, terminalURI, 903); // a live subscriber
+    // The session is deleted (TUI) while the command is still running.
+    h.facade.push({ type: "session.deleted", sessionID: SES });
+    await waitFor(() => h.notification("root/sessionRemoved", 1) !== undefined, "root/sessionRemoved");
+    const exited = await waitForAction(h, terminalURI, "terminal/exited");
+    expect(exited.action.exitCode).toBeUndefined(); // unknown — the command died
+    await waitFor(() => lastCatalog(h).length === 0, "catalog drop on removal");
+    const sub = await subscribe(h, 1, terminalURI, 904);
+    expect(sub.error?.code).toBe(-32008);
+    // The session channel is gone too.
+    const sessSub = await subscribe(h, 1, sessionURI, 905);
+    expect(sessSub.error?.code).toBe(-32001);
+    h.stop();
+  });
+
+  it("with the capability off: shell calls open no terminals and publish no catalog actions", async () => {
+    const h = makeHarness({ terminals: false });
+    h.init(1, "c1");
+    await waitInit(h, 1);
+    const chatURI = chatChannelURI(SES);
+    await createSession(h, 1, sessionChannelURI(SES), { provider: "gpuz" });
+    await subscribe(h, 1, chatURI, 910);
+    startTurn(h, chatURI, "tOff", 1, "run it");
+    await waitFor(() => h.facade.promptCalls.length === 1, "prompt");
+    h.facade.push({ type: "tool.input.started", sessionID: SES, assistantMessageID: "msg_1", id: TOOL, name: "shell" });
+    h.facade.push({ type: "tool.input.ended", sessionID: SES, assistantMessageID: "msg_1", id: TOOL, text: JSON.stringify({ command: "echo hi" }) });
+    h.facade.push({ type: "tool.success", sessionID: SES, id: TOOL, content: [{ type: "text", text: "hi\n" }] });
+    h.facade.push({ type: "execution.succeeded", sessionID: SES });
+    await waitForAction(h, chatURI, "chat/turnComplete");
+    expect(h.actionsOn(ROOT_CHANNEL).filter((a) => a.action.type === "root/terminalsChanged")).toHaveLength(0);
+    const rootSub = await subscribe(h, 1, ROOT_CHANNEL, 911);
+    expect(rootSub.result.snapshot.state.terminals).toBeUndefined();
+    h.stop();
+  });
+});
+
+describe("resolveSessionConfig (AHP 1.0.0 root command, plan §14.18)", () => {
+  const SES = "ses_cfg";
+
+  it("answers the empty schema with empty values — the client's strict pre-send resolve succeeds", async () => {
+    const h = makeHarness();
+    h.init(1, "c1");
+    await waitInit(h, 1);
+    // The VS Code shape: provider + workingDirectory + (later) config.
+    h.send(
+      1,
+      "resolveSessionConfig",
+      {
+        channel: ROOT_CHANNEL,
+        provider: "gpuz",
+        workingDirectory: "file:///tmp/opencode/ahp-scratch/project-lan",
+        config: {},
+      },
+      920,
+    );
+    await waitFor(() => h.frames.some((f) => f.message.id === 920), "resolveSessionConfig response");
+    const res = h.frames.find((f) => f.message.id === 920)!.message.result;
+    expect(res).toEqual({ schema: { type: "object", properties: {} }, values: {} });
+    h.stop();
+  });
+
+  it("accepts a missing channel as a client error (-32602), not a protocol error", async () => {
+    const h = makeHarness();
+    h.init(1, "c1");
+    await waitInit(h, 1);
+    h.send(1, "resolveSessionConfig", { channel: "ahp-session:/x" }, 921);
+    await waitFor(() => h.frames.some((f) => f.message.id === 921), "resolveSessionConfig response");
+    expect(h.frames.find((f) => f.message.id === 921)!.message.error.code).toBe(-32602);
+    h.send(1, "resolveSessionConfig", {}, 922);
+    await waitFor(() => h.frames.some((f) => f.message.id === 922), "resolveSessionConfig response");
+    expect(h.frames.find((f) => f.message.id === 922)!.message.error.code).toBe(-32602);
+    h.stop();
+  });
+
+  it("the full VS Code new-session flow: resolve → createSession → first send works", async () => {
+    const h = makeHarness();
+    h.init(1, "c1");
+    await waitInit(h, 1);
+    // Strict resolve right before the send (what _sendNewSessionRequest does).
+    h.send(1, "resolveSessionConfig", { channel: ROOT_CHANNEL, provider: "gpuz" }, 923);
+    await waitFor(() => h.frames.some((f) => f.message.id === 923), "resolveSessionConfig response");
+    expect(h.frames.find((f) => f.message.id === 923)!.message.error).toBeUndefined();
+    await createSession(h, 1, sessionChannelURI(SES), { provider: "gpuz" });
+    const chatURI = chatChannelURI(SES);
+    await subscribe(h, 1, chatURI, 924);
+    startTurn(h, chatURI, "tCfg", 1, "hello");
+    await waitFor(() => h.facade.promptCalls.length === 1, "prompt delivered");
     h.stop();
   });
 });

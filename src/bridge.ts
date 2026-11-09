@@ -853,6 +853,11 @@ export function fileUri(absPath: string): string {
   return pathToFileURL(absPath).href;
 }
 
+/** File URI of a directory — directory paths end with `/` (RFC 8089). */
+export function directoryUri(absPath: string): string {
+  return fileUri(absPath.endsWith("/") ? absPath : absPath + "/");
+}
+
 /** Content ref for a file's HEAD content (the "before" of a live diff). */
 export function headContentRef(absPath: string): string {
   return CONTENT_HEAD_MARKER + b64url(absPath);

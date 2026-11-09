@@ -58,6 +58,16 @@ In the Agents window, an `opencode` host with:
   `discard-changes` operation restores a file. Requires the location
   directory to be a git repository (otherwise the changesets are empty);
   opt out with `capabilities.changesets: false`.
+- **Terminals** — read-only `ahp-terminal:` channels rendered from
+  `shell`-tool executions (`isPty: false`, completed-command output with
+  exit codes): while a turn runs a foreground shell command, the terminal
+  appears in the root catalog, streams
+  `data` → `commandFinished` → `exited` to subscribers, and leaves the
+  catalog at turn end (the channel state stays subscribable until the
+  chat/session is removed). The terminals are renderings, not pty —
+  `createTerminal`/`disposeTerminal` and client `terminal/*` actions get
+  clean read-only errors. Opt out with
+  `capabilities.terminals: false`.
 
 Not yet: cancelling a queued message and the `always` permission reply
 (Phase 4 extensions); official conformance-suite coverage (Phase 5,
@@ -119,7 +129,7 @@ sibling of `src/index.ts` (checkouts only — copy
 | `keepAlive` | `true` | Keep the opencode location loaded against its idle timeout (`experimental.location_idle_timeout`, default 60 min) by periodically touching an internal anchor session — with this on, **no `location_idle_timeout` config entry is needed**. The anchor (`opencode-ahp (keep-alive)`) is a real opencode session: it shows in the TUI session list but is hidden from AHP clients (opencode's plugin surface cannot archive it) |
 | `keepAliveIntervalMinutes` | `10` | Minutes between keep-alive touches; keep well below the effective idle timeout |
 | `replayWindow` | `1000` | Per-channel actions kept for reconnect replay; older gaps → fresh snapshot |
-| `capabilities` | `{ changesets: true, terminals: false, automations: false }` | Advertised in `initialize` — never advertise what we don't implement. Set `changesets` to `false` to disable the diff channels (the session/chat snapshots then carry no changeset catalogues and changeset URIs resolve to nothing) |
+| `capabilities` | `{ changesets: true, terminals: true, automations: false }` | Host-side switches — never advertise what we don't implement (in AHP 1.0.0 none of these is a wire field; discovery is the state's optionality). Set `changesets` to `false` to disable the diff channels (the session/chat snapshots then carry no changeset catalogues and changeset URIs resolve to nothing); set `terminals` to `false` to disable the synthetic shell-command terminal channels (no `root/terminals` list, `shell` calls open no `ahp-terminal:` channels) |
 
 ## Remote access (local LAN — MVP)
 

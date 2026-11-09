@@ -601,6 +601,7 @@ export default Plugin.define({
         replayWindow: opts.replayWindow,
         defaultDirectory: ctx.location.directory,
         changesets: opts.capabilities.changesets,
+        terminals: opts.capabilities.terminals,
         send: (socketId, message) => {
           listener?.sendTo({ id: socketId }, JSON.stringify(message));
         },

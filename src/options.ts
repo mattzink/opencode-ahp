@@ -72,8 +72,12 @@ export const BUILTIN_OPTIONS: Options = {
   keepAliveIntervalMinutes: 10,
   replayWindow: 1000,
   // Phase 2: changesets are on by default (opt out with
-  // `capabilities.changesets: false`).
-  capabilities: { changesets: true, terminals: false, automations: false },
+  // `capabilities.changesets: false`). Phase 4 extension 3: terminals
+  // are on by default too — the synthetic shell-command terminals (plan
+  // §14.16 option (c)); opt out with `capabilities.terminals: false`.
+  // Off the wire in 1.0.0 (no capability field) — the flag gates the
+  // host-side behavior only.
+  capabilities: { changesets: true, terminals: true, automations: false },
 };
 
 export function isRecord(v: unknown): v is Record<string, unknown> {

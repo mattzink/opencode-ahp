@@ -50,6 +50,8 @@ import {
   ResponsePartKind,
   SessionInputRequestKind,
   SessionStatus,
+  TerminalClaimKind,
+  TerminalLifecycleStatus,
   ToolCallConfirmationReason,
   ToolCallContributorKind,
   ToolCallStatus,
@@ -59,7 +61,6 @@ import {
   type ActionOrigin,
   type ChatAction,
   type ChatSummary,
-  type ChatState,
   type ChatToolCallCompleteAction,
   type ChatToolCallConfirmedAction,
   type ChatToolCallContentChangedAction,
@@ -72,20 +73,22 @@ import {
   type Implementation,
   type Message,
   type ReconnectResult,
+  type ResolveSessionConfigResult,
   type RootAction,
   type SessionAction,
   type SessionActiveClient,
-  type SessionState,
   type SessionSummary,
   type SessionToolClientExecutionRequest,
   type SessionToolConfirmationRequest,
   type Snapshot,
   type StateAction,
   type StringOrMarkdown,
+  type TerminalAction,
+  type TerminalInfo,
+  type TerminalState,
   type ToolCallConfirmationState,
   type ToolCallResult,
   type ToolCallState,
-  type ToolDefinition,
   type ToolResultContent,
 } from "@microsoft/agent-host-protocol";
 import {
@@ -98,6 +101,7 @@ import {
   chatSummaryOf,
   displayNameFor,
   discardOperation,
+  directoryUri,
   fileUri,
   initialChatState,
   initialSessionState,
@@ -114,6 +118,7 @@ import {
   type FacadeEvent,
   type FacadeModelRef,
   type FacadeSession,
+  type FacadeToolContent,
   type OpencodeFacade,
 } from "./bridge.js";
 import {
@@ -133,6 +138,7 @@ import {
   sessionChannelURI,
   sessionChangesetURI,
   sessionIDOf,
+  terminalChannelURI,
   turnChangesetURI,
   uncommittedChangesetURI,
 } from "./channels.js";
@@ -144,10 +150,12 @@ import {
   createChangesetStateStore,
   createRootStateStore,
   createSessionStateStore,
+  createTerminalStateStore,
   type ChatStateStore,
   type ChangesetStateStore,
   type RootStateStore,
   type SessionStateStore,
+  type TerminalStateStore,
 } from "./state.js";
 
 export const ERROR_PARSE = -32700;
@@ -159,6 +167,7 @@ export const ERROR_NO_PROVIDER = -32002;
 export const ERROR_SESSION_EXISTS = -32003;
 export const ERROR_NOT_FOUND = -32008;
 export const ERROR_PERMISSION_DENIED = -32009;
+export const ERROR_NOT_SUPPORTED = -32010;
 
 // ActionType / ReconnectResultType are `declare const enum` in the package
 // but are also real runtime objects (verified against the published dist),
@@ -268,6 +277,33 @@ interface SessionRecord {
   sessionChangesets: Map<string, ChangesetStateStore>;
 }
 
+/**
+ * Phase 4 extension 3 (plan §14.16 option (c)): everything the host
+ * tracks for one synthetic terminal channel — a read-only rendering of a
+ * `shell`-tool command execution (`isPty: false`, command parts only).
+ * Opened at the tool call's `tool.input.ended` (the command line is only
+ * known there); the record outlives its turn — the root catalog drops it
+ * at turn end (retention), and the channel state stays subscribable until
+ * the owning chat/record is removed.
+ */
+interface TerminalRecord {
+  /** The terminal channel URI (`ahp-terminal:/<toolCallId>`). */
+  uri: string;
+  /** The AHP session record that owns the channel (claim `session`). */
+  rec: SessionRecord;
+  /** The chat whose turn ran the command (claim `chat`). */
+  chat: ChatRuntime;
+  /** The opencode tool call id (also the `commandId`, scoped to the URI). */
+  toolCallId: string;
+  /** The AHP turnId the command executed in — the catalog membership key. */
+  turnId: string;
+  /** The official-reducer store (the snapshot payload). */
+  store: TerminalStateStore;
+  commandLine: string;
+  /** Date.now() at `terminal/commandExecuted` (the `durationMs` baseline). */
+  startedAt: number;
+}
+
 export interface HostOptions {
   serverInfo: Implementation;
   facade: OpencodeFacade;
@@ -276,6 +312,13 @@ export interface HostOptions {
   defaultDirectory?: string;
   /** Advertise + serve the changeset channels (catalogues, snapshots, discard). */
   changesets: boolean;
+  /**
+   * Open + serve the synthetic shell-command terminal channels (Phase 4
+   * extension 3, plan §14.16 option (c)): one read-only `ahp-terminal:`
+   * channel per foreground `shell`-tool call. Off the wire in 1.0.0
+   * (no capability field) — the switch gates the host-side behavior.
+   */
+  terminals: boolean;
   /** Deliver a JSON-serializable frame to a connection. */
   send: (socketId: number, message: unknown) => void;
   /** Close one connection (a superseded duplicate clientId). */
@@ -302,6 +345,41 @@ const LIST_SESSIONS_DEFAULT_LIMIT = 100;
 const SNAPSHOT_TOOLS = new Set(["write", "edit", "apply", "patch"]);
 /** The tool-input keys that carry a file path (checked in order). */
 const SNAPSHOT_PATH_KEYS = ["path", "file_path", "filePath", "file"] as const;
+/**
+ * Phase 4 extension 3 (plan §14.16 option (c)): the opencode tool names
+ * whose executions render as synthetic `ahp-terminal:` channels. `shell`
+ * is the v2 core tool name; `bash` is its pre-rename alias (kept so an
+ * older provider-side tool name still maps).
+ */
+const SHELL_TOOL_NAMES = new Set(["shell", "bash"]);
+/**
+ * Max characters of the command line kept in the terminal title (the
+ * catalog row and the state title share it — long pipelines stay
+ * one-line in the Agents-window list).
+ */
+const TERMINAL_TITLE_MAX = 64;
+
+/**
+ * Phase 4 extension 3: the exit code of a successful `shell`-tool
+ * result, read from its LAST text content part. opencode's shell tool
+ * appends a trailing `Exit code: N` notice part only for non-zero exits
+ * and signals (`Exit code: 137 (SIGKILL)` — the 128+signum convention
+ * parses as the numeric status); a zero exit carries no notice.
+ * Spawn failures arrive as `tool.failed` instead (no code available
+ * there). `null` when the last part carries an `Exit code:` line with a
+ * non-numeric value (e.g. `Exit code: unknown`) — the actions then
+ * omit the field.
+ */
+function shellExitCodeOf(content: FacadeToolContent[]): number | null {
+  const last = content
+    .map((c) => (c.type === "text" && typeof c.text === "string" ? c.text : null))
+    .filter((t): t is string => t !== null)
+    .pop();
+  if (last === undefined) return 0; // no output, no notice — clean zero exit
+  const numeric = /Exit code: (-?\d+)\b/.exec(last);
+  if (numeric !== null) return Number.parseInt(numeric[1]!, 10);
+  return /Exit code:/.test(last) ? null : 0;
+}
 /**
  * Phase 4 extension 2 (durability): the opencode session-metadata key
  * carrying the AHP markers (plan §14.13.1). Two shapes, same key:
@@ -370,6 +448,13 @@ export class Host {
    * after the grace window.
    */
   private readonly pendingChatBindings = new Map<string, { fs: FacadeSession; chatURI: string }[]>();
+  /**
+   * Phase 4 extension 3: synthetic terminal channels keyed by URI
+   * (`ahp-terminal:/<toolCallId>`), created at the `shell`-tool call's
+   * `tool.input.ended` and retained until the owning chat/record is
+   * removed (plan §14.16 option (c) retention).
+   */
+  private readonly terminals = new Map<string, TerminalRecord>();
   private readonly opts: HostOptions;
   private readonly log: (message: string) => void;
   private turnCounter = 0;
@@ -565,6 +650,9 @@ export class Host {
       case "listSessions":
         await this.handleListSessions(socketId, msg);
         break;
+      case "resolveSessionConfig":
+        this.handleResolveSessionConfig(socketId, msg);
+        break;
       case "createSession":
         await this.handleCreateSession(socketId, msg);
         break;
@@ -579,6 +667,20 @@ export class Host {
         break;
       case "invokeChangesetOperation":
         await this.handleInvokeChangesetOperation(socketId, msg);
+        break;
+      case "createTerminal":
+      case "disposeTerminal":
+        // Phase 4 extension 3: the host's terminals are read-only
+        // renderings of `shell`-tool executions — the plugin surface can
+        // neither create nor destroy pty-backed terminals, so both
+        // commands get a clean server error instead of -32601 (plan
+        // §14.16 decision: proper error handling once terminals exist).
+        this.sendError(
+          socketId,
+          msg.id,
+          ERROR_NOT_SUPPORTED,
+          `${method} is not supported: this host's terminals are read-only renderings of shell tool calls`,
+        );
         break;
       case "setClientManagedSettingsPermissions":
         // VS Code-specific post-init notification (plan §14.7): the
@@ -746,7 +848,9 @@ export class Host {
           code:
             outcome.reason === "no-such-session"
               ? ERROR_SESSION_NOT_FOUND
-              : ERROR_INVALID_PARAMS,
+              : outcome.reason === "no-such-terminal"
+                ? ERROR_NOT_FOUND
+                : ERROR_INVALID_PARAMS,
           message: `cannot subscribe to ${uri}`,
         },
       });
@@ -999,6 +1103,9 @@ export class Host {
    * drop every binding.
    */
   private removeChat(rec: SessionRecord, chat: ChatRuntime, toolError = "chat removed before the client completed the tool call"): void {
+    // Phase 4 extension 3: the chat's terminal channels go with it
+    // (running commands get a final `terminal/exited` first).
+    this.teardownTerminalsForChat(chat);
     for (const uri of chat.changesets.keys()) {
       this.publish({ channel: uri, action: { type: ActionType.ChangesetCleared } });
     }
@@ -1266,6 +1373,39 @@ export class Host {
     this.sendFrame(socketId, { jsonrpc: "2.0", id: msg.id ?? null, result });
   }
 
+  /**
+   * AHP 1.0.0 root command — the client resolves the session-creation
+   * config schema. VS Code calls it every time the new-session composer
+   * opens and STRICTLY again before the first send of a new session
+   * (`_sendNewSessionRequest`), so an unimplemented host makes every
+   * fresh session unstartable ("unknown method: resolveSessionConfig",
+   * plan §14.18). opencode collects no session-creation configuration —
+   * agent/model choice rides session-state customizations and the
+   * per-turn message — so the honest answer is an empty schema with
+   * empty values. `provider` / `workingDirectory` / `config` are
+   * accepted and deliberately unused: sessions run in the location
+   * directory and the host advertises no config properties (which also
+   * keeps `sessionConfigCompletions` unreachable — it only serves
+   * `enumDynamic` properties this schema does not carry).
+   */
+  private handleResolveSessionConfig(socketId: number, msg: RpcMessage): void {
+    const params = isRecord(msg.params) ? msg.params : {};
+    if (params["channel"] !== ROOT_CHANNEL) {
+      this.sendError(
+        socketId,
+        msg.id,
+        ERROR_INVALID_PARAMS,
+        "resolveSessionConfig requires the ahp-root:// channel",
+      );
+      return;
+    }
+    const result: ResolveSessionConfigResult = {
+      schema: { type: "object", properties: {} },
+      values: {},
+    };
+    this.sendFrame(socketId, { jsonrpc: "2.0", id: msg.id ?? null, result });
+  }
+
   // ── client-dispatchable actions (Phase 1) ──────────────────────────────
 
   /**
@@ -1311,6 +1451,23 @@ export class Host {
       } else {
         this.echo(channel, stateAction, origin, `unsupported action on changeset channel: ${String(action.type)}`);
       }
+      return;
+    }
+    if (kind === "terminal") {
+      // Phase 4 extension 3: the synthetic terminals are read-only
+      // renderings of shell-tool calls — every client-dispatchable
+      // action (`input`, `resized`, `claimed`, `titleChanged`,
+      // `cleared`) has no pty to act on, so each gets an explicit
+      // rejection (write-ahead clients roll back on the reason); the
+      // `no such terminal` check covers a channel whose chat was removed.
+      this.echo(
+        channel,
+        stateAction,
+        origin,
+        this.terminals.has(channel)
+          ? "read-only terminal: this host's terminals render shell tool calls and accept no input, resize, claim, title, or clear"
+          : `no such terminal: ${channel}`,
+      );
       return;
     }
     if (kind !== "session" && kind !== "chat") {
@@ -2031,6 +2188,10 @@ export class Host {
         // point). Awaited in the sequential pump so the capture is
         // complete before `execution.*` can end the turn.
         if (this.opts.changesets) await this.captureTurnBefore(chat, ev.id, ev.text);
+        // Phase 4 extension 3: a foreground `shell`-tool call opens its
+        // synthetic terminal channel here — the command line is only
+        // known at input.ended (plan §14.16 option (c)).
+        this.openTerminalForToolCall(rec, chat, ev.id, ev.text);
         // Phase 4 extension 1: a client-executed call clears its
         // confirmation gate here (no opencode permission can fire for
         // it) — ready straight to running, then surface the execution
@@ -2062,6 +2223,11 @@ export class Host {
         this.ensureToolReady(chat, ev.id, false);
         return;
       case "tool.success": {
+        // Phase 4 extension 3: the synthetic terminal completes on the
+        // tool's terminal event (before the turn guard — a command that
+        // finishes after its turn was torn down still exits its
+        // terminal; no-op when the call never opened one).
+        this.finishTerminal(chat, ev.id, { ok: true, content: ev.content });
         if (chat.currentTurnId === null) return;
         this.ensureToolReady(chat, ev.id, false);
         if (this.toolCallTerminal(chat, ev.id)) {
@@ -2090,6 +2256,7 @@ export class Host {
         return;
       }
       case "tool.failed": {
+        this.finishTerminal(chat, ev.id, { ok: false, message: ev.error.message });
         if (chat.currentTurnId === null) return;
         this.ensureToolReady(chat, ev.id, false);
         if (this.toolCallTerminal(chat, ev.id)) {
@@ -2241,9 +2408,168 @@ export class Host {
       // A queued prompt from outside AHP (e.g. the TUI).
       this.startTurn(chat, userMessage(chat.lastInbox.text));
     }
+    // Phase 4 extension 3: the ended turn's command terminals leave the
+    // root catalog now (retention — their state stays subscribable until
+    // the chat/record is removed; plan §14.16). Runs after the possible
+    // chained startTurn so the published list is the post-handoff one.
+    if (this.opts.terminals && endedTurnId !== null && this.terminals.size > 0) {
+      this.refreshTerminals();
+    }
     if (this.opts.changesets && endedTurnId !== null) {
       await this.refreshTurnChangesets(this.byChannel.get(chat.uri)!, chat, endedTurnId);
     }
+  }
+
+  // ── Phase 4 extension 3: synthetic shell-command terminals (plan §14.16 option (c)) ──
+
+  /**
+   * Open the synthetic `ahp-terminal:` channel for a foreground
+   * `shell`-tool call (read-only rendering of the command execution):
+   * seed the state (`isPty: false`, session claim scoped to
+   * chat/turn/toolCall, `supportsCommandDetection: true`), publish
+   * `terminal/commandExecuted` (commandId = toolCallId), register the
+   * channel, and refresh the root catalog. No-op for the excluded shapes
+   * (capability off, no active turn, non-shell tool, malformed input,
+   * background calls — the background result carries no turn-scoped
+   * completion).
+   */
+  private openTerminalForToolCall(rec: SessionRecord, chat: ChatRuntime, toolCallId: string, inputJson: string): void {
+    if (!this.opts.terminals) return;
+    const turnId = chat.currentTurnId;
+    if (turnId === null) return;
+    const name = chat.toolName.get(toolCallId);
+    if (name === undefined || !SHELL_TOOL_NAMES.has(name)) return;
+    let input: unknown;
+    try {
+      input = JSON.parse(inputJson);
+    } catch {
+      return; // malformed input text — nothing to render
+    }
+    if (!isRecord(input)) return;
+    const command = input["command"];
+    if (typeof command !== "string" || command.length === 0) return;
+    if (input["background"] === true) return; // excluded: no synchronous completion
+    const uri = terminalChannelURI(toolCallId);
+    if (this.terminals.has(uri)) {
+      this.log(`terminal ${uri} already exists (duplicate toolCallId ${toolCallId}); not reopening`);
+      return;
+    }
+    const now = Date.now();
+    const initial: TerminalState = {
+      title:
+        command.length > TERMINAL_TITLE_MAX ? `${command.slice(0, TERMINAL_TITLE_MAX - 1)}…` : command,
+      content: [],
+      lifecycle: { status: TerminalLifecycleStatus.Running },
+      claim: { kind: TerminalClaimKind.Session, session: rec.channel, chat: chat.uri, turnId, toolCallId },
+      supportsCommandDetection: true,
+      isPty: false,
+      // A directory URI (trailing slash — RFC 8089).
+      ...(this.opts.defaultDirectory !== undefined ? { cwd: directoryUri(this.opts.defaultDirectory) } : {}),
+    };
+    this.terminals.set(uri, {
+      uri,
+      rec,
+      chat,
+      toolCallId,
+      turnId,
+      store: createTerminalStateStore(initial),
+      commandLine: command,
+      startedAt: now,
+    });
+    this.channels.addTerminal(uri);
+    this.publish({
+      channel: uri,
+      action: { type: ActionType.TerminalCommandExecuted, commandId: toolCallId, commandLine: command, timestamp: now },
+    });
+    this.refreshTerminals();
+  }
+
+  /**
+   * Complete the synthetic terminal of a `shell`-tool call: publish
+   * `terminal/data` (the output — the tool's text content on success,
+   * the error message on failure), `terminal/commandFinished` (exitCode
+   * + duration), and `terminal/exited`, then refresh the root catalog
+   * (the listed lifecycle flips to exited while the turn still runs).
+   * Idempotent — a terminal that already exited is left alone. The
+   * record itself is retained (retention); only the state moves on.
+   */
+  private finishTerminal(
+    chat: ChatRuntime,
+    toolCallId: string,
+    result: { ok: true; content: FacadeToolContent[] } | { ok: false; message: string },
+  ): void {
+    if (!this.opts.terminals) return;
+    const uri = terminalChannelURI(toolCallId);
+    const t = this.terminals.get(uri);
+    if (t === undefined) return;
+    if (t.store.state.lifecycle.status === TerminalLifecycleStatus.Exited) return;
+    const output = result.ok
+      ? result.content
+          .filter((c) => c.type === "text" && typeof c.text === "string")
+          .map((c) => c.text as string)
+          .join("\n")
+      : result.message;
+    if (output.length > 0) {
+      this.publish({ channel: uri, action: { type: ActionType.TerminalData, data: output } });
+    }
+    const exitCode = result.ok ? (shellExitCodeOf(result.content) ?? undefined) : undefined;
+    const durationMs = Math.max(0, Date.now() - t.startedAt);
+    this.publish({
+      channel: uri,
+      action: {
+        type: ActionType.TerminalCommandFinished,
+        commandId: toolCallId,
+        ...(exitCode !== undefined ? { exitCode } : {}),
+        ...(durationMs > 0 ? { durationMs } : {}),
+      },
+    });
+    this.publish({
+      channel: uri,
+      action: { type: ActionType.TerminalExited, ...(exitCode !== undefined ? { exitCode } : {}) },
+    });
+    this.refreshTerminals();
+  }
+
+  /**
+   * Republish the root terminal catalog (`root/terminalsChanged`, full
+   * replacement). Catalog membership is turn-scoped: a terminal is
+   * listed while its turn is still the owning chat's active turn —
+   * finished commands keep their (final) lifecycle row until the turn
+   * ends, then the row drops (host-controlled retention, plan §14.16).
+   * No-op when the serialized list is unchanged.
+   */
+  private refreshTerminals(): void {
+    if (!this.opts.terminals) return;
+    const terminals: TerminalInfo[] = [];
+    for (const t of this.terminals.values()) {
+      if (t.chat.currentTurnId !== t.turnId) continue;
+      const s = t.store.state;
+      terminals.push({ resource: t.uri, title: s.title, claim: s.claim, lifecycle: s.lifecycle });
+    }
+    if (JSON.stringify(this.state.state.terminals) === JSON.stringify(terminals)) return;
+    this.publish({ channel: ROOT_CHANNEL, action: { type: ActionType.RootTerminalsChanged, terminals } });
+  }
+
+  /**
+   * Drop a chat's terminal channels (removeChat — covers both chat
+   * disposal and record removal): a still-running command gets a final
+   * `terminal/exited` (it dies with the chat), then the records and
+   * registry entries go and the root catalog refreshes. Existing socket
+   * subscriptions linger (the session-removal precedent) — no further
+   * actions will reach them.
+   */
+  private teardownTerminalsForChat(chat: ChatRuntime): void {
+    let changed = false;
+    for (const t of [...this.terminals.values()]) {
+      if (t.chat !== chat) continue;
+      if (t.store.state.lifecycle.status === TerminalLifecycleStatus.Running) {
+        this.publish({ channel: t.uri, action: { type: ActionType.TerminalExited } });
+      }
+      this.terminals.delete(t.uri);
+      this.channels.removeTerminal(t.uri);
+      changed = true;
+    }
+    if (changed) this.refreshTerminals();
   }
 
   // ── Phase 2: changesets ────────────────────────────────────────────────
@@ -3162,6 +3488,13 @@ export class Host {
       }
       return { resource: uri, state: store.state, fromSeq: this.seq.seq };
     }
+    if (kind === "terminal") {
+      // Phase 4 extension 3: the synthetic terminal's official-reducer
+      // state; null once the record is torn down (the chat is gone).
+      const t = this.terminals.get(uri);
+      if (t === undefined) return null;
+      return { resource: uri, state: t.store.state, fromSeq: this.seq.seq };
+    }
     if (kind !== "root") {
       const rec = this.byChannel.get(uri);
       if (rec === undefined) return null;
@@ -3235,6 +3568,13 @@ export class Host {
         const rec = parsed !== null ? this.byChannel.get(parsed.ownerUri) : undefined;
         const store = rec !== undefined ? this.changesetStoreOf(rec, draft.channel) : undefined;
         if (store !== undefined) store.apply(draft.action as ChangesetAction);
+      } else if (kind === "terminal") {
+        // Phase 4 extension 3: synthetic shell-command terminals.
+        // Non-creating: a publish targets a record that exists (opened at
+        // `tool.input.ended`); a missing record means the channel was
+        // already torn down — the notification still goes out.
+        const t = this.terminals.get(draft.channel);
+        if (t !== undefined) t.store.apply(draft.action as TerminalAction);
       } else {
         // byChannel, not sessions.get(sessionIDOf(…)): the channel suffix
         // is not always the opencode session id (client-chosen suffixes).
