@@ -12,15 +12,14 @@ execute it:
 4. **[LAN two-machine test](#4-lan-two-machine-test-vs-code)** — the manual
    end-to-end walkthrough with VS Code on a second machine.
 5. **[Conformance](#5-conformance-ahp-official-fixtures)** — the official
-   AHP fixture corpus (not yet run — see
-   [futures.md §1.5](futures.md#15-conformance-deliberately-last)).
+   AHP fixture corpus.
 
 The standing rule: after **any** code change, `pnpm typecheck` and
 `pnpm test` must pass — never complete work with a red suite.
 
 Companions: [`design.md`](design.md) describes how the implementation
-works; [`futures.md`](futures.md) lists what is not done yet (the
-conformance suite is its one planned item); the [README](../README.md) and
+works; [`futures.md`](futures.md) lists what is not done yet; the
+[README](../README.md) and
 [`options.example.jsonc`](../options.example.jsonc) cover installation and
 options.
 
@@ -274,7 +273,7 @@ Nothing is installed on PC B — VS Code ships the AHP client.
 ### 4.5 Known-open manual verifications
 
 The single-machine checklist is done; the items below are still open and
-tracked in [futures.md §1.6](futures.md#16-open-live-verification-items) —
+tracked in [futures.md §1.5](futures.md#15-open-live-verification-items) —
 run them as part of this two-machine pass:
 
 - PC B composer first-send retry (fresh session from the composer).
@@ -294,10 +293,9 @@ run them as part of this two-machine pass:
 The AHP repo ships a language-independent conformance corpus in
 [`types/test-cases`](https://github.com/microsoft/agent-host-protocol/tree/main/types/test-cases).
 It is the exit criterion for the host: **green for every capability the
-host advertises** ([futures.md §1.5](futures.md#15-conformance-deliberately-last)).
-It has not been run against this host yet (as of 2026-11-09) — this
-section records what the corpus is, why it validates this host, and how
-to execute it.
+host advertises**. It was first run on 2026-11-09 and is green
+([§5.6](#56-results-2026-11-09-first-run)); this section records what the
+corpus is, why it validates this host, and how to execute it.
 
 ### 5.1 The corpus
 
@@ -306,7 +304,7 @@ Three fixture families (verified against the repo at 2026-11-09):
 | Family | Contents | Fixture shape |
 | --- | --- | --- |
 | `types/test-cases/reducers/` | 308 reducer fixtures at `spec/v1.0.0` — state-transition behavior of every channel reducer, including no-op and wrong-id guard cases. | `{ description, reducer, initial, actions, expected }` — feed `actions` through the named reducer starting from `initial`; the result must deep-equal `expected`. |
-| `types/test-cases/round-trips/` | 68 wire round-trip fixtures — decode/re-encode parity for every wire type (envelopes, JSON-RPC frames, state snapshots, unknown-variant preservation). | `{ group?, type, input, acceptableOutputs [exactly 1], preservedOutput? }` — decode `input`, re-encode, and require the single canonical form; group **B** fixtures assert the key-preserving form (`preservedOutput`) for runtimes without a decoder (TypeScript). `KNOWN-FIDELITY-GAPS.md` in the directory documents what the corpus does *not* verify. |
+| `types/test-cases/round-trips/` | 67 wire round-trip fixtures — decode/re-encode parity for every wire type (envelopes, JSON-RPC frames, state snapshots, unknown-variant preservation). | `{ group?, type, input, acceptableOutputs [exactly 1], preservedOutput? }` — decode `input`, re-encode, and require the single canonical form; group **B** fixtures assert the key-preserving form (`preservedOutput`) for runtimes without a decoder (TypeScript). `KNOWN-FIDELITY-GAPS.md` in the directory documents what the corpus does *not* verify. |
 | `types/test-cases/version-negotiation.json` | 22 negotiation cases — highest-offered-in-range selection, `null` for no overlap, and invalid-version rejection. | `{ offered, expected }` / `{ offered, invalid: true }` against `negotiateProtocolVersion`. |
 
 The official gate for the reducer family is the repo's root `npm test`,
@@ -341,8 +339,11 @@ Verified (2026-11-09): the installed
 `@microsoft/agent-host-protocol@1.0.0` package's `src/` is byte-identical
 to the `spec/v1.0.0` tag (`clients/typescript/src` verbatim; the canonical
 `types/` modulo a 3-line "Generated" header). So a green suite at the
-tag **is** conformance of the pinned dependency, and the unit + live
-layers ([§1](#1-unit-tests-vitest), [§3](#3-live-verification)) run
+tag **is** conformance of the pinned dependency — and gate 4
+([§5.4](#54-how-to-run-it)) re-runs the reducer + version-negotiation
+corpora against the installed dist on every pass, so the delegation does
+not rest on that one-time check alone. The unit + live layers
+([§1](#1-unit-tests-vitest), [§3](#3-live-verification)) run
 against the installed dist. Honest limits, per
 `KNOWN-FIDELITY-GAPS.md`: the TS round-trip harness does not verify
 generated-type correctness (types are erased at runtime — that is the
@@ -352,44 +353,85 @@ layers, not by the corpus.
 
 ### 5.4 How to run it
 
-A local clone of the AHP repo (currently at
-`/home/mattzink/agent-host-protocol`) is the reference checkout. It is a
-user resource: check the tag out, run, and go back to `main` — never
-commit to it.
+`node scripts/ahp-conformance.mjs` runs the whole pass. It shallow-clones
+the AHP repo at the `spec/v1.0.0` tag into a throwaway scratch copy under
+`/tmp/opencode/ahp-conformance/` (any local reference checkout is never
+touched), installs the repo's dependencies, runs the four gates, and
+removes the scratch on exit:
 
-```sh
-cd /home/mattzink/agent-host-protocol
-git fetch origin
-git checkout spec/v1.0.0          # detached HEAD
+1. **Fixtures** — `tsx --test types/*.test.ts types/version/*.test.ts`
+   at the tag: the reducer, version-negotiation, message-map, and
+   extension-prefix corpora.
+2. **Round-trips + client units** — `clients/typescript` `npm ci` +
+   `npm test`: the wire round-trip corpus and the TS client's own
+   suites. Prerequisite (handled by the script): the client's
+   `src/types/` is *generated* from the root `types/` and gitignored —
+   without `npm run generate:typescript` at the repo root, the client
+   suites fail with `ERR_MODULE_NOT_FOUND` on
+   `src/types/common/errors.js`.
+3. **Coverage gate** — the official root-gate test files
+   (`types/*.test.ts`, `types/version/*.test.ts`,
+   `clients/dotnet/codegen/telemetry/*.test.ts`, `scripts/*.test.ts`)
+   under c8 with `--include types/reducers.ts --check-coverage
+   --branches 100` (100 % branch coverage on `types/reducers.ts` is
+   required). The script drives c8's `outputReport` programmatically
+   instead of via the CLI: on Node 26 the c8 11.0.0 CLI crashes before
+   any test runs (its `require('yargs/yargs')` hits yargs 17.7.2's
+   `"type": "module"` package and Node's require(ESM) bridge); the
+   programmatic path runs the identical gate on any Node version. The
+   include pattern resolves relative to cwd, so the report runs from the
+   repo root, and the result is verified against the coverage map
+   directly — with an empty map istanbul reports NaN pct and
+   `NaN < 100` is false, so the threshold check would otherwise pass on
+   air.
+4. **Installed dist** — the tag's reducer + version-negotiation corpora
+   run against the `@microsoft/agent-host-protocol` package installed in
+   *this* repo's `node_modules` (the exact exports our host imports:
+   `src/state.ts`'s five reducers, `src/handshake.ts`'s
+   `negotiateProtocolVersion`): the pin-drift guard, so the pass covers
+   what we ship, not only the tag.
 
-npm ci
+Options: `--tag <tag>` (default `spec/v1.0.0`), `--repo-url <url>`,
+`--dir <scratch root>`, `--keep` (retain the scratch checkout). Exit
+codes (house convention): `0` all gates green · `1` fixture or coverage
+failure · `2` setup failure (clone / `npm ci` / generate).
 
-# Reducer + version-negotiation + message-map + extension-prefix fixtures:
-npx tsx --test types/*.test.ts types/version/*.test.ts
-
-# Round-trip corpus + the TS client's own unit suites:
-cd clients/typescript && npm ci && npm test
-
-cd /home/mattzink/agent-host-protocol
-git checkout main
-```
-
-The repo's full root gate (`npm test`) additionally runs lint, the
-release-metadata/changelog/change-fragment/generated verifications, and
-the 100 % branch-coverage requirement on `types/reducers.ts`.
-
-When the host's advertised surface has settled, an in-repo variant (a
-small Vitest suite that loads the `spec/v1.0.0` fixtures and runs them
-against the installed package's exports, mirroring the official runners)
-is the intended follow-up — see
-[futures.md §1.5](futures.md#15-conformance-deliberately-last).
+The repo's full root gate (`npm test`) additionally runs lint and the
+release-metadata/changelog/change-fragment/generated verifications on top
+of the same test files; it is the upstream repo's release gate, not part
+of this host's conformance pass.
 
 ### 5.5 Status
 
-Not yet run. Deliberately last: the suite runs once the other potential
-items in [`futures.md`](futures.md) have either landed or been consciously
-set aside, so it validates the full advertised surface, including anything
-new that gets turned on.
+Run and green as of the 2026-11-09 first pass
+([§5.6](#56-results-2026-11-09-first-run)). The pass was deliberately
+scheduled last — after the other [`futures.md`](futures.md) candidates
+land or are set aside — so it validates the full advertised surface.
+Re-run `scripts/ahp-conformance.mjs` whenever new capabilities are turned
+on, the pinned AHP package changes, or the `spec/v1.0.0` corpus moves.
+
+### 5.6 Results (2026-11-09 first run)
+
+First pass via `scripts/ahp-conformance.mjs`, `spec/v1.0.0`
+tag at `5f16d81b` ("release: AHP 1.0.0"):
+
+| Gate | Result |
+| --- | --- |
+| 1 — fixtures (`types/*.test.ts` + `types/version/*.test.ts`) | 400/400 pass |
+| 2 — TS client (`npm test`: round-trip corpus + client units) | 77/77 pass |
+| 3 — coverage gate (official root-gate files under c8) | 516/516 pass; `types/reducers.ts` 100 % stmts / branches / funcs / lines — 100 % branch threshold met |
+| 4 — installed dist vs corpus (reducer + version-negotiation) | 330/330 fixtures pass against the `@microsoft/agent-host-protocol@1.0.0` installed in this repo |
+
+Fixture counts at the tag match [§5.1](#51-the-corpus): 308 reducer
+files, 67 round-trip fixtures (the 68th directory entry is
+`KNOWN-FIDELITY-GAPS.md`), 22 version-negotiation cases.
+
+**Exit criterion met: green for every capability the host advertises.**
+Per [§5.3](#53-what-it-covers-for-this-host), the corpus covers
+everything the host delegates to the pinned package — version
+negotiation, the five implemented channel reducers, and wire
+round-trips — so a green tag suite is conformance of the pinned
+dependency.
 
 ---
 
@@ -401,4 +443,4 @@ new that gets turned on.
 | Live-behavior change (transport, host, keep-alive) — before asking the user to publish | §3 test server + `ahp-turn-lifecycle.mjs` minimum, plus the script dedicated to the changed surface. |
 | opencode event-catalog change | §3 `capture-events.mjs` to refresh `src/test/fixtures/events.jsonl`, then §1. |
 | Publish (user's push; CI trusted publisher) | §2 re-runs in CI; `prepublishOnly` runs the same pair first. |
-| Conformance gate | §5 — last, once the advertised surface is settled (§5.5). |
+| Conformance gate | §5 — re-run on new capabilities, pin changes, or corpus moves (§5.5). |

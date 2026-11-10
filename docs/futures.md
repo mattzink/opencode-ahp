@@ -5,14 +5,12 @@ of the AHP 1.0.0 surface the host does not implement, the upgrade
 outlook for AHP 1.1.0, and upstream changes (opencode, VS Code) that
 would unlock more use cases.
 
-**Nothing in this document is planned or scheduled** — with one
-exception: the conformance suite
-([§1.5](#15-conformance-deliberately-last)). Every other item carries
-one or more issues — a missing plugin surface, a missing upstream
-feature, a protocol gap, or no client that drives it — that make it
-hard to implement, or not worth implementing, today. This is a backlog
-of candidates (what *could* be done, and what stands in the way), not
-a roadmap.
+**Nothing in this document is planned or scheduled.** Every item
+carries one or more issues — a missing plugin surface, a missing
+upstream feature, a protocol gap, or no client that drives it — that
+make it hard to implement, or not worth implementing, today. This
+is a backlog of candidates (what *could* be done, and what stands in
+the way), not a roadmap.
 
 It is the forward-looking companion to [`design.md`](design.md), which
 describes how the plugin works today. For installation and options, see
@@ -30,10 +28,8 @@ v2.2.6 source and current `main` where noted.
 
 ## 1. Potential work items
 
-Candidate work — **none of it planned or scheduled**; the exception is
-the conformance suite
-([§1.5](#15-conformance-deliberately-last)). Each item below names
-its blocker, or the reason it is not worth doing today.
+Candidate work — **none of it planned or scheduled**. Each item below
+names its blocker, or the reason it is not worth doing today.
 
 ### 1.1 Elicitation completion (decision pending)
 
@@ -198,18 +194,7 @@ becomes worth doing only once that happens.
   rejection echo. Potential, not planned: it is small, and nothing
   currently demands it.
 
-### 1.5 Conformance (deliberately last)
-
-**The one planned item in this document.** Run the official AHP
-conformance fixtures
-([`microsoft/agent-host-protocol` → `types/test-cases`](https://github.com/microsoft/agent-host-protocol/tree/main/types/test-cases))
-against the host over WebSocket. Exit criterion: green for **every
-capability the host advertises**. It is deliberately last: run it once
-the other potential items in this document have either landed or been
-consciously set aside, so the suite validates the full advertised
-surface, including anything new that gets turned on.
-
-### 1.6 Open live-verification items
+### 1.5 Open live-verification items
 
 Open verifications and one optional user-side configuration item —
 not implementation work, but they gate whether several of the items
@@ -455,7 +440,7 @@ unlocks.
 
 - **Terminal rendering (open question).** Does the Agents window render
   *session-claimed* terminals at all? The wire is verified; the client
-  side is not ([§1.6](#16-open-live-verification-items)). The 1.145.2
+  side is not ([§1.5](#15-open-live-verification-items)). The 1.145.2
   source shows the remote agent-host contribution consuming terminal
   channels (`reconnectTerminals` after reconnection, recovery
   telemetry), but the terminal service itself was not extractable from
@@ -513,7 +498,7 @@ case changes:
 | Item | Where | Awaiting |
 | --- | --- | --- |
 | Elicitation settlement design — options (a) / (b) / (c) | [§1.1](#11-elicitation-completion-decision-pending) | user decision |
-| PC B composer first-send retry (also settles terminal rendering) | [§1.6](#16-open-live-verification-items) | user action on PC B |
-| Second-machine items still open | [§1.6](#16-open-live-verification-items) | user action on PC B |
-| Optional AHP entry in the daily `:80` service config | [§1.6](#16-open-live-verification-items) | user configuration |
+| PC B composer first-send retry (also settles terminal rendering) | [§1.5](#15-open-live-verification-items) | user action on PC B |
+| Second-machine items still open | [§1.5](#15-open-live-verification-items) | user action on PC B |
+| Optional AHP entry in the daily `:80` service config | [§1.5](#15-open-live-verification-items) | user configuration |
 | Filing the opencode feature requests | [§4.1](#41-opencode--feature-requests-to-file) | "investigate upstream later" |
