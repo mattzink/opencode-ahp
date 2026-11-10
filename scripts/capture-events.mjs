@@ -1,11 +1,11 @@
 #!/usr/bin/env node
 /**
- * opencode-ahp event fixture capture (Phase 0, plan §11).
+ * opencode-ahp event fixture capture.
  *
  * Boots a scratch location, opens the server's SSE event stream, runs one
  * small tool-using prompt, and records every V2Event envelope to a JSONL
- * fixture (one event per line, in arrival order) for the Phase 1
- * event→AHP mapping tests (src/test/fixtures/).
+ * fixture (one event per line, in arrival order) for the event→AHP
+ * mapping tests (src/test/fixtures/).
  *
  * Uses the HTTP API with Basic auth (same mechanism `opencode api` uses;
  * the password comes from --password or $OPENCODE_SERVER_PASSWORD).

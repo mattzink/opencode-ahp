@@ -1,6 +1,6 @@
 #!/usr/bin/env node
 /**
- * opencode-ahp hello-world AHP client (Phase 0 spike, plan §11).
+ * opencode-ahp hello-world AHP client (handshake + transport probe).
  *
  * Dependency-free: Node ≥ 22 global WebSocket + fetch.
  *

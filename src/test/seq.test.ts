@@ -54,10 +54,10 @@ describe("Sequencer", () => {
     const a = s.publish({
       ...draft(0),
       origin: { clientId: "c1", clientSeq: 9 },
-      rejectionReason: "unsupported action (Phase 0)",
+      rejectionReason: "unsupported action: root/agentsChanged",
     });
     expect(a.origin).toEqual({ clientId: "c1", clientSeq: 9 });
-    expect(a.rejectionReason).toBe("unsupported action (Phase 0)");
+    expect(a.rejectionReason).toBe("unsupported action: root/agentsChanged");
     const b = s.publish(draft(1));
     expect(b.origin).toBeUndefined();
     expect(b.rejectionReason).toBeUndefined();

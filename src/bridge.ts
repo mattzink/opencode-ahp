@@ -1,16 +1,13 @@
 /**
- * The opencode ⇄ AHP bridge (plan §6.1 bridge.ts) — the only opencode-
- * aware module, kept pure: it receives the narrow `OpencodeFacade` that
- * src/index.ts implements against the plugin `ctx`, and unit tests inject
- * a fake.
+ * The opencode ⇄ AHP bridge — the only opencode-aware module, kept pure:
+ * it receives the narrow `OpencodeFacade` that src/index.ts implements
+ * against the plugin `ctx`, and unit tests inject a fake.
  *
- * Phase 0: the `ahp-root://` catalog (providers as AgentInfo, opencode
- * agents as AHP customizations — plan §14.7).
- *
- * Phase 1: the opencode session surface (create/list/get, prompt with
- * delivery, switchAgent/switchModel, interrupt, permission replies, the
- * mapped event stream) plus the initial-state builders and summary mappers
- * the host uses to seed session/chat stores.
+ * Surfaces: the `ahp-root://` catalog (providers as AgentInfo, opencode
+ * agents as AHP customizations); the opencode session surface (create/
+ * list/get, prompt with delivery, switchAgent/switchModel, interrupt,
+ * permission replies, the mapped event stream); and the initial-state
+ * builders and summary mappers the host uses to seed session/chat stores.
  */
 import { pathToFileURL } from "node:url";
 import { sessionChangesetURI, turnChangesetURI, uncommittedChangesetURI } from "./channels.js";
@@ -63,8 +60,7 @@ export interface FacadeProvider {
 export type FacadeAgentMode = "primary" | "subagent" | "all";
 
 /**
- * Narrow opencode agent (plan §14.7 mapping table), from
- * `ctx.agent.list()` → `Agent.Info[]`.
+ * Narrow opencode agent, from `ctx.agent.list()` → `Agent.Info[]`.
  */
 export interface FacadeAgent {
   id: string;
@@ -92,7 +88,7 @@ export interface FacadeSession {
   archived?: boolean;
   time: { created: number; updated: number };
   /**
-   * Durable, core-opaque session metadata (plan §14.13.1). The host uses
+   * Durable, core-opaque session metadata. The host uses
    * one key — `opencode-ahp` — to make the peer-chat binding survive a
    * restart; everything else is passed through opaquely.
    */
@@ -102,7 +98,7 @@ export interface FacadeSession {
 /** `SessionPromptInput.delivery` (steer | queue; absent = default). */
 export type FacadeDelivery = "steer" | "queue";
 
-/** The decision values the host uses (`always` is out of MVP scope). */
+/** The decision values the host uses (`always` is not implemented). */
 export type FacadePermissionDecision = "once" | "reject";
 
 /**
@@ -158,19 +154,19 @@ export interface FacadeTokens {
 
 /**
  * The narrow opencode surface the bridge needs. Implemented in
- * src/index.ts against the plugin `ctx` (the only ctx call sites, plan
- * §7 pure-module principle); a fake in unit tests.
+ * src/index.ts against the plugin `ctx` (the only ctx call sites — this
+ * module stays pure); a fake in unit tests.
  *
  * All methods are async: the catalog, agents, and sessions come from the
  * registry/session read APIs, which the docs guarantee reflect every
  * registration so far, including during plugin setup.
  */
 export interface OpencodeFacade {
-  /** Live provider/model catalog (plan §3.2: `ctx.provider` + `ctx.model`). */
+  /** Live provider/model catalog (`ctx.provider` + `ctx.model`). */
   listCatalog(): Promise<readonly FacadeProvider[]>;
-  /** Live opencode agents (plan §14.7: `ctx.agent.list()`). */
+  /** Live opencode agents (`ctx.agent.list()`). */
   listAgents(): Promise<readonly FacadeAgent[]>;
-  // ── Phase 1: sessions ─────────────────────────────────────────────────
+  // ── sessions ─────────────────────────────────────────────────
   /**
    * Create an opencode session. `id` is only passed through when it is a
    * valid opencode SessionID (must start with "ses"); the host decides.
@@ -180,7 +176,7 @@ export interface OpencodeFacade {
     title?: string;
     agent?: string;
     model?: FacadeModelRef;
-    /** Durable session metadata (plan §14.13.1) — the host's chat-binding marker rides here. */
+    /** Durable session metadata — the host's chat-binding marker rides here. */
     metadata?: Record<string, unknown>;
   }): Promise<FacadeSession>;
   /** All opencode sessions for this location. */
@@ -188,9 +184,9 @@ export interface OpencodeFacade {
   /** One opencode session, or null when it does not exist. */
   getSession(sessionID: string): Promise<FacadeSession | null>;
   /**
-   * Remove an opencode session (`ctx.session.remove`). Phase 4
-   * extension 2: `disposeChat` removes a chat's backend session, and
-   * record removal disposes the peer-chat backends (plan §14.13).
+   * Remove an opencode session (`ctx.session.remove`). `disposeChat`
+   * removes a chat's backend session, and record removal disposes the
+   * peer-chat backends (multi-chat: one AHP chat per opencode session).
    */
   removeSession(sessionID: string): Promise<void>;
   /**
@@ -213,7 +209,7 @@ export interface OpencodeFacade {
    * iterator ends (without error) when the signal aborts.
    */
   events(signal: AbortSignal): AsyncIterable<FacadeEvent>;
-  // ── Phase 2: changesets ───────────────────────────────────────────────
+  // ── changesets ───────────────────────────────────────────────
   /**
    * Working-tree diff vs HEAD (uncommitted changes, untracked files
    * included), with **absolute** file paths. `[]` when the location is
@@ -237,13 +233,13 @@ export interface OpencodeFacade {
    * (fallback delete), untracked → delete.
    */
   discardFile(absPath: string): Promise<void>;
-  // ── Phase 4 extension 1: client-provided tools ─────────────────────────
+  // ── client-provided tools ─────────────────────────
   /**
    * Replace the location's registered client tools with `tools` (the
    * cross-session union of every AHP session's active-client tools;
    * `[]` when none). The implementation applies them to the opencode
    * tool registry (`ctx.tool.transform` + `ctx.tool.reload`) — the
-   * registered tools' `execute` routes back to the host (plan §14.12).
+   * registered tools' `execute` routes back to the host.
    */
   syncClientTools(tools: readonly FacadeClientTool[]): Promise<void>;
 }
@@ -289,12 +285,12 @@ export interface FacadeDiffFile {
   status: "added" | "deleted" | "modified";
 }
 
-// ── Phase 0: catalog mappers ─────────────────────────────────────────────
+// ── catalog mappers ─────────────────────────────────────────────
 
 /**
- * Stable synthetic AHP URI for an opencode agent (plan §14.7: file URIs
- * are not available for config/built-in agents, and the URI only has to
- * match between the customization tree and `Message.agent`).
+ * Stable synthetic AHP URI for an opencode agent (file URIs are not
+ * available for config/built-in agents, and the URI only has to match
+ * between the customization tree and `Message.agent`).
  */
 export function agentUri(id: string): string {
   return `opencode:agent/${id}`;
@@ -306,8 +302,7 @@ export function agentIDFromUri(uri: string): string | null {
 }
 
 /**
- * Map opencode agents to AHP `AgentCustomization` children
- * (plan §14.7 mapping table):
+ * Map opencode agents to AHP `AgentCustomization` children:
  *  - `id` → `uri` (synthetic `opencode:agent/<id>`, stable per agent) and
  *    `id` (same value — the host is the minting publisher);
  *  - `hidden: true` agents are omitted (internal: summary/title/…);
@@ -365,7 +360,7 @@ export function agentDirectoryCustomization(
 
 /**
  * Map the opencode catalog to the AHP root state's `agents` list.
- * Mapping locked 2026-11-07 (plan §14):
+ * Mapping locked 2026-11-07:
  *  - one AgentInfo per opencode provider;
  *  - providers with activation "disabled" are excluded;
  *  - models with enabled: false are excluded;
@@ -374,7 +369,7 @@ export function agentDirectoryCustomization(
  *    · maxPromptTokens ← limit.input;
  *  - supportsVision ← capabilities.input contains "image".
  *
- * With opencode agents + a workspace directory (plan §14.7), every
+ * With opencode agents + a workspace directory, every
  * AgentInfo also carries the same workspace directory container with the
  * agent children as `customizations` — omitted when there is no visible
  * (non-hidden) agent, so the picker shows the generic provider default
@@ -411,7 +406,7 @@ export function mapCatalog(
       displayName: provider.name,
       description: provider.description ?? provider.name,
       models,
-      // Phase 4 extension 2 (plan §14.13): advertise plain multi-chat.
+      // Multi-chat: advertise plain multipleChats.
       // No `fork`/`sideChat` sub-caps — the opencode plugin surface has
       // no fork API in 2.2.6, so conformant clients (VS Code gates its
       // UI on these) will never attempt the unsupported source forms.
@@ -423,7 +418,7 @@ export function mapCatalog(
   return out;
 }
 
-// ── Phase 1: event mapping ───────────────────────────────────────────────
+// ── event mapping ───────────────────────────────────────────────
 
 const isObj = (v: unknown): v is Record<string, unknown> => typeof v === "object" && v !== null;
 
@@ -640,7 +635,7 @@ function mapToolContent(c: Record<string, unknown>): FacadeToolContent | undefin
   return undefined;
 }
 
-// ── Phase 1: state builders & summary mappers ────────────────────────────
+// ── state builders & summary mappers ────────────────────────────
 
 const STATUS_IDLE_READ = (SessionStatus.Idle | SessionStatus.IsRead) as SessionStatus;
 
@@ -656,7 +651,7 @@ export function modelRefString(model?: FacadeModelRef): string | null {
  * Initial `SessionState` for a new or lazily-registered opencode session.
  * `status` starts at `Idle | IsRead` (33) — the session reducer can only
  * move the read/archive/input-needed bits, so the *activity* source of
- * truth is the chat status (synced via `session/chatUpdated`, plan §14.9).
+ * truth is the chat status (synced via `session/chatUpdated`).
  * `customizations` carries the workspace agent directory container — the
  * same one the root catalog builds — because VS Code's agent dropdown reads
  * `SessionState.customizations` (root-state customizations are NOT read).
@@ -725,8 +720,7 @@ export function userMessage(text: string, model?: string, agentUri?: string): Me
 /**
  * Build the `SessionSummary` for root notifications / `listSessions` from
  * a live record's denormalized fields. `chats` is the full catalog in
- * authoritative order (default first, then insertion order — plan
- * §14.13).
+ * authoritative order (default first, then insertion order).
  */
 export function buildSessionSummary(input: {
   channel: string;
@@ -828,10 +822,10 @@ export function pastTenseMessageFor(toolName: string, inputText: string | undefi
   return msg;
 }
 
-// ── Phase 2: changesets ───────────────────────────────────────────────────
+// ── changesets ───────────────────────────────────────────────────
 
 /**
- * Content-ref URIs the host serves through `resourceRead` (plan §14.10):
+ * Content-ref URIs the host serves through `resourceRead`:
  *  - `ahp-content://head/<b64url(absPath)>` — the file's content in HEAD
  *    (`git show HEAD:<rel>`), for the "before" side of uncommitted/session
  *    changes;
@@ -906,8 +900,8 @@ function b64urlDecode(value: string): string | null {
 }
 
 /**
- * Line diff stats for two file contents (port of the ahp-acp-gateway
- * implementation, plan §14.10): CRLF-normalized, trailing newline ignored,
+ * Line diff stats for two file contents (ported from the ahp-acp-gateway
+ * implementation): CRLF-normalized, trailing newline ignored,
  * common prefix/suffix stripped, then an LCS DP over the middle with a
  * 40 000-cell cap (falls back to counting the whole middle when exceeded).
  */
@@ -971,7 +965,7 @@ export function computeLineDiffStats(
   };
 }
 
-/** The single operation this host advertises (plan §11 Phase 2). */
+/** The single changeset operation this host advertises. */
 export const DISCARD_OPERATION_ID = "discard-changes";
 
 /**
@@ -993,8 +987,8 @@ export function discardOperation(): ChangesetOperation {
 /**
  * The session channel's changeset catalogue: the session-wide changeset
  * only (the protocol's "session" changeKind — all changes the agent has
- * produced; approximated by the working tree vs HEAD, plan §14.10).
- * Takes the session channel URI (the owner — plan §14.13).
+ * produced; approximated by the working tree vs HEAD). Takes the session
+ * channel URI as the changeset owner.
  */
 export function sessionChangesetCatalog(sessionChannel: string): Changeset[] {
   return [
@@ -1012,7 +1006,7 @@ export function sessionChangesetCatalog(sessionChannel: string): Changeset[] {
  * changes, the session-wide changeset, and the per-turn template
  * (`{turnId}` expands against the chat's turns — the protocol's standard
  * template shapes). Multi-chat: every chat has its own catalogue keyed
- * off its own channel URI (plan §14.13).
+ * off its own channel URI.
  */
 export function chatChangesetCatalog(chatChannel: string, sessionChannel: string): Changeset[] {
   return [
@@ -1043,8 +1037,8 @@ function withReviewed(file: ChangesetFile, reviewed: boolean | undefined): Chang
 }
 
 /**
- * `ChangesetFile` entries for the working-tree diff (the `uncommitted` and
- * `session` changesets share this approximation, plan §14.10):
+ * `ChangesetFile` entries for the working-tree diff (the `uncommitted`
+ * and `session` changesets share this approximation):
  *  - added → `after` only, live `file://` content ref;
  *  - deleted → `before` only, HEAD content ref;
  *  - modified → live `file://` after + HEAD before.

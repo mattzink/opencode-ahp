@@ -1,6 +1,6 @@
 /**
- * Client-provided tools (plan Phase 4 extension 1, findings §14.12): the
- * pure helpers the host uses for the client-tool surface — wire validation
+ * Client-provided tools: the pure helpers the host uses for the
+ * client-tool surface — wire validation
  * of AHP `ToolDefinition`s, the cross-session definition union the model
  * sees (first-registered wins per name), and the per-session provider
  * lookup used to attribute the tool-call contributor and route execution.

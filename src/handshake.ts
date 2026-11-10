@@ -1,7 +1,6 @@
 /**
- * AHP 1.0.0 handshake (plan §6.1 handshake.ts): the `initialize` command
- * — semver capability negotiation via the official package's
- * `negotiateProtocolVersion`.
+ * AHP 1.0.0 handshake: the `initialize` command — semver capability
+ * negotiation via the official package's `negotiateProtocolVersion`.
  *
  * Version semantics (AHP versioning spec): the server picks the highest
  * client-offered version inside its supported caret baselines and echoes

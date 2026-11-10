@@ -208,7 +208,7 @@ describe("ChannelRegistry: live sessions", () => {
     reg.subscribe(1, sessionChannelURI("s-1"));
     reg.removeSession("s-1");
     expect(reg.subscribe(2, sessionChannelURI("s-1"))).toEqual({ ok: false, reason: "no-such-session" });
-    // socket 1's existing subscription record stays (Phase 1 prunes on session events)
+    // socket 1's existing subscription record stays (the host prunes on session events)
     expect(reg.subscriptionsOf(1)).toEqual([sessionChannelURI("s-1")]);
   });
 });

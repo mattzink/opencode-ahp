@@ -120,7 +120,7 @@ describe("createListener", () => {
 
   it("allows a loopback bind without a token", () => {
     // No throw before the runtime check: under vitest (Node, no Bun) the
-    // failure is the R6 runtime error, not the R4 refusal.
+    // failure is the Bun.serve runtime error, not the R4 refusal.
     expect(() =>
       createListener({ host: "127.0.0.1", port: 1, path: "/ahp", healthPath: "/healthz", token: null, allowedOrigins: "*" }, noop),
     ).toThrow(/Bun\.serve/);
@@ -130,13 +130,13 @@ describe("createListener", () => {
     ).toThrow(/Bun\.serve/);
   });
 
-  it("refuses a non-loopback bind with a token only when the runtime lacks Bun.serve (R6)", () => {
+  it("refuses a non-loopback bind with a token only when the runtime lacks Bun.serve", () => {
     expect(() =>
       createListener({ host: "0.0.0.0", port: 1, path: "/ahp", healthPath: "/healthz", token: "x", allowedOrigins: "*" }, noop),
     ).toThrow(/Bun\.serve/);
   });
 
-  it("passes the PEM contents to Bun.serve when tls is set, and omits tls otherwise (Phase 3)", () => {
+  it("passes the PEM contents to Bun.serve when tls is set, and omits tls otherwise", () => {
     // The transport reads Bun from globalThis (no @types/bun dependency),
     // so a stubbed serve() is enough to observe the options it receives —
     // no network, no disk.

@@ -1,8 +1,9 @@
 #!/usr/bin/env node
 /**
- * opencode-ahp Phase 2 live verification (plan §11, §9.4 items 12 + 7).
+ * opencode-ahp live verification: changesets end to end, plus
+ * mid-turn reconnect/replay.
  *
- * E2E item 12 — changesets:
+ * Changesets:
  *   1. initialize (root subscription)
  *   2. createSession (provider selection)
  *   3. subscribe session + chat → assert the changeset catalogues
@@ -22,7 +23,7 @@
  *      the location directory is local to this machine), changeset
  *      refreshed to empty; the turn changeset keeps its record
  *
- * E2E item 7 — reconnect:
+ * Reconnect/replay:
  *  10. start a second turn, drop the link right after the turnStarted
  *      echo (mid-turn), reconnect with the same clientId +
  *      lastSeenServerSeq → replay (or snapshot) with no duplicate turn
@@ -33,9 +34,9 @@
  * Dependency-free: Node ≥ 22 global WebSocket.
  *
  * Usage:
- *   node scripts/ahp-phase2.mjs --token <token> \
+ *   node scripts/ahp-changesets.mjs --token <token> \
  *     [--base http://127.0.0.1:8767] [--path /ahp] \
- *     [--channel ahp-session:/lan-phase2] [--provider opencode] \
+ *     [--channel ahp-session:/lan-changesets] [--provider opencode] \
  *     [--location-dir /tmp/opencode/ahp-scratch/project-lan] \
  *     [--timeout-ms 120000]
  *
@@ -45,7 +46,7 @@ import { readFileSync } from "node:fs";
 import { join } from "node:path";
 import { randomBytes } from "node:crypto";
 
-const TAG = "[ahp-phase2]";
+const TAG = "[ahp-changesets]";
 const fail = (code, msg) => {
   console.error(`${TAG} FAIL: ${msg}`);
   process.exit(code);
@@ -61,7 +62,7 @@ const opts = {
   base: (arg("--base", "http://127.0.0.1:8767") ?? "").replace(/\/$/, ""),
   path: arg("--path", "/ahp"),
   token: arg("--token", null),
-  channel: arg("--channel", "ahp-session:/lan-phase2"),
+  channel: arg("--channel", "ahp-session:/lan-changesets"),
   provider: arg("--provider", "opencode"),
   locationDir: arg("--location-dir", "/tmp/opencode/ahp-scratch/project-lan"),
   timeoutMs: Number(arg("--timeout-ms", "120000")),
@@ -96,7 +97,7 @@ const pending = new Map();
 const actionsByChannel = new Map(); // channel -> ActionEnvelope[]
 const rootNotifications = [];
 let lastSeenSeq = -1;
-const clientId = "phase2-" + randomBytes(4).toString("hex");
+const clientId = "changesets-" + randomBytes(4).toString("hex");
 
 /** The (not yet started) turn-2 id; set before it is dispatched. */
 let TURN_ID_2 = null;
@@ -213,7 +214,7 @@ function startTurn(chatChannel, turnId, text) {
 }
 
 try {
-  // ── Phase A: catalogues ────────────────────────────────────────────────
+  // ── 1. catalogues ──────────────────────────────────────────────────────
   await connect();
   console.log(`${TAG} connected (clientId ${clientId})`);
 
@@ -254,7 +255,7 @@ try {
   turnTemplate = chatCatalog.find((c) => c.changeKind === "turn")?.uriTemplate;
   if (uncommittedURI === undefined || turnTemplate === undefined) fail(1, "catalogue missing uncommitted/turn entries");
 
-  // ── Phase B: the editing turn ──────────────────────────────────────────
+  // ── 2. the editing turn ────────────────────────────────────────────────
   const unsubSub = await request("subscribe", { channel: uncommittedURI });
   if (unsubSub.error) fail(1, `subscribe uncommitted: ${JSON.stringify(unsubSub.error)}`);
   const initialState = unsubSub.result?.snapshot?.state;
@@ -331,7 +332,7 @@ try {
     JSON.stringify({ b: turnFile?.edit?.before?.content?.uri, a: turnFile?.edit?.after?.content?.uri }),
   );
 
-  // ── Phase C: resourceRead + review + discard ───────────────────────────
+  // ── 3. resourceRead + review + discard ─────────────────────────────────
   const rr = (uri, encoding) => request("resourceRead", encoding ? { uri, encoding } : { uri });
 
   const live = await rr(fileRef, "utf-8");
@@ -438,7 +439,7 @@ try {
     `files=${turnResub.result?.snapshot?.state?.files?.length}`,
   );
 
-  // ── Phase D: reconnect (E2E item 7) ────────────────────────────────────
+  // ── 4. reconnect / replay ──────────────────────────────────────────────
   // The reconnect boundary is the turn-2 turnStarted echo's seq: by the
   // time we drop the link, at least one further turn-2 action has been
   // published, so the replay is guaranteed to carry something (the rest,
@@ -517,6 +518,6 @@ if (failures > 0) {
   console.error(`${TAG} ${failures} check(s) failed`);
   process.exit(1);
 }
-console.log(`${TAG} OK: Phase 2 live verification passed (E2E items 12 + 7)`);
+console.log(`${TAG} OK: changesets + reconnect/replay verification passed`);
 ws.close(1000);
 process.exit(0);

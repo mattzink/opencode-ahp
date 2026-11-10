@@ -75,7 +75,7 @@ describe("mapCatalog", () => {
     ]);
   });
 
-  it("advertises plain multi-chat (no fork/sideChat sub-caps — plan §14.13)", () => {
+  it("advertises plain multi-chat (no fork/sideChat sub-caps)", () => {
     const agents = mapCatalog([provider()]);
     // Empty object = multi-chat without source-based creation; conformant
     // clients (VS Code gates its fork UI on `multipleChats.fork`) never
@@ -230,7 +230,7 @@ describe("mapCatalog", () => {
 });
 
 describe("mapAgentCustomizations", () => {
-  it("maps the plan §14.7 fields (name, description, pinned model ref)", () => {
+  it("maps the agent fields (name, description, pinned model ref)", () => {
     const child = mapAgentCustomizations([
       facadeAgent({
         description: "Default build agent",
@@ -799,7 +799,7 @@ describe("mapV2Event", () => {
   });
 });
 
-// ── Phase 2: changesets ───────────────────────────────────────────────────
+// ── changesets ───────────────────────────────────────────────────
 
 describe("changeset catalogues", () => {
   it("session catalog: the session-wide changeset only (owner: the session channel)", () => {

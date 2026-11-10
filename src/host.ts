@@ -1,11 +1,10 @@
 /**
  * The AHP host: the JSON-RPC 2.0 router over transport connections that
  * ties the sequencer, channel registry, root state store, and bridge
- * together (plan §6.1).
+ * together.
  *
- * Deviation (plan §14): the plan's §7 module list stopped at bridge.ts;
- * the router that wires the pure modules to sockets is extracted here (a
- * `Host` class) so the whole protocol layer is unit-testable and
+ * The router that wires the pure modules to sockets is extracted here
+ * (a `Host` class) so the whole protocol layer is unit-testable and
  * exercisable by the spike client without a WebSocket runtime.
  *
  * Connection model (AHP 1.0.0 lifecycle spec):
@@ -18,7 +17,7 @@
  *    dispatched action comes back on the `action` notification stream
  *    (write-ahead reconciliation; rejections carry `rejectionReason`).
  *
- * Phase 1 (plan §11): `createSession` + `listSessions`, session/chat
+ * Session surface: `createSession` + `listSessions`, session/chat
  * snapshots, the opencode event pump (streaming text/reasoning, tool-call
  * lifecycle, permission prompts, usage, turn terminals + steering/queue
  * handoff), and the client-dispatchable actions VS Code sends
@@ -26,8 +25,8 @@
  * `chat/turnCancelled`, drafts/read/title/activeClient echoes, …).
  *
  * Session model: one AHP session = one opencode location session record
- * holding a chat catalog; one AHP chat = one opencode session (plan
- * §14.13). The default chat reuses the record's opencode session, so
+ * holding a chat catalog; one AHP chat = one opencode session. The
+ * default chat reuses the record's opencode session, so
  * single-chat clients see zero wire change; peer chats created via
  * `createChat` bind fresh opencode sessions to client-chosen chat URIs.
  * Channel suffixes are opaque; opencode session ids start with "ses"
@@ -197,10 +196,10 @@ interface ClientRecord {
 }
 
 /**
- * Phase 4 extension 2: everything the host tracks for one AHP chat —
- * the backing opencode session, its chat-state store, and the per-turn
- * tracking the event pump needs to join opencode events to AHP turns.
- * One AHP chat ↔ one opencode session (plan §14.13).
+ * Everything the host tracks for one AHP chat — the backing opencode
+ * session, its chat-state store, and the per-turn tracking the event
+ * pump needs to join opencode events to AHP turns. One AHP chat ↔ one
+ * opencode session.
  */
 interface ChatRuntime {
   /** The AHP chat channel URI (`ahp-chat:/…`). */
@@ -228,14 +227,13 @@ interface ChatRuntime {
   /** opencode permission request id → toolCallId. */
   toolForPermission: Map<string, string>;
   /**
-   * Phase 4 extension 1: toolCallId → client-executed tool call tracking
-   * (created at `tool.input.started`, removed at the opencode-side
-   * terminal — plan §14.12).
+   * toolCallId → client-executed tool call tracking (created at
+   * `tool.input.started`, removed at the opencode-side terminal).
    */
   clientToolCalls: Map<string, ClientToolInvocation>;
   /** The most recent `session.inbox.enqueued` (external/TUI prompt tracking). */
   lastInbox: { text: string; delivery: string } | null;
-  // ── Phase 2: changesets ────────────────────────────────────────────────
+  // ── changesets ────────────────────────────────────────────────
   /**
    * Live chat-owned changeset stores (uncommitted + turn), keyed by
    * changeset URI (created on subscribe). The session-kind changeset
@@ -246,7 +244,7 @@ interface ChatRuntime {
    * Per-turn file snapshots for the turn changesets: turnId → absPath →
    * captured {before (pre-edit disk read), after (disk at turn end)}.
    * `null` = the file was absent on that side. Kept until the chat is
-   * removed (content refs + discard-restore read them, plan §14.10).
+   * removed (content refs + discard-restore read them).
    */
   turnSnapshots: Map<string, Map<string, { before: string | null; after: string | null }>>;
 }
@@ -278,8 +276,8 @@ interface SessionRecord {
 }
 
 /**
- * Phase 4 extension 3 (plan §14.16 option (c)): everything the host
- * tracks for one synthetic terminal channel — a read-only rendering of a
+ * Everything the host tracks for one synthetic terminal channel — a
+ * read-only rendering of a
  * `shell`-tool command execution (`isPty: false`, command parts only).
  * Opened at the tool call's `tool.input.ended` (the command line is only
  * known there); the record outlives its turn — the root catalog drops it
@@ -313,8 +311,8 @@ export interface HostOptions {
   /** Advertise + serve the changeset channels (catalogues, snapshots, discard). */
   changesets: boolean;
   /**
-   * Open + serve the synthetic shell-command terminal channels (Phase 4
-   * extension 3, plan §14.16 option (c)): one read-only `ahp-terminal:`
+   * Open + serve the synthetic shell-command terminal channels: one
+   * read-only `ahp-terminal:`
    * channel per foreground `shell`-tool call. Off the wire in 1.0.0
    * (no capability field) — the switch gates the host-side behavior.
    */
@@ -346,8 +344,8 @@ const SNAPSHOT_TOOLS = new Set(["write", "edit", "apply", "patch"]);
 /** The tool-input keys that carry a file path (checked in order). */
 const SNAPSHOT_PATH_KEYS = ["path", "file_path", "filePath", "file"] as const;
 /**
- * Phase 4 extension 3 (plan §14.16 option (c)): the opencode tool names
- * whose executions render as synthetic `ahp-terminal:` channels. `shell`
+ * The opencode tool names whose executions render as synthetic
+ * `ahp-terminal:` channels. `shell`
  * is the v2 core tool name; `bash` is its pre-rename alias (kept so an
  * older provider-side tool name still maps).
  */
@@ -360,8 +358,8 @@ const SHELL_TOOL_NAMES = new Set(["shell", "bash"]);
 const TERMINAL_TITLE_MAX = 64;
 
 /**
- * Phase 4 extension 3: the exit code of a successful `shell`-tool
- * result, read from its LAST text content part. opencode's shell tool
+ * The exit code of a successful `shell`-tool result, read from its LAST
+ * text content part. opencode's shell tool
  * appends a trailing `Exit code: N` notice part only for non-zero exits
  * and signals (`Exit code: 137 (SIGKILL)` — the 128+signum convention
  * parses as the numeric status); a zero exit carries no notice.
@@ -381,8 +379,8 @@ function shellExitCodeOf(content: FacadeToolContent[]): number | null {
   return /Exit code:/.test(last) ? null : 0;
 }
 /**
- * Phase 4 extension 2 (durability): the opencode session-metadata key
- * carrying the AHP markers (plan §14.13.1). Two shapes, same key:
+ * Durability: the opencode session-metadata key carrying the AHP
+ * markers. Two shapes, same key:
  *   - on a peer-chat backend:
  *     `{ chat: <chat channel URI>, owner: <the opencode session id of
  *     the owning AHP session> }` — `owner` is the opencode id, not the
@@ -431,14 +429,13 @@ export class Host {
   private readonly sessions = new Map<string, SessionRecord>();
   private readonly byChannel = new Map<string, SessionRecord>();
   /**
-   * Phase 4 extension 2: opencode session id → the (record, chat) the id
-   * backs. The event pump's join key — every chat has its own opencode
-   * session, and the pump must land on the owning chat, not just the
-   * record (plan §14.13).
+   * opencode session id → the (record, chat) the id backs. The event
+   * pump's join key — every chat has its own opencode session, and the
+   * pump must land on the owning chat, not just the record.
    */
   private readonly byOpencode = new Map<string, { rec: SessionRecord; chat: ChatRuntime }>();
   /**
-   * Phase 4 extension 2 (durability): marked peer backends whose owner
+   * Durability: marked peer backends whose owner
    * AHP session is not registered yet, keyed by the marker's `owner`
    * (opencode session id). A peer can be listed before its owner in the
    * same synchronous `listSessions` pass, and after a restart the owner
@@ -449,10 +446,10 @@ export class Host {
    */
   private readonly pendingChatBindings = new Map<string, { fs: FacadeSession; chatURI: string }[]>();
   /**
-   * Phase 4 extension 3: synthetic terminal channels keyed by URI
+   * Synthetic terminal channels keyed by URI
    * (`ahp-terminal:/<toolCallId>`), created at the `shell`-tool call's
    * `tool.input.ended` and retained until the owning chat/record is
-   * removed (plan §14.16 option (c) retention).
+   * removed.
    */
   private readonly terminals = new Map<string, TerminalRecord>();
   private readonly opts: HostOptions;
@@ -515,8 +512,8 @@ export class Host {
     if (socket?.clientId) {
       const record = this.clients.get(socket.clientId);
       if (record && record.socketId === socketId) record.socketId = null;
-      // Phase 4 extension 1: the spec says the server SHOULD remove an
-      // active client when it disconnects (plan §14.12). Safe: the
+      // The spec says the server SHOULD remove an
+      // active client when it disconnects. Safe: the
       // official client re-dispatches `activeClientSet` on re-subscribe.
       this.evictActiveClient(socket.clientId);
     }
@@ -525,7 +522,7 @@ export class Host {
   }
 
   /**
-   * Phase 4 extension 1: evict a disconnected client's active-client
+   * Evict a disconnected client's active-client
    * role from every session it holds (server-side
    * `session/activeClientRemoved`), fail its in-flight client-tool
    * executions (the opencode tool then fails → the pump's normal
@@ -547,7 +544,7 @@ export class Host {
         channel: rec.channel,
         action: { type: ActionType.SessionActiveClientRemoved, clientId },
       });
-      // In-flight client-tool calls are per-chat (plan §14.13).
+      // In-flight client-tool calls are per-chat.
       for (const chat of rec.chats.values()) {
         for (const [toolCallId, inv] of chat.clientToolCalls) {
           if (inv.clientId !== clientId || inv.result !== undefined) continue;
@@ -670,11 +667,11 @@ export class Host {
         break;
       case "createTerminal":
       case "disposeTerminal":
-        // Phase 4 extension 3: the host's terminals are read-only
+        // The host's terminals are read-only
         // renderings of `shell`-tool executions — the plugin surface can
         // neither create nor destroy pty-backed terminals, so both
-        // commands get a clean server error instead of -32601 (plan
-        // §14.16 decision: proper error handling once terminals exist).
+        // commands get a clean server error instead of -32601
+        // (proper error handling once terminals exist).
         this.sendError(
           socketId,
           msg.id,
@@ -683,7 +680,7 @@ export class Host {
         );
         break;
       case "setClientManagedSettingsPermissions":
-        // VS Code-specific post-init notification (plan §14.7): the
+        // VS Code-specific post-init notification: the
         // permissions VS Code manages in its own settings UI. AHP 1.0.0
         // has no counterpart — accept deliberately (parse + log), never
         // error; the connection stays up.
@@ -943,7 +940,7 @@ export class Host {
     const created = await this.opts.facade.createSession({
       id: passID,
       model,
-      // Durability (plan §14.13.1): a minted-id default backend carries
+      // Durability: a minted-id default backend carries
       // the client-chosen session channel in its opencode metadata —
       // after a restart the session resurfaces under the ORIGINAL channel
       // instead of its opencode id (a "ses" suffix IS the opencode id and
@@ -956,7 +953,7 @@ export class Host {
     // flight. Remap: drop the interim record (root/sessionRemoved) and
     // re-register under the client-chosen channel below.
     //
-    // Marker interaction (plan §14.13.1): with the channel marker, the
+    // Marker interaction: with the channel marker, the
     // interim external registration lands under the MARKED channel (the
     // client's own), so `interim.channel !== channel` is false and the
     // remap is skipped — the re-registration below then re-announces the
@@ -1006,7 +1003,7 @@ export class Host {
     const defaultChat = this.newChatRuntime(rec.defaultChatURI, created.sessionID, "Chat 1", now);
     this.bindChat(rec, defaultChat);
 
-    // Phase 4 extension 1: a createSession `activeClient` seeds the
+    // A createSession `activeClient` seeds the
     // session's tools — register them with opencode now.
     if (activeClients.length > 0) void this.syncClientToolsToOpencode();
 
@@ -1020,7 +1017,7 @@ export class Host {
       channel,
       action: { type: ActionType.SessionDefaultChatChanged, defaultChat: rec.defaultChatURI },
     });
-    // Phase 2: advertise the changeset catalogues (session channel: the
+    // Advertise the changeset catalogues (session channel: the
     // session-wide changeset; chat channel: uncommitted + session + the
     // per-turn template).
     if (this.opts.changesets) {
@@ -1049,10 +1046,10 @@ export class Host {
     this.sendFrame(socketId, { jsonrpc: "2.0", id: msg.id ?? null, result: null });
   }
 
-  // ── Phase 4 extension 2: multi-chat ────────────────────────────────────
+  // ── multi-chat ────────────────────────────────────
 
   /**
-   * Fresh per-chat runtime (plan §14.13): one AHP chat = one opencode
+   * Fresh per-chat runtime: one AHP chat = one opencode
    * session, with its own chat-state store and all the per-turn tracking
    * the event pump joins opencode events to.
    */
@@ -1085,8 +1082,7 @@ export class Host {
    * changesets (whose owner is the chat channel) subscribable. The
    * default chat's suffix IS its opencode id, added by the
    * registration paths; a peer chat's opencode id gets no registry
-   * entry (it has no subscribable session channel of its own — plan
-   * §14.13).
+   * entry (it has no subscribable session channel of its own).
    */
   private bindChat(rec: SessionRecord, chat: ChatRuntime): void {
     rec.chats.set(chat.uri, chat);
@@ -1103,7 +1099,7 @@ export class Host {
    * drop every binding.
    */
   private removeChat(rec: SessionRecord, chat: ChatRuntime, toolError = "chat removed before the client completed the tool call"): void {
-    // Phase 4 extension 3: the chat's terminal channels go with it
+    // The chat's terminal channels go with it
     // (running commands get a final `terminal/exited` first).
     this.teardownTerminalsForChat(chat);
     for (const uri of chat.changesets.keys()) {
@@ -1127,7 +1123,7 @@ export class Host {
 
   /**
    * `createChat` (AHP 1.0.0 chat command): create a new chat in an
-   * existing session. The 1:1 mapping (plan §14.13): mint a fresh
+   * existing session. The 1:1 mapping: mint a fresh
    * opencode session (same provider/model resolution as `createSession`)
    * and bind it to the client-chosen chat URI. Result: `null` (the
    * client waits for `session/chatAdded` on the session channel, and
@@ -1187,7 +1183,7 @@ export class Host {
     const now = new Date().toISOString();
     let created;
     try {
-      // Plan §14.13.1: write the chat-binding marker atomically at
+      // Write the chat-binding marker atomically at
       // create — it is what re-attaches this backend to this session's
       // chat catalog after an opencode/plugin restart (opencode session
       // metadata is the only durable surface a plugin has).
@@ -1378,8 +1374,8 @@ export class Host {
    * config schema. VS Code calls it every time the new-session composer
    * opens and STRICTLY again before the first send of a new session
    * (`_sendNewSessionRequest`), so an unimplemented host makes every
-   * fresh session unstartable ("unknown method: resolveSessionConfig",
-   * plan §14.18). opencode collects no session-creation configuration —
+   * fresh session unstartable ("unknown method: resolveSessionConfig").
+   * opencode collects no session-creation configuration —
    * agent/model choice rides session-state customizations and the
    * per-turn message — so the honest answer is an empty schema with
    * empty values. `provider` / `workingDirectory` / `config` are
@@ -1406,11 +1402,11 @@ export class Host {
     this.sendFrame(socketId, { jsonrpc: "2.0", id: msg.id ?? null, result });
   }
 
-  // ── client-dispatchable actions (Phase 1) ──────────────────────────────
+  // ── client-dispatchable actions ──────────────────────────────
 
   /**
    * `dispatchAction` is a notification — the response is the `action`
-   * notification stream itself. Phase 1 routes the client-dispatchable
+   * notification stream itself. The host routes the client-dispatchable
    * actions VS Code sends; everything else is acknowledged with a
    * rejection on that stream.
    */
@@ -1454,7 +1450,7 @@ export class Host {
       return;
     }
     if (kind === "terminal") {
-      // Phase 4 extension 3: the synthetic terminals are read-only
+      // The synthetic terminals are read-only
       // renderings of shell-tool calls — every client-dispatchable
       // action (`input`, `resized`, `claimed`, `titleChanged`,
       // `cleared`) has no pty to act on, so each gets an explicit
@@ -1488,7 +1484,7 @@ export class Host {
       this.echo(channel, stateAction, origin, `no such chat: ${channel}`);
       return;
     }
-    // Chat actions run against the owning chat runtime (plan §14.13);
+    // Chat actions run against the owning chat runtime;
     // a chat action on a session channel is rejected (a session no
     // longer identifies a single chat once multi-chat is on).
     const chat = rec.chats.get(channel);
@@ -1546,7 +1542,7 @@ export class Host {
         this.echo(channel, stateAction, origin);
         return;
       default:
-        this.echo(channel, stateAction, origin, `unsupported action (Phase 1): ${String(stateAction.type)}`);
+        this.echo(channel, stateAction, origin, `unsupported action: ${String(stateAction.type)}`);
     }
   }
 
@@ -1629,7 +1625,7 @@ export class Host {
     }
 
     // Apply the message's model/agent selection to THIS chat's opencode
-    // session before the prompt (per-chat isolation, plan §14.13).
+    // session before the prompt (per-chat isolation).
     const selectionError = await this.applyMessageSelection(chat, message);
     if (selectionError !== null) {
       this.echo(chatURI, action, origin, `failed to apply model/agent selection: ${selectionError}`);
@@ -1739,7 +1735,7 @@ export class Host {
     chat.toolForPermission.delete(permissionID);
   }
 
-  // ── Phase 4 extension 1: client-executed tool calls ───────────────────
+  // ── client-executed tool calls ───────────────────
 
   /**
    * `chat/toolCallComplete` (client-dispatchable): the owning client
@@ -1979,7 +1975,7 @@ export class Host {
       action: { type: ActionType.SessionActiveClientSet, activeClient: normalized },
       origin,
     });
-    // Phase 4 extension 1: the session's tool contribution changed —
+    // The session's tool contribution changed —
     // re-sync the location-global opencode tool union.
     void this.syncClientToolsToOpencode();
   }
@@ -1996,7 +1992,7 @@ export class Host {
       return;
     }
     this.echo(rec.channel, action, origin);
-    // Phase 4 extension 1: the session's tool contribution shrank —
+    // The session's tool contribution shrank —
     // re-sync the location-global opencode tool union.
     void this.syncClientToolsToOpencode();
   }
@@ -2005,7 +2001,7 @@ export class Host {
 
   private async handleEvent(ev: FacadeEvent): Promise<void> {
     if (ev.type === "session.created") {
-      // Every live chat has its own opencode session (plan §14.13), so a
+      // Every live chat has its own opencode session, so a
       // created event for an already-bound id is ours (a createChat
       // backend) and never an external session.
       if (this.sessions.has(ev.sessionID) || this.byOpencode.has(ev.sessionID)) return;
@@ -2024,8 +2020,8 @@ export class Host {
     }
 
     // The opencode session id joins to (record, chat) — every chat has
-    // its own backend session, and per-turn state lives on the chat
-    // (plan §14.13). Only session.created registers sessions.
+    // its own backend session, and per-turn state lives on the chat.
+    // Only session.created registers sessions.
     const binding = this.byOpencode.get(ev.sessionID);
     if (binding === undefined) return;
     const { rec, chat } = binding;
@@ -2156,7 +2152,7 @@ export class Host {
           return;
         }
         chat.toolName.set(ev.id, ev.name);
-        // Phase 4 extension 1: when the session's active clients provide
+        // When the session's active clients provide
         // this tool, the call is client-executed — the client
         // `contributor` must be established at start (the official
         // reducer ignores a late one), and the call is tracked for the
@@ -2183,16 +2179,16 @@ export class Host {
       }
       case "tool.input.ended": {
         chat.toolInput.set(ev.id, ev.text);
-        // Phase 2: for file-mutating tools, capture the pre-edit file
+        // For file-mutating tools, capture the pre-edit file
         // content now (the event fires before execution — the last safe
         // point). Awaited in the sequential pump so the capture is
         // complete before `execution.*` can end the turn.
         if (this.opts.changesets) await this.captureTurnBefore(chat, ev.id, ev.text);
-        // Phase 4 extension 3: a foreground `shell`-tool call opens its
+        // A foreground `shell`-tool call opens its
         // synthetic terminal channel here — the command line is only
-        // known at input.ended (plan §14.16 option (c)).
+        // known at input.ended.
         this.openTerminalForToolCall(rec, chat, ev.id, ev.text);
-        // Phase 4 extension 1: a client-executed call clears its
+        // A client-executed call clears its
         // confirmation gate here (no opencode permission can fire for
         // it) — ready straight to running, then surface the execution
         // request so the owning client picks up the work.
@@ -2223,7 +2219,7 @@ export class Host {
         this.ensureToolReady(chat, ev.id, false);
         return;
       case "tool.success": {
-        // Phase 4 extension 3: the synthetic terminal completes on the
+        // The synthetic terminal completes on the
         // tool's terminal event (before the turn guard — a command that
         // finishes after its turn was torn down still exits its
         // terminal; no-op when the call never opened one).
@@ -2303,7 +2299,7 @@ export class Host {
         return;
       case "permission.asked":
         // Only tool-sourced permissions map to a tool confirmation;
-        // anything else has no AHP counterpart in this MVP (gap).
+        // anything else has no AHP counterpart (gap).
         if (ev.source === undefined) {
           this.log(`ignoring non-tool permission.asked ${ev.id} (action: ${ev.action})`);
           return;
@@ -2381,7 +2377,7 @@ export class Host {
    * queued prompt was already sent with `delivery: "queue"` — opencode
    * starts it automatically; this only updates the AHP state).
    *
-   * Phase 2: then refresh the session's changesets — the turn's captured
+   * Then refresh the session's changesets — the turn's captured
    * "after" content is read from disk here, and the uncommitted/session/
    * turn changesets recompute (async: awaits the facade).
    */
@@ -2408,9 +2404,9 @@ export class Host {
       // A queued prompt from outside AHP (e.g. the TUI).
       this.startTurn(chat, userMessage(chat.lastInbox.text));
     }
-    // Phase 4 extension 3: the ended turn's command terminals leave the
+    // The ended turn's command terminals leave the
     // root catalog now (retention — their state stays subscribable until
-    // the chat/record is removed; plan §14.16). Runs after the possible
+    // the chat/record is removed). Runs after the possible
     // chained startTurn so the published list is the post-handoff one.
     if (this.opts.terminals && endedTurnId !== null && this.terminals.size > 0) {
       this.refreshTerminals();
@@ -2420,7 +2416,7 @@ export class Host {
     }
   }
 
-  // ── Phase 4 extension 3: synthetic shell-command terminals (plan §14.16 option (c)) ──
+  // ── synthetic shell-command terminals ───────────────────────────────────
 
   /**
    * Open the synthetic `ahp-terminal:` channel for a foreground
@@ -2535,7 +2531,7 @@ export class Host {
    * replacement). Catalog membership is turn-scoped: a terminal is
    * listed while its turn is still the owning chat's active turn —
    * finished commands keep their (final) lifecycle row until the turn
-   * ends, then the row drops (host-controlled retention, plan §14.16).
+   * ends, then the row drops (host-controlled retention).
    * No-op when the serialized list is unchanged.
    */
   private refreshTerminals(): void {
@@ -2572,7 +2568,7 @@ export class Host {
     if (changed) this.refreshTerminals();
   }
 
-  // ── Phase 2: changesets ────────────────────────────────────────────────
+  // ── changesets ────────────────────────────────────────────────
 
   /**
    * Capture the pre-edit content of a file-mutating tool's target file for
@@ -2624,7 +2620,7 @@ export class Host {
   }
 
   /**
-   * The changeset store's owner (plan §14.13): session-kind changesets
+   * The changeset store's owner: session-kind changesets
    * live on the record (the session channel owns them); uncommitted/turn
    * changesets live on the owning chat. Null when the owner is gone
    * (a disposed chat's changesets are un-subscribable).
@@ -2688,8 +2684,7 @@ export class Host {
     try {
       if (parsed.kind === "turn") {
         // The turn's snapshots live on the owning chat; the content refs
-        // carry its opencode session id (the byOpencode join key, plan
-        // §14.13).
+        // carry its opencode session id (the byOpencode join key).
         const chat = rec.chats.get(parsed.ownerUri);
         if (chat === undefined) return;
         files = buildTurnChangesetFiles({
@@ -3040,7 +3035,7 @@ export class Host {
     chat.clientToolCalls.delete(toolCallId);
   }
 
-  // ── Phase 4 extension 1: client-tool helpers ───────────────────────────
+  // ── client-tool helpers ─────────────────────────────────────────────────
 
   /**
    * The session's active client providing `toolName` (the tool-call
@@ -3055,8 +3050,8 @@ export class Host {
    * Re-sync the location-global opencode tool registry with the
    * cross-session union of every live session's active-client tools
    * (first-registered wins per name). Location-global by design —
-   * opencode's tool state is per-location, not per-session (plan
-   * §14.12): the `execute` bridge re-checks per-session ownership at
+   * opencode's tool state is per-location, not per-session: the
+   * `execute` bridge re-checks per-session ownership at
    * runtime.
    */
   private async syncClientToolsToOpencode(): Promise<void> {
@@ -3109,7 +3104,7 @@ export class Host {
    * client-tool invocation to the owning AHP client and wait for its
    * result.
    *
-   * Per-session scoping (plan §14.12): the tool is visible location-
+   * Per-session scoping: the tool is visible location-
    * globally, but execution only resolves when *this* session is an
    * AHP session with an active client providing the tool — otherwise
    * the opencode tool fails (a `Tool.Error` the model sees), so e.g. a
@@ -3122,7 +3117,7 @@ export class Host {
     signal: AbortSignal;
   }): Promise<FacadeClientToolResult> {
     // The opencode session id joins to the (record, chat) that owns it —
-    // every chat has its own backend session (plan §14.13).
+    // every chat has its own backend session.
     const binding = this.byOpencode.get(input.sessionID);
     if (binding === undefined) {
       return Promise.resolve({
@@ -3193,7 +3188,7 @@ export class Host {
   /**
    * Register an opencode session the host did not create (TUI, another
    * client, or a session resurfacing after a restart).
-   * Outcomes (plan §14.13 / §14.13.1):
+   * Outcomes:
    *
    *  - the opencode id already backs a chat of a live record → skip
    *    (undefined); `listSessions` must not surface peer-chat backends
@@ -3250,7 +3245,7 @@ export class Host {
 
   /**
    * Re-attach a marked peer backend to its owner session's chat catalog
-   * after a restart (plan §14.13.1). The owner store is LIVE (unlike a
+   * after a restart. The owner store is LIVE (unlike a
    * fresh standalone registration), so the catalog change goes through
    * `publish` (store + any existing subscribers + the root diff), not a
    * direct apply. The chat title is re-derived (`Chat <n>`) — a
@@ -3296,7 +3291,7 @@ export class Host {
   }
 
   /**
-   * Orphan fallback for queued peer-chat bindings (plan §14.13.1): the
+   * Orphan fallback for queued peer-chat bindings: the
    * owner never registered and is gone from opencode (e.g. deleted in
    * the TUI while the plugin was down). Drop the queue and register each
    * peer as a standalone AHP session. A failed owner lookup keeps the
@@ -3349,7 +3344,7 @@ export class Host {
   /**
    * Register an opencode session as a single-chat AHP session (its
    * default chat reuses the opencode id). The session channel defaults
-   * to the opencode id; the channel-marker path (plan §14.13.1) passes
+   * to the opencode id; the channel-marker path passes
    * the ORIGINAL client-chosen channel instead — the registry then
    * resolves both suffixes (mirroring `handleCreateSession`). Applied
    * directly to the fresh stores (no seq, no actions) — the
@@ -3392,7 +3387,7 @@ export class Host {
     sessionStore.apply({ type: ActionType.SessionReady });
     sessionStore.apply({ type: ActionType.SessionChatAdded, summary: chatSummaryOf(defaultChat.chatStore.state) });
     sessionStore.apply({ type: ActionType.SessionDefaultChatChanged, defaultChat: rec.defaultChatURI });
-    // Phase 2: advertise the changeset catalogues directly on the fresh
+    // Advertise the changeset catalogues directly on the fresh
     // stores (registration is server-side bookkeeping — no seq, no actions).
     if (this.opts.changesets) {
       sessionStore.apply({ type: ActionType.SessionChangesetsChanged, changesets: sessionChangesetCatalog(recChannel) });
@@ -3401,7 +3396,7 @@ export class Host {
         changesets: chatChangesetCatalog(rec.defaultChatURI, recChannel),
       });
     }
-    // Durability (plan §14.13.1): peers whose marker points at this
+    // Durability: peers whose marker points at this
     // session may have been listed earlier in the same `listSessions`
     // pass — re-attach them before the root announcement so the
     // sessionAdded summary carries the full chat catalog.
@@ -3427,14 +3422,14 @@ export class Host {
         .removeSession(chat.sessionID)
         .catch((err) => this.log(`failed to remove the peer chat's opencode session ${chat.sessionID}: ${errorMessage(err)}`));
     }
-    // Phase 2: every live changeset URI is about to become un-subscribable
+    // Every live changeset URI is about to become un-subscribable
     // — dispatch `changeset/cleared` (protocol case 2) before the teardown
     // so subscribers release their references.
     for (const uri of rec.sessionChangesets.keys()) {
       this.publish({ channel: uri, action: { type: ActionType.ChangesetCleared } });
     }
     rec.sessionChangesets.clear();
-    // Per-chat teardown (Phase 4 extension 2): live chat changesets
+    // Per-chat teardown: live chat changesets
     // (`changeset/cleared`), in-flight client-tool executions failed
     // (the waiters must not leak), and every binding dropped.
     let failedTools = false;
@@ -3452,7 +3447,7 @@ export class Host {
       action: { type: ActionType.RootActiveSessionsChanged, activeSessions: this.sessions.size },
     });
     this.notifyRoot("root/sessionRemoved", { channel: ROOT_CHANNEL, session: rec.channel });
-    // Phase 4 extension 1: re-sync the opencode tool union when this
+    // Re-sync the opencode tool union when this
     // session's clients' tools leave the cross-session set (or any
     // in-flight call was failed — the facade union is unchanged, but the
     // session's execute gate must not linger).
@@ -3476,7 +3471,7 @@ export class Host {
       if (!this.opts.changesets) return null;
       const parsed = parseChangesetChannel(uri);
       if (parsed === null) return null;
-      // The owner is the session/chat channel (owner-aware, plan §14.13).
+      // The owner is the session/chat channel (owner-aware).
       const rec = this.byChannel.get(parsed.ownerUri);
       if (rec === undefined) return null;
       const store = this.changesetStore(rec, uri);
@@ -3489,7 +3484,7 @@ export class Host {
       return { resource: uri, state: store.state, fromSeq: this.seq.seq };
     }
     if (kind === "terminal") {
-      // Phase 4 extension 3: the synthetic terminal's official-reducer
+      // The synthetic terminal's official-reducer
       // state; null once the record is torn down (the chat is gone).
       const t = this.terminals.get(uri);
       if (t === undefined) return null;
@@ -3522,7 +3517,7 @@ export class Host {
   private sessionSummary(rec: SessionRecord): SessionSummary {
     const s = rec.sessionStore.state;
     // Authoritative chat order: default first, then insertion order
-    // (the default chat is bound first — plan §14.13).
+    // (the default chat is bound first).
     const chats = [...rec.chats.values()].map((c) => chatSummaryOf(c.chatStore.state));
     let modifiedAt = rec.modifiedAt;
     for (const c of rec.chats.values()) {
@@ -3561,7 +3556,7 @@ export class Host {
         this.state.apply(draft.action as RootAction);
       } else if (kind === "changeset") {
         // Changeset stores are owner-keyed (session-kind on the record,
-        // chat-kind on the chat — plan §14.13). Non-creating: a publish
+        // chat-kind on the chat). Non-creating: a publish
         // targets a store someone created (subscribe/refresh); a missing
         // owner means the changeset is already torn down.
         const parsed = parseChangesetChannel(draft.channel);
@@ -3569,7 +3564,7 @@ export class Host {
         const store = rec !== undefined ? this.changesetStoreOf(rec, draft.channel) : undefined;
         if (store !== undefined) store.apply(draft.action as ChangesetAction);
       } else if (kind === "terminal") {
-        // Phase 4 extension 3: synthetic shell-command terminals.
+        // Synthetic shell-command terminals.
         // Non-creating: a publish targets a record that exists (opened at
         // `tool.input.ended`); a missing record means the channel was
         // already torn down — the notification still goes out.
@@ -3704,8 +3699,8 @@ function normalizeActiveClient(ac: Record<string, unknown>): SessionActiveClient
 }
 
 /**
- * Wire-validate a client-dispatched `toolCallComplete` result (plan
- * §14.12): `success` is the one field the host depends on (it decides
+ * Wire-validate a client-dispatched `toolCallComplete` result:
+ * `success` is the one field the host depends on (it decides
  * the facade result + the Tool.Error path); the rest is stored
  * verbatim for the AHP state mirror.
  */
@@ -3762,7 +3757,7 @@ function clientResultToFacade(result: ToolCallResult): FacadeClientToolResult {
 
 /**
  * Map opencode tool result content blocks to AHP `ToolResultContent`
- * (only text blocks are representable in this MVP; file/patch text is
+ * (only text blocks are representable; file/patch text is
  * carried as text).
  */
 function mapToolResultContent(content: readonly { type: string; text?: string }[]): ToolResultContent[] {

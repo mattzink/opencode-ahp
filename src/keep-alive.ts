@@ -1,5 +1,5 @@
 /**
- * Location keep-alive (plan §15).
+ * Location keep-alive.
  *
  * opencode v2 unloads idle locations after `experimental.location_idle_timeout`
  * (default 60 minutes). `LocationActivity` (packages/core/src/location-activity.ts)
@@ -11,14 +11,14 @@
  * any user config (`location_idle_timeout: false` is no longer required).
  *
  * The anchor session is visible in the opencode TUI session list (the plugin
- * surface cannot archive it — plan §15); the AHP host filters it out by its
+ * surface cannot archive it); the AHP host filters it out by its
  * deterministic ID from every client-facing surface.
  *
  * Cold boot is an architectural limit, not a keep-alive problem: plugins load
  * per location (`Node.makeLocationNode`) and cannot run before the location
  * boots, and no config boots a location at server start. The anchor session's
  * first touch therefore only helps once the location is up — the one-time boot
- * step stays (README "Remote access").
+ * step stays (open the project once, or a headless location-boot request).
  *
  * Pure module: session access and the timer are dependency-injected, so this
  * is unit-tested without an OpenCode runtime (house pattern).

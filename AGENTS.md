@@ -11,8 +11,9 @@ strict-pinned — the installed dist is the wire ground truth). House pattern
 at `./src/index.ts` and opencode (Bun runtime) loads the TS source directly;
 pure, dependency-injected modules (`host.ts`, `bridge.ts`, `transport.ts`,
 `keep-alive.ts`) unit-tested with Vitest without an opencode runtime.
-`plan.md` is the canonical design doc and wire-finding log — the source of
-truth for *why* the code is shaped the way it is.
+`docs/design.md` is the canonical design doc — the source of truth for
+*why* the code is shaped the way it is (future work: `docs/futures.md`;
+testing: `docs/testing.md`).
 
 ## Commands
 
@@ -29,8 +30,8 @@ truth for *why* the code is shaped the way it is.
 - **Tests**: `pnpm test` (Vitest, `vitest run` — all suites in
   `src/test/`). There is no build step and no E2E suite in CI; live
   verification is done manually against the LAN test server via
-  `scripts/ahp-client.mjs` (handshake/probe) and `scripts/ahp-phase1.mjs`
-  (full Phase 1 lifecycle).
+  `scripts/ahp-client.mjs` (handshake/probe) and
+  `scripts/ahp-turn-lifecycle.mjs` (full turn lifecycle).
 - **Publishing**: CI only — push to GitHub and the trusted-publisher
   workflow (`.github/workflows/publish.yml`) publishes
   `0.1.<GITHUB_RUN_NUMBER>` (gaps in run numbers are expected) and creates
@@ -62,11 +63,11 @@ truth for *why* the code is shaped the way it is.
 - **AHP wire contract**: protocol behavior is defined by AHP 1.0.0 — when in
   doubt about a method/field, check `node_modules/@microsoft/agent-host-protocol`
   dist and the VS Code 1.145.2 AHP client sources (`/tmp/opencode/vscode-*.ts`),
-  and record findings in `plan.md` §14. The host's `serverInfo.version` is
+  and record findings in `docs/design.md`. The host's `serverInfo.version` is
   read from `package.json` at runtime (`pluginVersion()` in `src/index.ts`).
 - **opencode v2 is per-location**: plugins load per location (a location
   boots on first use and is idle-evicted after 60 min by default). The
-  keep-alive module (`src/keep-alive.ts`, plan §15) is what holds the
+  keep-alive module (`src/keep-alive.ts`; design §15.3) is what holds the
   location loaded; its anchor session `ses_ahp_keepalive` is deliberately
   filtered from every AHP surface — keep it that way if the anchor changes.
 - **Typecheck gotcha**: when piping `tsc` output (e.g. through `head`), use
@@ -102,16 +103,18 @@ truth for *why* the code is shaped the way it is.
 - **Plugin interface only**: solutions must live inside the existing opencode
   plugin `setup(ctx)` interface — no separate processes (a sidecar `opencode
   acp` was explicitly rejected), no upstream opencode changes, no standalone
-  bin (plan §12 D4/D5).
-- **MVP transport is plain `ws://` + token on the local LAN** (D3); no TLS or
-  off-LAN routing in this phase.
+  bin (futures §5).
+- **Transport is token-authenticated `ws://` (local LAN) or native `wss://`
+  (TLS-terminated, same listener) for off-LAN** (D3); anything beyond native
+  TLS (tunnels, proxies) is operational, not architectural.
 - **AHP stays strict-pinned at 1.0.0.**
 
 ### Documentation updates
 
 - Behavior, architecture, or wire-contract changes MUST update
-  [`plan.md`](plan.md) (findings go in §14, new topics get a new §).
-- User-facing behavior (install, config, options, runbook) MUST update
+  [`docs/design.md`](docs/design.md) (findings go in the relevant
+  section, new topics get a new §).
+- User-facing behavior (install, config, options) MUST update
   [`README.md`](README.md) and/or `options.example.jsonc`.
 
 ### Test execution
@@ -120,7 +123,7 @@ truth for *why* the code is shaped the way it is.
   the task complete. Tests MUST pass — debug and fix root causes, never
   complete a task with failing tests.
 - Changes that alter live behavior (transport, host, keep-alive) should be
-  verified against the LAN test server with `scripts/ahp-phase1.mjs` before
+  verified against the LAN test server with `scripts/ahp-turn-lifecycle.mjs` before
   asking the user to publish.
 
 ### API validation

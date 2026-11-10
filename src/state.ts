@@ -1,14 +1,13 @@
 /**
  * Channel state stores, all maintained by the official reducers from
  * @microsoft/agent-host-protocol — the host never hand-rolls state
- * transitions (plan §6.1 state.ts: "state computed by the official
- * reducers").
+ * transitions (state is computed by the official reducers).
  *
- *  - root channel: `rootReducer` (Phase 0);
- *  - session channels: `sessionReducer` (Phase 1);
- *  - chat channels: `chatReducer` (Phase 1);
- *  - changeset channels: `changesetReducer` (Phase 2);
- *  - terminal channels: `terminalReducer` (Phase 4 extension 3).
+ *  - root channel: `rootReducer`;
+ *  - session channels: `sessionReducer`;
+ *  - chat channels: `chatReducer`;
+ *  - changeset channels: `changesetReducer`;
+ *  - terminal channels: `terminalReducer`.
  */
 import {
   chatReducer,

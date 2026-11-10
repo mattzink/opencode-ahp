@@ -1,6 +1,6 @@
 #!/usr/bin/env node
 /**
- * opencode-ahp Phase 1 live verification (plan §11).
+ * opencode-ahp live verification: full session + turn lifecycle.
  *
  * Drives the full AHP 1.0.0 surface that the VS Code Agents window needs:
  *   1. initialize (root subscription)
@@ -15,16 +15,16 @@
  * Dependency-free: Node ≥ 22 global WebSocket.
  *
  * Usage:
- *   node scripts/ahp-phase1.mjs --token <token> \
+ *   node scripts/ahp-turn-lifecycle.mjs --token <token> \
  *     [--base http://127.0.0.1:8767] [--path /ahp] \
- *     [--channel ahp-session:/lan-phase1] [--provider gpuz] \
+ *     [--channel ahp-session:/lan-turn] [--provider gpuz] \
  *     [--prompt "Reply with exactly: ok"] [--timeout-ms 90000]
  *
  * Exit codes: 0 success · 1 protocol/verification failure · 2 connection
  */
 import { randomBytes } from "node:crypto";
 
-const TAG = "[ahp-phase1]";
+const TAG = "[ahp-turn-lifecycle]";
 const fail = (code, msg) => {
   console.error(`${TAG} FAIL: ${msg}`);
   process.exit(code);
@@ -40,7 +40,7 @@ const opts = {
   base: (arg("--base", "http://127.0.0.1:8767") ?? "").replace(/\/$/, ""),
   path: arg("--path", "/ahp"),
   token: arg("--token", null),
-  channel: arg("--channel", "ahp-session:/lan-phase1"),
+  channel: arg("--channel", "ahp-session:/lan-turn"),
   provider: arg("--provider", "gpuz"),
   prompt: arg("--prompt", "Reply with exactly: ok"),
   timeoutMs: Number(arg("--timeout-ms", "90000")),
@@ -144,7 +144,7 @@ try {
   console.log(`${TAG} connected ${wsUrl.replace(opts.token, "***")}`);
 
   // 1. initialize
-  const clientId = "phase1-" + randomBytes(4).toString("hex");
+  const clientId = "turn-" + randomBytes(4).toString("hex");
   const init = await request("initialize", {
     channel: "ahp-root://",
     clientId,
@@ -238,6 +238,6 @@ if (failures > 0) {
   console.error(`${TAG} ${failures} check(s) failed`);
   process.exit(1);
 }
-console.log(`${TAG} OK: Phase 1 live verification passed`);
+console.log(`${TAG} OK: session + turn lifecycle verification passed`);
 ws.close(1000);
 process.exit(0);

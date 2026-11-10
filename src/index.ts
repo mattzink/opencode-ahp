@@ -1,12 +1,12 @@
 /**
  * opencode-ahp — OpenCode V2 plugin: hosts the **Agent Host Protocol
  * (AHP) 1.0.0** in-process so opencode appears as a native agent in the
- * VS Code Agents window (plan §8.1).
+ * VS Code Agents window.
  *
- * This is the only module that touches the plugin `ctx` (plan §7
- * pure-module principle). Everything else — options, transport,
- * handshake, channels, seq, state, bridge, host — is pure or
- * dependency-injected and unit-tested without an OpenCode runtime.
+ * This is the only module that touches the plugin `ctx` — everything
+ * else (options, transport, handshake, channels, seq, state, bridge,
+ * host) is pure or dependency-injected and unit-tested without an
+ * OpenCode runtime.
  *
  * Lifecycle:
  *   1. resolve options (ctx.options ▸ options.jsonc sibling ▸ built-ins;
@@ -14,12 +14,12 @@
  *      `enabled: false` → the plugin is fully inert (no listener)
  *   2. token: explicit option, else persisted in ctx.storage (generated
  *      once, printed once to the server log)
- *   3. keep-alive (plan §15): get-or-create the anchor session and start
+ *   3. keep-alive: get-or-create the anchor session and start
  *      touching it periodically so the location survives the idle timeout
  *      without any user config
  *   4. wire the Host (JSON-RPC router) to the transport (Bun.serve)
  *   5. start the opencode event pump (maps `ctx.event.subscribe` into
- *      the host's AHP action stream — plan §6.1/§11)
+ *      the host's AHP action stream)
  *   6. return cleanup that stops the keep-alive, the pump, and the listener
  *
  * Every failure path logs and stays up: a bad client connection or a
@@ -66,9 +66,9 @@ import {
 } from "./bridge.js";
 import { normalizedName } from "./client-tools.js";
 /**
- * The opencode tool surface for client-provided tools (Phase 4
- * extension 1, plan §14.12). `ToolError` is the schema `Error` class
- * (thrown from the `execute` bridge); `ToolInfo` is the promise-flavored
+ * The opencode tool surface for client-provided tools. `ToolError` is
+ * the schema `Error` class (thrown from the `execute` bridge); `ToolInfo`
+ * is the promise-flavored
  * tool registration; `ToolContext` carries the tool-call context
  * (sessionID, the tool-call `id`, the abort `signal`).
  */
@@ -119,7 +119,7 @@ function generateToken(): string {
  * Token from options when set; otherwise the persisted one from plugin
  * storage, generated (and printed once) on first start. Persisting in
  * `ctx.storage` means restarts reuse the same token — a printed token
- * must not go stale on `opencode service restart` (plan §8.1).
+ * must not go stale on `opencode service restart`.
  */
 async function ensureToken(ctx: Context): Promise<string> {
   const existing = await ctx.storage.get(TOKEN_STORAGE_KEY);
@@ -152,7 +152,7 @@ function mapSessionInfo(info: SessionInfo): FacadeSession {
     ...(info.model !== undefined ? { model: modelRefOf(info) } : {}),
     // SessionInfo.time carries `archived` only while archived.
     ...(info.time.archived !== undefined ? { archived: true } : {}),
-    // Durable, core-opaque metadata (plan §14.13.1): the host reads its
+    // Durable, core-opaque metadata: the host reads its
     // `opencode-ahp` chat-binding marker from it on external registration.
     ...(isRecord(info.metadata) ? { metadata: info.metadata as Record<string, unknown> } : {}),
     time: { created: info.time.created, updated: info.time.updated },
@@ -166,7 +166,7 @@ function isHiddenSessionEvent(event: unknown, hiddenSessionID: string): boolean 
   return isRecord(data) && data["sessionID"] === hiddenSessionID;
 }
 
-// ── Phase 2: changeset git helpers (plan §14.10) ──────────────────────────
+// ── changeset git helpers ──────────────────────────
 //
 // The plugin `ctx` has no "file content at HEAD" or "discard one file"
 // surface (`ctx.vcs` only diffs), so the facade shells out to `git` in the
@@ -205,7 +205,7 @@ function isEnoent(err: unknown): boolean {
 }
 
 /**
- * The narrow opencode surface the bridge needs (plan §3.2, §14.7, §11).
+ * The narrow opencode surface the bridge needs.
  *
  * The catalog and agents are re-read on every call (the host snapshots
  * lazily on initialize/subscribe/reconnect, not at setup) from the
@@ -216,17 +216,17 @@ function isEnoent(err: unknown): boolean {
  * registry reads reflect every registration so far — including during
  * plugin setup — so no setup-time race.
  *
- * Phase 1 adds the session surface: create/list/get, prompt with
- * `delivery` (steer|queue), switchModel/switchAgent, interrupt, update
- * (rename), permission reply, and the mapped event stream.
+ * The session surface covers create/list/get, prompt with `delivery`
+ * (steer|queue), switchModel/switchAgent, interrupt, update (rename),
+ * permission reply, and the mapped event stream.
  *
- * `hiddenSessionID` (the keep-alive anchor, plan §15) is filtered from all
+ * `hiddenSessionID` (the keep-alive anchor) is filtered from all
  * three session surfaces so the AHP client never sees it: `list`/snapshots
  * (by ID), `get` (null = not found), and the event stream (by
  * `data.sessionID` — covers `session.created` and anything a future bridge
  * version may map).
  *
- * `hostRef` (Phase 4 extension 1, plan §14.12): the client-tool
+ * `hostRef`: the client-tool
  * `execute` bridge needs the host, but the facade is constructed as part
  * of the host's own options — a mutable holder assigned right after
  * `new Host(...)` returns (the `listener` closure pattern).
@@ -236,7 +236,7 @@ type HostRef = { current: Host | null };
 function implementFacade(ctx: Context, hiddenSessionID: string | null, hostRef: HostRef): OpencodeFacade {
   const locationDir = ctx.location.directory;
 
-  // Phase 4 extension 1: the cross-session client-tool set (plan §14.12).
+  // The cross-session client-tool set (client-provided tools).
   // The single `ctx.tool.transform` registration is applied on every
   // registry rebuild (opencode rebuilds from scratch, re-running all
   // transforms over a fresh base — verified in core `State.create`), so
@@ -304,7 +304,7 @@ function implementFacade(ctx: Context, hiddenSessionID: string | null, hostRef: 
         hidden: a.hidden,
       }));
     },
-    // ── Phase 1: sessions ────────────────────────────────────────────────
+    // ── sessions ────────────────────────────────────────────────
     async createSession(input?: {
       id?: string;
       title?: string;
@@ -325,7 +325,7 @@ function implementFacade(ctx: Context, hiddenSessionID: string | null, hostRef: 
               },
             }
           : {}),
-        // Plan §14.13.1: the chat-binding marker is written atomically at
+        // The chat-binding marker is written atomically at
         // create (no read-merge — core projects MetadataUpdated as a full
         // column replacement, so a later update would clobber it). Session
         // metadata is JSON by the Session.Metadata schema; the facade keeps
@@ -397,7 +397,7 @@ function implementFacade(ctx: Context, hiddenSessionID: string | null, hostRef: 
         if (mapped !== null) yield mapped;
       }
     },
-    // ── Phase 2: changesets (plan §14.10) ────────────────────────────────
+    // ── changesets ────────────────────────────────
     async vcsDiffWorking() {
       const root = await gitRepoRoot(locationDir);
       if (root === null) return []; // not a git repo → no working diff
@@ -456,7 +456,7 @@ function implementFacade(ctx: Context, hiddenSessionID: string | null, hostRef: 
         await removeFile(absPath); // in the index but not in HEAD → delete
       }
     },
-    // ── Phase 4 extension 1: client-provided tools (plan §14.12) ───────
+    // ── client-provided tools ───────
     async syncClientTools(tools: readonly FacadeClientTool[]) {
       clientTools = [...tools];
       if (!clientToolsTransformRegistered) {
@@ -475,7 +475,7 @@ function implementFacade(ctx: Context, hiddenSessionID: string | null, hostRef: 
               name: tool.name,
               // The AHP `inputSchema` is a raw object JSON Schema —
               // opencode's `inputJsonSchema` passes it through verbatim
-              // and validates model inputs against it (plan §14.12).
+              // and validates model inputs against it.
               input: tool.inputSchema,
               description: tool.description,
               // A client tool must be a DIRECT tool: under Code Mode a
@@ -484,7 +484,7 @@ function implementFacade(ctx: Context, hiddenSessionID: string | null, hostRef: 
               // (only the outer `execute` call does), so the host could
               // never see the call to track + relay to the client.
               // `codemode: false` keeps it out of the catalog and in
-              // the direct list (plan §14.12, live finding 2026-11-08).
+              // the direct list (live finding 2026-11-08).
               options: { codemode: false },
               execute: async (_input: unknown, context: ToolContext) => {
                 const host = hostRef.current;
@@ -523,7 +523,7 @@ function implementFacade(ctx: Context, hiddenSessionID: string | null, hostRef: 
 export default Plugin.define({
   id: "opencode-ahp",
   async setup(ctx: Context) {
-    // 1. Options — resolved before anything else (plan §8.1).
+    // 1. Options — resolved before anything else.
     let opts: Options;
     try {
       opts = resolveOptions(ctx.options, readOptionsFile());
@@ -545,8 +545,8 @@ export default Plugin.define({
       return; // R2: the opencode server stays up without AHP
     }
 
-    // 3. Keep-alive (plan §15). Before the host exists, so the anchor
-    //    session's `session.created` fires before the event pump subscribesbscribes
+    // 3. Keep-alive. Before the host exists, so the anchor
+    //    session's `session.created` fires before the event pump subscribes
     //    and never reaches AHP clients (the facade filters it from the
     //    snapshot/list surfaces regardless). A deterministic session ID means
     //    reloads reuse the same session — no accumulation in the DB.
@@ -556,7 +556,7 @@ export default Plugin.define({
     let keepAlive: KeepAlive | null = null;
     if (opts.keepAlive) {
       keepAlive = new KeepAlive({
-        // Get-or-create. (Upstream gap, plan §15: `SessionUpdateInput`
+        // Get-or-create. (Upstream gap: `SessionUpdateInput`
         // advertises `archived`, but the plugin host's `session.update`
         // drops it — `packages/core/src/plugin/host.ts` forwards only
         // title/metadata/permissions, in v2.2.6 and current dev. So the
@@ -590,9 +590,9 @@ export default Plugin.define({
     // constructed (the listener's socket ids are the host's socket ids).
     let listener: Listener | null = null;
     let cleanupHost: (() => void) | null = null;
-    // Phase 4 extension 1: the host back-reference for the client-tool
-    // `execute` bridge (the facade is built from the host's options, so
-    // the reference lands one statement later — the `listener` pattern).
+    // The host back-reference for the client-tool `execute` bridge (the
+    // facade is built from the host's options, so the reference lands
+    // one statement later — the `listener` pattern).
     const hostRef: HostRef = { current: null };
     try {
       const host = new Host({
@@ -611,7 +611,7 @@ export default Plugin.define({
         log: (msg) => console.warn(`${TAG} ${msg}`),
       });
       hostRef.current = host; // the client-tool execute bridge can route now
-      // TLS material (Phase 3): read the key/cert files here so a
+      // TLS material: read the key/cert files here so a
       // missing/unreadable file fails before binding and takes the R2
       // degrade path below — the transport itself stays
       // filesystem-free (it receives the PEM contents).
@@ -639,7 +639,7 @@ export default Plugin.define({
       );
       // 5. Event pump: opencode V2 events → AHP actions (the streaming
       // text/reasoning, tool lifecycle, permissions, usage, turn
-      // terminals, steering/queue handoff — plan §11).
+      // terminals, steering/queue handoff).
       host.startEventPump();
       cleanupHost = () => host.stopEventPump();
       console.log(
@@ -657,7 +657,7 @@ export default Plugin.define({
     // 6. Cleanup: stop the keep-alive timer, stop the pump (aborts the
     //    event subscription), and stop the listener, dropping every client
     //    connection. Logged because a torn-down listener with no log line
-    //    is otherwise undiagnosable (plan §14.8).
+    //    is otherwise undiagnosable.
     return () => {
       console.log(`${TAG} location teardown — stopping the AHP host (location unloaded by opencode)`);
       keepAlive?.stop();

@@ -1,5 +1,5 @@
 /**
- * AHP transport (plan §6.1 transport.ts).
+ * AHP transport.
  *
  * Two layers:
  *
@@ -7,8 +7,8 @@
  *     policy, path routing, loopback check. Unit-tested without a runtime.
  *  2. **A thin listener** behind the `Listener` interface. The reference
  *     implementation uses `Bun.serve` (opencode v2 is Bun-based, so the
- *     in-process plugin runtime has it — verified by the Phase 0 spike,
- *     R6). If the plugin context ever forbids raw listeners, a `ws`-
+ *     in-process plugin runtime has it). If the plugin context ever
+ *     forbids raw listeners, a `ws`-
  *     package implementation drops in here with no changes to the
  *     protocol layer.
  *
@@ -71,7 +71,7 @@ export function tokenValid(expected: string, presented: string | null): boolean 
 }
 
 /**
- * Origin policy (plan R5). The token is the only credential; this only
+ * Origin policy. The token is the only credential; this only
  * filters *which* browser origins may attempt a connection. A null Origin
  * (non-browser clients: VS Code's own connection, CLI clients) always
  * passes — browser-origin filtering is the real attack surface.
@@ -183,7 +183,7 @@ const textDecoder = new TextDecoder();
 /**
  * Start the AHP listener. Throws before binding when a non-loopback
  * address is given without a token (R4) or when the runtime lacks
- * `Bun.serve` (R6 — the fallback implementation would be added here).
+ * `Bun.serve` (the fallback implementation would be added here).
  */
 export function createListener(opts: ListenerOptions, callbacks: TransportCallbacks): Listener {
   if (!isLoopback(opts.host) && !opts.token) {
@@ -194,7 +194,7 @@ export function createListener(opts: ListenerOptions, callbacks: TransportCallba
   const bun = bunOf();
   if (!bun) {
     throw new Error(
-      "Bun.serve is not available in this runtime (R6); expected inside the " +
+      "Bun.serve is not available in this runtime; expected inside the " +
         "Bun-based opencode v2 server — a `ws`-package fallback would go here",
     );
   }

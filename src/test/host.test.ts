@@ -1,5 +1,5 @@
 /**
- * Host tests (Phase 1): the JSON-RPC router over the fake facade —
+ * Host tests: the JSON-RPC router over the fake facade —
  * createSession/listSessions, the session/chat snapshots (the dropdown-fix
  * invariant: session-state customizations carry the agent directory),
  * client-dispatchable actions (turns, steering/queue, permissions, cancel,
@@ -77,7 +77,7 @@ const agents: FacadeAgent[] = [
   { id: "title", name: "Title", mode: "all", hidden: true },
 ];
 
-/** The 38-event captured turn (plan §14.6), header + one event per line. */
+/** The 38-event captured turn, header + one event per line. */
 function loadFixtureEvents(): { header: Record<string, unknown>; events: unknown[] } {
   const raw = readFileSync(fileURLToPath(new URL("./fixtures/events.jsonl", import.meta.url)), "utf8");
   const parts: string[] = [];
@@ -139,14 +139,14 @@ class FakeFacade implements OpencodeFacade {
     metadata?: Record<string, unknown>;
   } | undefined)[] = [];
   getSessionsCalls: string[] = [];
-  // ── Phase 4 extension 2: multi-chat ─────────────────────────────────────
+  // ── multi-chat ─────────────────────────────────────
   /** Every `removeSession` call (disposeChat / peer-chat teardown). */
   removeCalls: string[] = [];
   /** The opencode ids minted by `createSession` (call order). */
   createdIds: string[] = [];
   /** When non-null, `prompt` throws (initialMessage rollback path). */
   promptError: string | null = null;
-  // ── Phase 2: changesets ─────────────────────────────────────────────────
+  // ── changesets ─────────────────────────────────────────────────
   /** The working-tree diff `vcsDiffWorking` serves (absolute paths). */
   diffFiles: FacadeDiffFile[] = [];
   /** File content on "disk" (absPath → content; absent = the file is gone). */
@@ -158,7 +158,7 @@ class FakeFacade implements OpencodeFacade {
   deleteCalls: string[] = [];
   /** When set, vcsDiffWorking throws (the changeset errors out). */
   diffError: string | null = null;
-  // ── Phase 4 extension 1: client tools ──────────────────────────────────
+  // ── client tools ──────────────────────────────────
   /** Every `syncClientTools` call (the cross-session union each time). */
   syncClientToolsCalls: FacadeClientTool[][] = [];
 
@@ -207,7 +207,7 @@ class FakeFacade implements OpencodeFacade {
       title: "New Session",
       time: { created: now, updated: now },
       ...(input?.model !== undefined ? { model: input.model } : {}),
-      // Durable metadata (plan §14.13.1): the host's chat-binding marker
+      // Durable metadata: the host's chat-binding marker
       // is written at create and must survive a "restart" (fresh host over
       // the same facade sessions).
       ...(input?.metadata !== undefined ? { metadata: input.metadata } : {}),
@@ -272,7 +272,7 @@ class FakeFacade implements OpencodeFacade {
       signal.removeEventListener("abort", onAbort);
     }
   }
-  // ── Phase 2: changesets ─────────────────────────────────────────────────
+  // ── changesets ─────────────────────────────────────────────────
   async vcsDiffWorking(): Promise<readonly FacadeDiffFile[]> {
     if (this.diffError !== null) throw new Error(this.diffError);
     return this.diffFiles;
@@ -403,7 +403,7 @@ function agentDirectoryOf(state: SessionState): { container: DirectoryCustomizat
   return { container, children: container.children as AgentCustomization[] };
 }
 
-// ── handshake / catalog (Phase 0 regression through the host) ─────────────
+// ── handshake / catalog (regression through the host) ─────────────
 
 describe("initialize", () => {
   it("negotiates 1.0.0, reports defaultDirectory, and snapshots the root catalog", async () => {
@@ -1273,7 +1273,7 @@ describe("external sessions", () => {
   }, 10000);
 });
 
-// ── Phase 2: changesets ───────────────────────────────────────────────────
+// ── changesets ───────────────────────────────────────────────────
 
 /** The harness location directory (HostOptions.defaultDirectory). */
 const DIR = "/tmp/opencode/ahp-scratch/project-lan";
@@ -1903,9 +1903,9 @@ describe("changeset teardown and capability gate", () => {
   });
 });
 
-// ── client tools (Phase 4 extension 1, plan §14.12) ───────────────────────
+// ── client tools ───────────────────────
 
-describe("client tools (Phase 4 extension 1)", () => {
+describe("client tools", () => {
   const SES = "ses_ct";
   const CHAT = chatChannelURI(SES);
   const SC = sessionChannelURI(SES);
@@ -2340,7 +2340,7 @@ async function waitForAction(
   return actions.find((a) => a.action.type === type && (match === undefined || match(a)))!;
 }
 
-// ── multi-chat (Phase 4 extension 2, plan §14.13) ─────────────────────────
+// ── multi-chat ─────────────────────────
 
 async function createChat(
   h: Harness,
@@ -2373,7 +2373,7 @@ async function setupSession(h: Harness, ses: string): Promise<string> {
   return h.facade.createdIds[0]!;
 }
 
-describe("multi-chat (Phase 4 extension 2)", () => {
+describe("multi-chat", () => {
   it("advertises the plain multi-chat capability in the root catalog", async () => {
     const h = makeHarness();
     h.init(1, "c1");
@@ -2688,7 +2688,7 @@ describe("multi-chat (Phase 4 extension 2)", () => {
   });
 });
 
-// ── chat-binding durability (Phase 4 extension 2, plan §14.13.1) ─────────
+// ── chat-binding durability ─────────
 
 /**
  * Seed the facade the way a post-restart opencode store looks:
@@ -2717,7 +2717,7 @@ async function listSessionsPage(h: Harness, id: number): Promise<Record<string, 
   return h.frames.find((f) => f.message.id === id)!.message.result;
 }
 
-describe("chat-binding durability (Phase 4 extension 2, plan §14.13.1)", () => {
+describe("chat-binding durability", () => {
   it("createChat stamps the AHP marker on the peer backend's opencode metadata", async () => {
     const h = makeHarness();
     h.init(1, "c1");
@@ -2907,9 +2907,9 @@ describe("chat-binding durability (Phase 4 extension 2, plan §14.13.1)", () => 
   });
 });
 
-// ── terminals (Phase 4 extension 3, plan §14.16 option (c)) ─────────────
+// ── terminals ─────────────
 
-describe("terminals (Phase 4 extension 3)", () => {
+describe("terminals", () => {
   const SES = "ses_term";
   const TOOL = "tool_term_1";
 
@@ -3165,7 +3165,7 @@ describe("terminals (Phase 4 extension 3)", () => {
   });
 });
 
-describe("resolveSessionConfig (AHP 1.0.0 root command, plan §14.18)", () => {
+describe("resolveSessionConfig (AHP 1.0.0 root command)", () => {
   const SES = "ses_cfg";
 
   it("answers the empty schema with empty values — the client's strict pre-send resolve succeeds", async () => {

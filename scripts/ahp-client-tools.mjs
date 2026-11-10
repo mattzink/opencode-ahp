@@ -1,7 +1,6 @@
 #!/usr/bin/env node
 /**
- * opencode-ahp Phase 4 extension 1 live verification (client-provided
- * tools, plan §14.12).
+ * opencode-ahp live verification: client-provided tools.
  *
  * The probe registers a `ping` client tool via
  * `createSession.activeClient.tools`, then drives three turns through the
@@ -564,6 +563,6 @@ if (failures > 0) {
   console.error(`${TAG} ${failures} check(s) failed`);
   process.exit(1);
 }
-console.log(`${TAG} OK: Phase 4 extension 1 (client tools) live verification passed`);
+console.log(`${TAG} OK: client-tools live verification passed`);
 ws.close(1000);
 process.exit(0);

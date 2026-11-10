@@ -1,5 +1,5 @@
 {
-  // Documented option set for opencode-ahp (plan §8.2).
+  // Documented option set for opencode-ahp.
   //
   // How to use: copy this file to `options.jsonc` next to src/index.ts when
   // running from a checkout, or — the usual case — put the values you want
@@ -12,8 +12,8 @@
   // WS listen port.
   // "port": 8765,
 
-  // Bind address. Binding a non-loopback address REQUIRES a token (the
-  // listener refuses to start without one — plan R4).
+  // Bind address. Binding a non-loopback address REQUIRES a token (R4:
+  // the listener refuses to start without one).
   // "host": "127.0.0.1",
 
   // WS path — VS Code's remoteAgentHosts URL carries it verbatim.
@@ -25,7 +25,7 @@
   // "token": "…",
 
   // Origin allowlist: "*" (default) or an exact list, e.g.
-  // ["vscode://vscode"]. The token is always required regardless (R5).
+  // ["vscode://vscode"]. The token is always required regardless.
   // "allowedOrigins": "*",
 
   // Native TLS termination via Bun.serve → wss:// (off-LAN transports,
@@ -39,7 +39,7 @@
 
   // Keep the opencode location loaded against the idle timeout
   // (experimental.location_idle_timeout, default 60 min) by touching an
-  // internal anchor session periodically (plan §15). On, the
+  // internal anchor session periodically. On, the
   // location_idle_timeout config entry is not needed. The anchor shows in
   // the TUI session list as "opencode-ahp (keep-alive)"; AHP clients never
   // see it.

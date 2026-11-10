@@ -1,10 +1,9 @@
 /**
- * Global action sequencer + replay window (plan §6.1 seq.ts).
+ * Global action sequencer + replay window.
  *
- * Deviation from the plan's "per-channel seq" wording (plan §14): AHP
- * 1.0.0's `serverSeq` is a single host-wide sequence across all channels
- * — the spec's lifecycle example numbers a chat action 43 while a root
- * snapshot is taken at 42. Consequences:
+ * AHP 1.0.0's `serverSeq` is a single host-wide sequence across all
+ * channels (not per-channel) — the spec's lifecycle example numbers a
+ * chat action 43 while a root snapshot is taken at 42. Consequences:
  *  - snapshots carry `fromSeq` = the current global seq;
  *  - reconnect replay is a *global* range (serverSeq > lastSeen) filtered
  *    by the client's subscriptions;

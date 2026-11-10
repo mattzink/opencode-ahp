@@ -1,7 +1,7 @@
 #!/usr/bin/env node
 /**
- * opencode-ahp Phase 4 extension 2 live verification (multi-chat per
- * session, plan §14.13).
+ * opencode-ahp live verification: multi-chat (one AHP chat per opencode
+ * session).
  *
  * The probe exercises the 1 AHP chat ↔ 1 opencode session mapping against
  * the real server:
@@ -23,8 +23,8 @@
  *      session stays healthy with its default chat, and a further turn on
  *      the default chat still works.
  *
- * Durability (plan §14.13.1) — the chat-binding marker on the peer
- * backend's opencode session metadata must survive a location reload:
+ * Durability — the chat-binding marker on the peer backend's opencode
+ * session metadata must survive a location reload:
  *
  *   Run 1:  node scripts/ahp-multi-chat.mjs --token <t> --leave-peer
  *           (steps 1–5, then LEAVES the peer chat + backend alive and
@@ -73,8 +73,8 @@ const opts = {
 };
 if (!opts.token) fail(2, "--token is required");
 
-// `--recheck <sessionChannel> <peerChatURI>`: the durability recheck
-// (plan §14.13.1) — a separate connection after a location reload.
+// `--recheck <sessionChannel> <peerChatURI>`: the durability recheck —
+// a separate connection after a location reload.
 const recheckIdx = argv.indexOf("--recheck");
 const recheck =
   recheckIdx >= 0 ? { channel: argv[recheckIdx + 1], chat: argv[recheckIdx + 2] } : null;
@@ -238,8 +238,8 @@ async function driveTurn(chat, turnId, prompt, deadline) {
 }
 
 /**
- * Durability recheck (plan §14.13.1), run after a location reload: the
- * peer chat (created + marked by an earlier run) must be re-attached to
+ * Durability recheck, run after a location reload: the peer chat
+ * (created + marked by an earlier run) must be re-attached to
  * its owner session at its ORIGINAL chat URI via the metadata marker on
  * the peer backend's opencode session.
  */
@@ -322,7 +322,7 @@ if (recheck !== null) {
     console.error(`${TAG} ${failures} check(s) failed`);
     process.exit(1);
   }
-  console.log(`${TAG} OK: chat-binding durability recheck (plan §14.13.1) passed`);
+  console.log(`${TAG} OK: chat-binding durability recheck passed`);
   ws.close(1000);
   process.exit(0);
 }
@@ -471,8 +471,8 @@ try {
   }
 
   if (opts.leavePeer) {
-    // Durability (plan §14.13.1): leave the peer chat + its backend
-    // session (now carrying the AHP marker in its opencode metadata)
+    // Durability: leave the peer chat + its backend session (now
+    // carrying the AHP marker in its opencode metadata)
     // alive across a location reload; the recheck run verifies the
     // re-attachment and disposes the peer.
     console.log(
@@ -527,6 +527,6 @@ if (failures > 0) {
   console.error(`${TAG} ${failures} check(s) failed`);
   process.exit(1);
 }
-console.log(`${TAG} OK: Phase 4 extension 2 (multi-chat) live verification passed`);
+console.log(`${TAG} OK: multi-chat live verification passed`);
 ws.close(1000);
 process.exit(0);

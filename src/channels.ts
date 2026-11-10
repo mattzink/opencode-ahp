@@ -1,12 +1,10 @@
 /**
- * AHP channel registry (plan §6.1 channels.ts): URI parsing/formatting,
- * per-socket subscription bookkeeping, and the set of live opencode
- * sessions. Pure in-memory — no runtime dependencies.
+ * AHP channel registry: URI parsing/formatting, per-socket subscription
+ * bookkeeping, and the sets of live opencode sessions and live terminal
+ * channels. Pure in-memory — no runtime dependencies.
  *
- * Phase 0 only the root channel is live; session/chat URI handling and
- * the session registry land with Phase 1 (session support). Phase 2 adds
- * the changeset channel kind (`<owner>/changeset/{uncommitted|session|
- * turn/<turnId>}` — plan §11).
+ * Channel kinds: root, session, chat, changeset
+ * (`<owner>/changeset/{uncommitted|session|turn/<turnId>}`), and terminal.
  */
 
 export const ROOT_CHANNEL = "ahp-root://";
@@ -23,11 +21,11 @@ export function channelKind(uri: string): ChannelKind {
   // Checked before the owner prefixes so `<sessionURI>/changeset/session`
   // is not misread as a session channel whose suffix contains the marker
   // (createSession rejects such suffixes, so no live session channel can
-  // contain the marker — plan §14).
+  // contain the marker).
   if (uri.lastIndexOf(CHANGASET_MARKER) > 0) return "changeset";
   if (uri.startsWith(SESSION_PREFIX) && uri.length > SESSION_PREFIX.length) return "session";
   if (uri.startsWith(CHAT_PREFIX) && uri.length > CHAT_PREFIX.length) return "chat";
-  // Phase 4 extension 3: synthetic shell-command terminals (plan §14.16).
+  // Synthetic shell-command terminals.
   if (uri.startsWith(TERMINAL_PREFIX) && uri.length > TERMINAL_PREFIX.length) return "terminal";
   return "unknown";
 }
@@ -41,15 +39,15 @@ export function sessionChannelURI(sessionID: string): string {
  * Channel URI of a session's default chat. The default chat reuses the
  * session's opencode id as its suffix (the single-chat zero-wire-change
  * mapping); peer chats created via `createChat` carry client-chosen
- * suffixes instead (plan §14.13).
+ * suffixes instead.
  */
 export function chatChannelURI(sessionID: string): string {
   return CHAT_PREFIX + sessionID;
 }
 
 /**
- * Channel URI of a synthetic shell-command terminal (Phase 4 extension 3,
- * plan §14.16 option (c)). The suffix is the opencode tool call id —
+ * Channel URI of a synthetic shell-command terminal. The suffix is the
+ * opencode tool call id —
  * globally unique per tool invocation, so the URI is unambiguous and the
  * terminal correlates 1:1 with the `chat/toolCall*` actions for the same
  * call.
@@ -67,7 +65,7 @@ export function sessionIDOf(uri: string): string | null {
 }
 
 /**
- * The three changeset kinds this host advertises (plan §11 Phase 2):
+ * The three changeset kinds this host advertises:
  *  - `uncommitted`: working tree vs HEAD (owner: the chat channel);
  *  - `session`: session-wide changes, same approximation (owner: the
  *    session channel — the protocol's "session" changeKind);
@@ -115,7 +113,7 @@ export function parseChangesetChannel(uri: string): ParsedChangesetChannel | nul
 /**
  * Changeset URI of one chat's uncommitted (working-tree) changes. The
  * owner is the chat channel itself (multi-chat: every chat has its own
- * uncommitted changeset — plan §14.13).
+ * uncommitted changeset).
  */
 export function uncommittedChangesetURI(chatChannel: string): string {
   return `${chatChannel}/changeset/uncommitted`;
@@ -138,9 +136,8 @@ export interface SubscribeOutcome {
 
 /**
  * Subscription bookkeeping keyed by transport socket id, plus the set of
- * live session ids (Phase 1) and the set of live terminal channel URIs
- * (Phase 4 extension 3 — the host adds/removes them as synthetic
- * terminals are opened and torn down).
+ * live session ids and the set of live terminal channel URIs (the host
+ * adds/removes them as synthetic terminals are opened and torn down).
  */
 export class ChannelRegistry {
   private readonly subs = new Map<number, Set<string>>();
@@ -195,7 +192,7 @@ export class ChannelRegistry {
     this.subs.delete(socketId);
   }
 
-  // ── live sessions (Phase 1: session/chat channels) ────────────────────
+  // ── live sessions (session/chat channels) ─────────────────────────────
 
   addSession(sessionID: string): void {
     this.sessions.add(sessionID);
@@ -209,7 +206,7 @@ export class ChannelRegistry {
     return this.sessions.has(sessionID);
   }
 
-  // ── live terminals (Phase 4 extension 3: shell-command terminals) ─────
+  // ── live terminals (synthetic shell-command terminals) ────────────────
 
   addTerminal(uri: string): void {
     this.terminals.add(uri);

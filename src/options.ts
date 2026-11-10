@@ -1,6 +1,6 @@
 /**
- * Plugin option resolution (plan §8.2): ctx.options ▸ options.jsonc
- * sibling file ▸ built-in defaults.
+ * Plugin option resolution: ctx.options ▸ options.jsonc sibling file ▸
+ * built-in defaults.
  *
  * Resolution is per top-level key (shallow): a key's value comes from
  * the highest-priority source that provides a valid value for it. Invalid
@@ -33,16 +33,16 @@ export interface Options {
   path: string;
   /** Auth token; null → auto-generate on first start and persist it. */
   token: string | null;
-  /** Origin allowlist; the token is always required regardless (R5). */
+  /** Origin allowlist; the token is always required regardless. */
   allowedOrigins: string[] | "*";
-  /** Native TLS via Bun.serve (post-MVP; off-LAN transports only, D3). */
+  /** Native TLS via Bun.serve on the same listener (off-LAN). */
   tls: TlsOptions | null;
   /** Plain-HTTP health endpoint (no auth). */
   healthPath: string;
   /**
    * Keep the opencode location loaded against the idle timeout (default
    * `experimental.location_idle_timeout`, 60 minutes) via a periodic durable
-   * touch of an internal anchor session (plan §15). With this on, the
+   * touch of an internal anchor session. With this on, the
    * `location_idle_timeout: false` config entry is not needed. The anchor
    * shows in the TUI session list as "opencode-ahp (keep-alive)"; AHP
    * clients never see it.
@@ -55,7 +55,7 @@ export interface Options {
   keepAliveIntervalMinutes: number;
   /** Global actions kept for reconnect replay; older gaps → snapshot. */
   replayWindow: number;
-  /** Advertised in `initialize` (plan §8.2). */
+  /** Advertised in `initialize`. */
   capabilities: CapabilityFlags;
 }
 
@@ -71,10 +71,9 @@ export const BUILTIN_OPTIONS: Options = {
   keepAlive: true,
   keepAliveIntervalMinutes: 10,
   replayWindow: 1000,
-  // Phase 2: changesets are on by default (opt out with
-  // `capabilities.changesets: false`). Phase 4 extension 3: terminals
-  // are on by default too — the synthetic shell-command terminals (plan
-  // §14.16 option (c)); opt out with `capabilities.terminals: false`.
+  // Changesets and the synthetic shell-command terminals are both on by
+  // default; opt out with `capabilities.changesets: false` and
+  // `capabilities.terminals: false` respectively.
   // Off the wire in 1.0.0 (no capability field) — the flag gates the
   // host-side behavior only.
   capabilities: { changesets: true, terminals: true, automations: false },

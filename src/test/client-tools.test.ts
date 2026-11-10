@@ -1,5 +1,5 @@
 /**
- * Client-tools pure helper tests (Phase 4 extension 1, plan §14.12):
+ * Client-tools pure helper tests:
  * wire validation of AHP `ToolDefinition`s, the cross-session union
  * (first-registered wins per name), the per-session provider lookup,
  * and the opencode-registration field derivation.
