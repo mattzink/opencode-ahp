@@ -212,3 +212,28 @@ describe("ChannelRegistry: live sessions", () => {
     expect(reg.subscriptionsOf(1)).toEqual([sessionChannelURI("s-1")]);
   });
 });
+
+describe("ChannelRegistry: live terminals", () => {
+  it("synthetic ahp-terminal: channels are subscribable only while live", () => {
+    const reg = new ChannelRegistry();
+    expect(reg.subscribe(1, "ahp-terminal:/tool-1")).toEqual({ ok: false, reason: "no-such-terminal" });
+    reg.addTerminal("ahp-terminal:/tool-1");
+    expect(reg.subscribe(1, "ahp-terminal:/tool-1")).toEqual({ ok: true });
+    reg.removeTerminal("ahp-terminal:/tool-1");
+    expect(reg.subscribe(1, "ahp-terminal:/tool-1")).toEqual({ ok: false, reason: "no-such-terminal" });
+  });
+
+  it("client-chosen pty terminal URIs classify unknown by prefix and track the live set", () => {
+    const reg = new ChannelRegistry();
+    const uri = "agenthost-terminal://x";
+    // No live record: an unknown URI.
+    expect(reg.subscribe(1, uri)).toEqual({ ok: false, reason: "unknown-uri" });
+    reg.addTerminal(uri);
+    expect(reg.subscribe(1, uri)).toEqual({ ok: true });
+    reg.removeTerminal(uri);
+    // Back to unknown once the record is gone (dispose / teardown).
+    expect(reg.subscribe(1, uri)).toEqual({ ok: false, reason: "unknown-uri" });
+    // Existing subscription records survive the removal (host prunes later).
+    expect(reg.subscriptionsOf(1)).toEqual([uri]);
+  });
+});

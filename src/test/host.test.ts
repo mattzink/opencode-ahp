@@ -51,6 +51,7 @@ import {
   ERROR_SESSION_NOT_FOUND,
   Host,
 } from "../host.js";
+import type { SpawnPty, SpawnPtyInput } from "../host-types.js";
 
 // ── fixtures / helpers ────────────────────────────────────────────────────
 
@@ -306,6 +307,50 @@ class FakeFacade implements OpencodeFacade {
   }
 }
 
+/**
+ * The test double for the host's `spawnPty` seam: records what the host
+ * writes to it (input) and the resize calls, and exposes the host-facing
+ * callbacks so tests can drive pty output and process exit (the instances
+ * are captured in the harness `ptys` list, ordered by spawn).
+ */
+class FakePty {
+  readonly written: string[] = [];
+  /** Every size the host applied: the spawn size, then one per resize. */
+  readonly resizes: Array<{ cols: number; rows: number }> = [];
+  killed = false;
+  private _onOutput: ((data: string) => void) | null = null;
+  private _onExit: ((code: number | undefined) => void) | null = null;
+
+  /** The host's spawn entry point (the `SpawnPty` seam shape). */
+  static spawn(input: SpawnPtyInput): FakePty {
+    const pty = new FakePty();
+    pty._onOutput = input.onOutput;
+    pty._onExit = input.onExit;
+    pty.resizes.push({ cols: input.cols, rows: input.rows });
+    return pty;
+  }
+
+  /** Test driver: the pty produces output (the `terminal/data` source). */
+  emit(data: string): void {
+    this._onOutput?.(data);
+  }
+
+  /** Test driver: the pty process exits (code undefined when killed). */
+  exit(code?: number): void {
+    this._onExit?.(code);
+  }
+
+  write(data: string): void {
+    this.written.push(data);
+  }
+  resize(cols: number, rows: number): void {
+    this.resizes.push({ cols, rows });
+  }
+  kill(): void {
+    this.killed = true;
+  }
+}
+
 interface Harness {
   host: Host;
   facade: FakeFacade;
@@ -317,11 +362,20 @@ interface Harness {
   actionsOn: (channel: string) => any[];
   notification: (method: string, socketId?: number) => Record<string, any> | undefined;
   stop: () => void;
+  /** The FakePty instances spawned so far, in spawn order. */
+  ptys: FakePty[];
 }
 
-function makeHarness(opts?: { changesets?: boolean; terminals?: boolean }): Harness {
+function makeHarness(opts?: {
+  changesets?: boolean;
+  terminals?: boolean;
+  /** The spawnPty seam; null omits the option entirely (the -32601 path),
+   * undefined uses the default fake that captures into `ptys`. */
+  spawnPty?: SpawnPty | null;
+}): Harness {
   const facade = new FakeFacade();
   const frames: Frame[] = [];
+  const ptys: FakePty[] = [];
   const host = new Host({
     serverInfo: { name: "opencode-ahp-test", version: "0.1.0" },
     facade,
@@ -329,6 +383,17 @@ function makeHarness(opts?: { changesets?: boolean; terminals?: boolean }): Harn
     defaultDirectory: "/tmp/opencode/ahp-scratch/project-lan",
     changesets: opts?.changesets ?? true,
     terminals: opts?.terminals ?? true,
+    ...(opts?.spawnPty === null
+      ? {}
+      : {
+          spawnPty:
+            opts?.spawnPty ??
+            ((input: SpawnPtyInput) => {
+              const pty = FakePty.spawn(input);
+              ptys.push(pty);
+              return pty;
+            }),
+        }),
     send: (socketId, message) => frames.push({ socketId, message: message as Record<string, any> }),
     log: () => {},
   });
@@ -337,6 +402,7 @@ function makeHarness(opts?: { changesets?: boolean; terminals?: boolean }): Harn
     host,
     facade,
     frames,
+    ptys,
     send: (socketId, method, params, id) => {
       host.onMessage(socketId, JSON.stringify(id === undefined ? { jsonrpc: "2.0", method, params } : { jsonrpc: "2.0", method, params, id }));
     },
@@ -460,6 +526,10 @@ describe("createSession", () => {
     expect(added!.params.summary.resource).toBe(sessionChannelURI("my-project-sess"));
     expect(added!.params.summary.provider).toBe("gpuz");
     expect(added!.params.summary.defaultChat).toBe(chatChannelURI("ses_fake_1"));
+    // The session's workspace is the location directory (the agent's tool
+    // access root) — VS Code groups its session list by this; without it the
+    // session lands in the "Unknown" bucket.
+    expect(added!.params.summary.workingDirectories).toEqual(["file:///tmp/opencode/ahp-scratch/project-lan/"]);
 
     // Session snapshot: lifecycle ready, the chat catalog, default chat, and —
     // the dropdown-fix invariant — session-state customizations carry the
@@ -468,6 +538,7 @@ describe("createSession", () => {
     expect(sess.lifecycle).toBe("ready");
     expect(sess.provider).toBe("gpuz");
     expect(sess.defaultChat).toBe(chatChannelURI("ses_fake_1"));
+    expect(sess.workingDirectories).toEqual(["file:///tmp/opencode/ahp-scratch/project-lan/"]);
     expect(sess.chats).toHaveLength(1);
     expect(sess.chats[0]!.title).toBe("Chat 1");
     const { container, children } = agentDirectoryOf(sess);
@@ -571,6 +642,7 @@ describe("listSessions", () => {
     ]);
     expect(page1.items[0].title).toBe("New");
     expect(page1.items[0].chats).toHaveLength(1);
+    expect(page1.items[0].workingDirectories).toEqual(["file:///tmp/opencode/ahp-scratch/project-lan/"]);
     expect(page1.nextCursor).toBe("2");
 
     h.send(1, "listSessions", { limit: 2, cursor: page1.nextCursor }, 201);
@@ -1217,11 +1289,13 @@ describe("external sessions", () => {
     const added = h.notification("root/sessionAdded", 1)!;
     expect(added.params.summary.resource).toBe(sessionChannelURI("ses_tui_1"));
     expect(added.params.summary.title).toBe("TUI session");
+    expect(added.params.summary.workingDirectories).toEqual(["file:///tmp/opencode/ahp-scratch/project-lan/"]);
     const counts = h.actionsOn(ROOT_CHANNEL).filter((a) => a.action.type === "root/activeSessionsChanged");
     expect(counts[counts.length - 1]!.action.activeSessions).toBe(1);
 
     const sess = await sessionSnapshotState(h, 1, sessionChannelURI("ses_tui_1"), 161);
     expect(sess.title).toBe("TUI session");
+    expect(sess.workingDirectories).toEqual(["file:///tmp/opencode/ahp-scratch/project-lan/"]);
     h.stop();
   }, 10000);
 
@@ -2936,6 +3010,18 @@ describe("terminals", () => {
     return subscribe(h, 1, uri, id).then((res) => res["result"]["snapshot"]["state"]);
   }
 
+  /** Send `createTerminal` and wait for the JSON-RPC result. */
+  async function createPtyTerminal(
+    h: Harness,
+    channel: string,
+    params: Record<string, unknown> = {},
+    id = 930,
+  ): Promise<Record<string, any>> {
+    h.send(1, "createTerminal", { channel, claim: { kind: "client", clientId: "c1" }, ...params }, id);
+    await waitFor(() => h.frames.some((f) => f.message.id === id), `createTerminal response (${channel})`);
+    return h.frames.find((f) => f.message.id === id)!.message;
+  }
+
   it("opens a synthetic terminal for a shell call: catalog row, snapshot shape, and the full action stream", async () => {
     const h = makeHarness();
     h.init(1, "c1");
@@ -3102,17 +3188,443 @@ describe("terminals", () => {
     h.stop();
   });
 
-  it("answers createTerminal and disposeTerminal with a clean -32010 instead of -32601", async () => {
-    const h = makeHarness();
-    h.init(1, "c1");
-    await waitInit(h, 1);
-    h.send(1, "createTerminal", { channel: "ahp-terminal:/wanted", claim: { kind: "client", clientId: "c1" } }, 900);
-    await waitFor(() => h.frames.some((f) => f.message.id === 900), "createTerminal response");
-    expect(h.frames.find((f) => f.message.id === 900)!.message.error.code).toBe(-32010);
-    h.send(1, "disposeTerminal", { channel: "ahp-terminal:/wanted" }, 901);
-    await waitFor(() => h.frames.some((f) => f.message.id === 901), "disposeTerminal response");
-    expect(h.frames.find((f) => f.message.id === 901)!.message.error.code).toBe(-32010);
-    h.stop();
+  // ── pty terminals (createTerminal / disposeTerminal) ────────────────
+
+  describe("pty terminals", () => {
+    const dispatch = (h: Harness, socketId: number, seq: number, action: Record<string, unknown>, uri: string) =>
+      h.send(socketId, "dispatchAction", { channel: uri, clientSeq: seq, action });
+
+    it("spawns a pty shell: result null, spawn input, catalog row, and the state snapshot", async () => {
+      const h = makeHarness();
+      h.init(1, "c1");
+      await waitInit(h, 1);
+      const res = await createPtyTerminal(h, "agenthost-terminal://t1", {
+        name: "my shell",
+        cwd: "file:///tmp/opencode/ahp-scratch/project-lan/sub",
+        cols: 120,
+        rows: 40,
+      }, 940);
+      expect(res.error).toBeUndefined();
+      expect(res.result).toBeNull();
+
+      // The pty was spawned with the resolved cwd and the requested size.
+      expect(h.ptys).toHaveLength(1);
+      expect(h.ptys[0]!.resizes[0]).toEqual({ cols: 120, rows: 40 });
+
+      // Root catalog: one row, client claim, running lifecycle.
+      await waitFor(() => lastCatalog(h).length === 1, "catalog row");
+      const row = lastCatalog(h)[0]!;
+      expect(row.resource).toBe("agenthost-terminal://t1");
+      expect(row.title).toBe("my shell");
+      expect(row.claim).toEqual({ kind: "client", clientId: "c1" });
+      expect(row.lifecycle).toEqual({ status: "running" });
+
+      // Snapshot: isPty, the directory cwd, size, no command detection.
+      const state = await terminalSnapshotState(h, "agenthost-terminal://t1", 941);
+      expect(state.isPty).toBe(true);
+      expect(state.supportsCommandDetection).toBeUndefined();
+      expect(state.title).toBe("my shell");
+      expect(state.cwd).toBe("file:///tmp/opencode/ahp-scratch/project-lan/sub/");
+      expect(state.cols).toBe(120);
+      expect(state.rows).toBe(40);
+      expect(state.claim).toEqual({ kind: "client", clientId: "c1" });
+      expect(state.lifecycle).toEqual({ status: "running" });
+      expect(state.content).toEqual([]);
+      h.stop();
+    });
+
+    it("defaults to 80x24 and the location directory when cols/rows/cwd are omitted", async () => {
+      const h = makeHarness();
+      h.init(1, "c1");
+      await waitInit(h, 1);
+      const res = await createPtyTerminal(h, "agenthost-terminal://t-defaults", {}, 942);
+      expect(res.error).toBeUndefined();
+      expect(res.result).toBeNull();
+      expect(h.ptys[0]!.resizes[0]).toEqual({ cols: 80, rows: 24 });
+      const state = await terminalSnapshotState(h, "agenthost-terminal://t-defaults", 943);
+      expect(state.title).toBe("Shell");
+      expect(state.cwd).toBe(`file://${DIR}/`);
+      expect(state.cols).toBe(80);
+      expect(state.rows).toBe(24);
+      h.stop();
+    });
+
+    it("resolves the cwd: subpaths stay, out-of-root clamps, wrapped and bare forms unwrap, malformed falls back", async () => {
+      const cases: Array<{ label: string; cwd: string; expected: string }> = [
+        { label: "file:// subpath", cwd: "file:///tmp/opencode/ahp-scratch/project-lan/src", expected: `${DIR}/src` },
+        { label: "file:// outside the root", cwd: "file:///etc", expected: DIR },
+        {
+          label: "agent-host wrapper (URI path)",
+          cwd: "vscode-agent-host://host/tmp/opencode/ahp-scratch/project-lan/deep",
+          expected: `${DIR}/deep`,
+        },
+        {
+          label: "agent-host wrapper (_ah meta wins)",
+          cwd:
+            "vscode-agent-host://host/ignored?" +
+            "_ah=" +
+            Buffer.from(JSON.stringify({ path: "/tmp/opencode/ahp-scratch/project-lan/from-meta" }), "utf8").toString("base64url"),
+          expected: `${DIR}/from-meta`,
+        },
+        { label: "bare absolute path", cwd: "/tmp/opencode/ahp-scratch/project-lan/bare", expected: `${DIR}/bare` },
+        { label: "malformed", cwd: "not-a-path", expected: DIR },
+      ];
+      for (let i = 0; i < cases.length; i++) {
+        const h = makeHarness();
+        h.init(1, "c1");
+        await waitInit(h, 1);
+        const channel = `agenthost-terminal://t-cwd-${i}`;
+        const res = await createPtyTerminal(h, channel, { cwd: cases[i]!.cwd }, 944 + i);
+        expect(res.error).toBeUndefined();
+        expect(h.ptys[0]!.resizes).toBeDefined();
+        // The spawn cwd is the resolved path (asserted via the record's state cwd).
+        const state = await terminalSnapshotState(h, channel, 960 + i);
+        expect(state.cwd, cases[i]!.label).toBe(`file://${cases[i]!.expected}/`);
+        h.stop();
+      }
+    });
+
+    it("rejects duplicate channels with AHP AlreadyExists (-32010)", async () => {
+      const h = makeHarness();
+      h.init(1, "c1");
+      await waitInit(h, 1);
+      const first = await createPtyTerminal(h, "agenthost-terminal://t-dup", {}, 950);
+      expect(first.error).toBeUndefined();
+      const dup = await createPtyTerminal(h, "agenthost-terminal://t-dup", {}, 951);
+      expect(dup.error?.code).toBe(-32010);
+      expect(h.ptys).toHaveLength(1);
+      h.stop();
+    });
+
+    it("refuses host-namespace channel URIs (-32600)", async () => {
+      const h = makeHarness();
+      h.init(1, "c1");
+      await waitInit(h, 1);
+      for (const [i, channel] of ["ahp-terminal:/x", "ahp-root://", "ahp-session:/x"].entries()) {
+        const res = await createPtyTerminal(h, channel, {}, 955 + i);
+        expect(res.error?.code, channel).toBe(-32600);
+      }
+      expect(h.ptys).toHaveLength(0);
+      h.stop();
+    });
+
+    it("rejects malformed params (-32602): missing channel, missing claim, foreign client claim", async () => {
+      const h = makeHarness();
+      h.init(1, "c1");
+      await waitInit(h, 1);
+      // Missing channel.
+      h.send(1, "createTerminal", { claim: { kind: "client", clientId: "c1" } }, 960);
+      await waitFor(() => h.frames.some((f) => f.message.id === 960), "response");
+      expect(h.frames.find((f) => f.message.id === 960)!.message.error.code).toBe(-32602);
+      // Missing claim.
+      h.send(1, "createTerminal", { channel: "agenthost-terminal://t-m1" }, 961);
+      await waitFor(() => h.frames.some((f) => f.message.id === 961), "response");
+      expect(h.frames.find((f) => f.message.id === 961)!.message.error.code).toBe(-32602);
+      // A client claim naming a different client is a foreign identity, not a credential.
+      h.send(
+        1,
+        "createTerminal",
+        { channel: "agenthost-terminal://t-m2", claim: { kind: "client", clientId: "other" } },
+        962,
+      );
+      await waitFor(() => h.frames.some((f) => f.message.id === 962), "response");
+      expect(h.frames.find((f) => f.message.id === 962)!.message.error.code).toBe(-32602);
+      expect(h.ptys).toHaveLength(0);
+      h.stop();
+    });
+
+    it("answers -32601 when the terminals capability is off", async () => {
+      const h = makeHarness({ terminals: false });
+      h.init(1, "c1");
+      await waitInit(h, 1);
+      const res = await createPtyTerminal(h, "agenthost-terminal://t-off", {}, 970);
+      expect(res.error?.code).toBe(-32601);
+      h.send(1, "disposeTerminal", { channel: "agenthost-terminal://t-off" }, 971);
+      await waitFor(() => h.frames.some((f) => f.message.id === 971), "disposeTerminal response");
+      expect(h.frames.find((f) => f.message.id === 971)!.message.error.code).toBe(-32601);
+      h.stop();
+    });
+
+    it("answers -32601 when the runtime cannot spawn ptys", async () => {
+      const h = makeHarness({ spawnPty: null });
+      h.init(1, "c1");
+      await waitInit(h, 1);
+      const res = await createPtyTerminal(h, "agenthost-terminal://t-nosetup", {}, 972);
+      expect(res.error?.code).toBe(-32601);
+      expect(h.ptys).toHaveLength(0);
+      h.stop();
+    });
+
+    it("answers -32603 when the spawn throws, and the host survives", async () => {
+      const h = makeHarness({
+        spawnPty: () => {
+          throw new Error("spawn boom");
+        },
+      });
+      h.init(1, "c1");
+      await waitInit(h, 1);
+      const res = await createPtyTerminal(h, "agenthost-terminal://t-throw", {}, 973);
+      expect(res.error?.code).toBe(-32603);
+      expect(res.error?.message).toMatch(/spawn boom/);
+      expect(h.ptys).toHaveLength(0);
+      // R2: the host is still serving (a subscribe on a live channel works).
+      const rootSub = await subscribe(h, 1, ROOT_CHANNEL, 974);
+      expect(rootSub.error).toBeUndefined();
+      h.stop();
+    });
+
+    it("streams pty output as terminal/data and trims the stored content to the rolling budget", async () => {
+      const h = makeHarness();
+      h.init(1, "c1");
+      await waitInit(h, 1);
+      const uri = "agenthost-terminal://t-stream";
+      await createPtyTerminal(h, uri, {}, 975);
+      await subscribe(h, 1, uri, 974); // a live subscriber for the data stream
+      h.ptys[0]!.emit("A".repeat(120_000));
+      const data = await waitForAction(h, uri, "terminal/data");
+      expect(data.action.data).toHaveLength(120_000);
+      expect(data.rejectionReason).toBeUndefined();
+      // The stored snapshot is trimmed to the 80k target (single part).
+      const state = await terminalSnapshotState(h, uri, 976);
+      expect(state.content).toHaveLength(1);
+      expect(state.content[0]).toEqual({ type: "unclassified", value: expect.stringMatching(/^A{80000}$/) });
+      // A small append lands in the surviving tail without re-trimming.
+      h.ptys[0]!.emit("bc");
+      await waitForAction(h, uri, "terminal/data", (a: any) => a.action.data === "bc");
+      const state2 = await terminalSnapshotState(h, uri, 977);
+      expect(state2.content[0].value).toHaveLength(80_002);
+      h.stop();
+    });
+
+    it("forwards terminal/input to the process and rejects invalid data", async () => {
+      const h = makeHarness();
+      h.init(1, "c1");
+      await waitInit(h, 1);
+      const uri = "agenthost-terminal://t-input";
+      await createPtyTerminal(h, uri, {}, 980);
+      await subscribe(h, 1, uri, 981);
+      dispatch(h, 1, 1, { type: "terminal/input", data: "echo hi\r" }, uri);
+      const accepted = await waitForAction(h, uri, "terminal/input");
+      expect(accepted.rejectionReason).toBeUndefined();
+      expect(h.ptys[0]!.written).toEqual(["echo hi\r"]);
+      // Invalid data (not a string) is rejected and never reaches the pty.
+      dispatch(h, 1, 2, { type: "terminal/input", data: 42 }, uri);
+      const rejected = await waitForAction(h, uri, "terminal/input", (a: any) => a.rejectionReason !== undefined);
+      expect(rejected.rejectionReason).toMatch(/data must be a string/);
+      expect(h.ptys[0]!.written).toEqual(["echo hi\r"]);
+      h.stop();
+    });
+
+    it("forwards terminal/resized to the process and the state; rejects non-positive sizes", async () => {
+      const h = makeHarness();
+      h.init(1, "c1");
+      await waitInit(h, 1);
+      const uri = "agenthost-terminal://t-resize";
+      await createPtyTerminal(h, uri, {}, 985);
+      await subscribe(h, 1, uri, 984);
+      dispatch(h, 1, 1, { type: "terminal/resized", cols: 100, rows: 50 }, uri);
+      const accepted = await waitForAction(h, uri, "terminal/resized");
+      expect(accepted.rejectionReason).toBeUndefined();
+      expect(h.ptys[0]!.resizes[1]).toEqual({ cols: 100, rows: 50 });
+      const state = await terminalSnapshotState(h, uri, 986);
+      expect(state.cols).toBe(100);
+      expect(state.rows).toBe(50);
+      dispatch(h, 1, 2, { type: "terminal/resized", cols: 0, rows: 24 }, uri);
+      const rejected = await waitForAction(h, uri, "terminal/resized", (a: any) => a.rejectionReason !== undefined);
+      expect(rejected.rejectionReason).toMatch(/positive integers/);
+      h.stop();
+    });
+
+    it("terminal/claimed is holder-only, a session claim is sticky, and the catalog tracks the claim", async () => {
+      const h = makeHarness();
+      h.init(1, "c1");
+      await waitInit(h, 1);
+      h.init(2, "c2");
+      await waitInit(h, 2);
+      const uri = "agenthost-terminal://t-claim";
+      await createPtyTerminal(h, uri, {}, 990);
+      await subscribe(h, 1, uri, 989);
+      // The non-holder client cannot re-claim.
+      dispatch(h, 2, 1, { type: "terminal/claimed", claim: { kind: "client", clientId: "c2" } }, uri);
+      const rejected = await waitForAction(h, uri, "terminal/claimed");
+      expect(rejected.rejectionReason).toMatch(/only the client currently holding/);
+      // The holder transfers the claim to a session scope.
+      dispatch(h, 1, 2, {
+        type: "terminal/claimed",
+        claim: { kind: "session", session: "ahp-session:/s1", chat: "ahp-chat:/s1" },
+      }, uri);
+      const accepted = await waitForAction(h, uri, "terminal/claimed", (a: any) => a.rejectionReason === undefined);
+      expect(accepted.action.claim.kind).toBe("session");
+      // Catalog row claim updated.
+      await waitFor(() => lastCatalog(h)[0]!.claim.kind === "session", "catalog claim refresh");
+      expect(lastCatalog(h)[0]!.claim).toEqual({ kind: "session", session: "ahp-session:/s1", chat: "ahp-chat:/s1" });
+      // The session claim is sticky: a later client claim is rejected.
+      dispatch(h, 1, 3, { type: "terminal/claimed", claim: { kind: "client", clientId: "c1" } }, uri);
+      const sticky = await waitForAction(
+        h,
+        uri,
+        "terminal/claimed",
+        (a: any) => a.rejectionReason !== undefined && a.origin?.clientSeq === 3,
+      );
+      expect(sticky.rejectionReason).toMatch(/only the client currently holding/);
+      h.stop();
+    });
+
+    it("terminal/titleChanged updates the state and catalog; an empty title is rejected", async () => {
+      const h = makeHarness();
+      h.init(1, "c1");
+      await waitInit(h, 1);
+      const uri = "agenthost-terminal://t-title";
+      await createPtyTerminal(h, uri, {}, 995);
+      await subscribe(h, 1, uri, 994);
+      dispatch(h, 1, 1, { type: "terminal/titleChanged", title: "renamed shell" }, uri);
+      const accepted = await waitForAction(h, uri, "terminal/titleChanged");
+      expect(accepted.rejectionReason).toBeUndefined();
+      await waitFor(() => lastCatalog(h)[0]!.title === "renamed shell", "catalog title refresh");
+      const state = await terminalSnapshotState(h, uri, 996);
+      expect(state.title).toBe("renamed shell");
+      dispatch(h, 1, 2, { type: "terminal/titleChanged", title: "" }, uri);
+      const rejected = await waitForAction(h, uri, "terminal/titleChanged", (a: any) => a.rejectionReason !== undefined);
+      expect(rejected.rejectionReason).toMatch(/non-empty string/);
+      h.stop();
+    });
+
+    it("terminal/cleared empties the content, and is allowed after exit", async () => {
+      const h = makeHarness();
+      h.init(1, "c1");
+      await waitInit(h, 1);
+      const uri = "agenthost-terminal://t-clear";
+      await createPtyTerminal(h, uri, {}, 997);
+      await subscribe(h, 1, uri, 993);
+      h.ptys[0]!.emit("some output");
+      await waitForAction(h, uri, "terminal/data");
+      dispatch(h, 1, 1, { type: "terminal/cleared" }, uri);
+      const cleared = await waitForAction(h, uri, "terminal/cleared");
+      expect(cleared.rejectionReason).toBeUndefined();
+      let state = await terminalSnapshotState(h, uri, 998);
+      expect(state.content).toEqual([]);
+      // After exit the state still exists — clear is still accepted.
+      h.ptys[0]!.exit(0);
+      await waitForAction(h, uri, "terminal/exited");
+      h.ptys[0]!.emit("more output after exit");
+      await waitForAction(h, uri, "terminal/data", (a: any) => a.action.data === "more output after exit");
+      dispatch(h, 1, 2, { type: "terminal/cleared" }, uri);
+      await waitForAction(h, uri, "terminal/cleared", (a: any) => a.origin?.clientSeq === 2);
+      state = await terminalSnapshotState(h, uri, 999);
+      expect(state.content).toEqual([]);
+      h.stop();
+    });
+
+    it("a self-exit publishes terminal/exited with the code; input/resize are rejected; the row stays listed", async () => {
+      const h = makeHarness();
+      h.init(1, "c1");
+      await waitInit(h, 1);
+      const uri = "agenthost-terminal://t-exit";
+      await createPtyTerminal(h, uri, {}, 1000);
+      await subscribe(h, 1, uri, 1001);
+      h.ptys[0]!.exit(3);
+      const exited = await waitForAction(h, uri, "terminal/exited");
+      expect(exited.action.exitCode).toBe(3);
+      expect(exited.rejectionReason).toBeUndefined();
+      // The row stays listed with the final lifecycle.
+      await waitFor(
+        () => lastCatalog(h).some((r: any) => r.resource === uri && r.lifecycle.status === "exited"),
+        "exited row in catalog",
+      );
+      const row = lastCatalog(h).find((r: any) => r.resource === uri)!;
+      expect(row.lifecycle).toEqual({ status: "exited", exitCode: 3 });
+      // Input and resize on the dead pty are rejected (no process to drive).
+      dispatch(h, 1, 1, { type: "terminal/input", data: "ls\r" }, uri);
+      const input = await waitForAction(h, uri, "terminal/input");
+      expect(input.rejectionReason).toMatch(/exited/);
+      dispatch(h, 1, 2, { type: "terminal/resized", cols: 80, rows: 24 }, uri);
+      const resized = await waitForAction(h, uri, "terminal/resized");
+      expect(resized.rejectionReason).toMatch(/exited/);
+      h.stop();
+    });
+
+    it("disposeTerminal kills the process, drops the row, is idempotent, and severs the channel", async () => {
+      const h = makeHarness();
+      h.init(1, "c1");
+      await waitInit(h, 1);
+      const uri = "agenthost-terminal://t-dispose";
+      await createPtyTerminal(h, uri, {}, 1005);
+      await subscribe(h, 1, uri, 1002);
+      h.ptys[0]!.emit("before");
+      await waitForAction(h, uri, "terminal/data");
+
+      h.send(1, "disposeTerminal", { channel: uri }, 1006);
+      await waitFor(() => h.frames.some((f) => f.message.id === 1006), "disposeTerminal response");
+      const res = h.frames.find((f) => f.message.id === 1006)!.message;
+      expect(res.error).toBeUndefined();
+      expect(res.result).toBeNull();
+      expect(h.ptys[0]!.killed).toBe(true);
+      // A final terminal/exited was published for the running process.
+      const exited = await waitForAction(h, uri, "terminal/exited");
+      expect(exited.action.exitCode).toBeUndefined();
+      // The row dropped from the catalog.
+      await waitFor(() => lastCatalog(h).length === 0, "catalog drop");
+
+      // Idempotent: an unknown channel answers success null (VS Code's
+      // shutdown path disposes terminals that may already be gone).
+      h.send(1, "disposeTerminal", { channel: uri }, 1007);
+      await waitFor(() => h.frames.some((f) => f.message.id === 1007), "second dispose");
+      const res2 = h.frames.find((f) => f.message.id === 1007)!.message;
+      expect(res2.error).toBeUndefined();
+      expect(res2.result).toBeNull();
+
+      // The channel is gone: subscribe fails with an unknown-channel error.
+      const sub = await subscribe(h, 1, uri, 1008);
+      expect(sub.error?.code).toBe(-32602);
+      // Post-dispose pty callbacks are no-ops (no new data action — the
+      // record lookup misses synchronously, so no delay is needed).
+      h.ptys[0]!.emit("after dispose");
+      expect(h.actionsOn(uri).some((a) => a.action.data === "after dispose")).toBe(false);
+      // Dispatching to the disposed URI is an unknown channel.
+      dispatch(h, 1, 1, { type: "terminal/input", data: "x" }, uri);
+      const dispatchReject = await waitForAction(h, uri, "terminal/input");
+      expect(dispatchReject.rejectionReason).toMatch(/unknown channel/);
+      h.stop();
+    });
+
+    it("refuses to dispose a synthetic (session-owned) terminal (-32009)", async () => {
+      const h = makeHarness();
+      h.init(1, "c1");
+      await waitInit(h, 1);
+      const { terminalURI } = await openShellTerminal(h);
+      h.send(1, "disposeTerminal", { channel: terminalURI }, 1010);
+      await waitFor(() => h.frames.some((f) => f.message.id === 1010), "disposeTerminal response");
+      const res = h.frames.find((f) => f.message.id === 1010)!.message;
+      expect(res.error?.code).toBe(-32009);
+      // The synthetic channel is still alive and subscribable.
+      const sub = await subscribe(h, 1, terminalURI, 1011);
+      expect(sub.error).toBeUndefined();
+      h.stop();
+    });
+
+    it("stopTerminals kills every live pty and drops the rows", async () => {
+      const h = makeHarness();
+      h.init(1, "c1");
+      await waitInit(h, 1);
+      const uri1 = "agenthost-terminal://t-stop-1";
+      const uri2 = "agenthost-terminal://t-stop-2";
+      await createPtyTerminal(h, uri1, {}, 1015);
+      await createPtyTerminal(h, uri2, {}, 1016);
+      await subscribe(h, 1, uri1, 1013);
+      await subscribe(h, 1, uri2, 1014);
+      await waitFor(() => lastCatalog(h).length === 2, "two catalog rows");
+      // One already exited on its own (the final-exited path is skipped).
+      h.ptys[0]!.exit(0);
+      await waitForAction(h, uri1, "terminal/exited");
+
+      h.host.stopTerminals();
+      expect(h.ptys[0]!.killed).toBe(true);
+      expect(h.ptys[1]!.killed).toBe(true);
+      const finalExited = await waitForAction(h, uri2, "terminal/exited");
+      expect(finalExited.action.exitCode).toBeUndefined();
+      await waitFor(() => lastCatalog(h).length === 0, "catalog empty");
+      h.stop();
+    });
   });
 
   it("rejects subscribing to a terminal that does not exist with -32008", async () => {

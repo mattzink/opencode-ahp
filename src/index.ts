@@ -53,6 +53,7 @@ type SessionCreateMetadata = NonNullable<Parameters<SessionDomain["create"]>[0]>
 import { isRecord, resolveOptions, type Options } from "./options.js";
 import { createListener, type Listener } from "./transport.js";
 import { Host } from "./host.js";
+import type { SpawnPty } from "./host-types.js";
 import { KeepAlive, KEEPALIVE_SESSION_ID } from "./keep-alive.js";
 import { errorMessage } from "./error.js";
 import {
@@ -106,6 +107,92 @@ function pluginVersion(): string {
     // fall through to the fallback
   }
   return "0.1.1";
+}
+
+/**
+ * The Bun runtime surface the pty seam uses. opencode ships as a
+ * Bun-compiled binary, so `globalThis.Bun` is present at runtime; the
+ * package's typecheck only knows the Node types, so the minimal shape is
+ * declared locally rather than taking a dev dependency on Bun's types.
+ */
+interface BunPty {
+  write(data: string): void;
+  resize(cols: number, rows: number): void;
+  close(): void;
+}
+
+interface BunChildProcess {
+  kill(): void;
+  readonly terminal: BunPty;
+  readonly exited: Promise<number>;
+}
+
+interface BunLike {
+  spawn(
+    cmd: string[],
+    opts: {
+      cwd: string;
+      env: Record<string, string | undefined>;
+      terminal: {
+        cols: number;
+        rows: number;
+        name: string;
+        data(term: unknown, data: string | Uint8Array): void;
+      };
+    },
+  ): BunChildProcess;
+}
+
+/**
+ * The host's `spawnPty` seam backed by `Bun.spawn`'s `terminal` option —
+ * a real pty with no external dependency (the plugin runs inside the Bun
+ * runtime). Returns undefined when the runtime is not Bun (the terminal
+ * commands then answer -32601 instead of the host crashing). The shell is
+ * `$SHELL` (fallback /bin/bash); login shells get `-l` (fish has none).
+ * Output is decoded defensively (string or bytes) and the exit code
+ * normalized (signal-killed → undefined).
+ */
+function createBunSpawnPty(): SpawnPty | undefined {
+  const bun = (globalThis as { Bun?: BunLike }).Bun;
+  if (bun === undefined) return undefined;
+  const decoder = new TextDecoder();
+  return (input) => {
+    const shell = process.env.SHELL ?? "/bin/bash";
+    const base = shell.split("/").pop() ?? "";
+    const login = ["bash", "zsh", "ksh", "sh", "dash", "ash"].includes(base) ? ["-l"] : [];
+    const proc = bun.spawn([shell, ...login], {
+      cwd: input.cwd,
+      env: { ...process.env, TERM: "xterm-256color" },
+      terminal: {
+        cols: input.cols,
+        rows: input.rows,
+        name: "xterm-256color",
+        data: (_term, data) => {
+          input.onOutput(typeof data === "string" ? data : decoder.decode(data));
+        },
+      },
+    });
+    void proc.exited.then(
+      (code) => input.onExit(Number.isInteger(code) && code >= 0 ? code : undefined),
+      () => input.onExit(undefined),
+    );
+    return {
+      write: (data) => proc.terminal.write(data),
+      resize: (cols, rows) => proc.terminal.resize(cols, rows),
+      kill: () => {
+        try {
+          proc.kill();
+        } catch {
+          // already gone
+        }
+        try {
+          proc.terminal.close();
+        } catch {
+          // already closed
+        }
+      },
+    };
+  };
 }
 
 /** 32 random bytes, base64url — 43 chars, comfortably over the 16-char floor. */
@@ -602,6 +689,7 @@ export default Plugin.define({
         defaultDirectory: ctx.location.directory,
         changesets: opts.capabilities.changesets,
         terminals: opts.capabilities.terminals,
+        spawnPty: createBunSpawnPty(),
         send: (socketId, message) => {
           listener?.sendTo({ id: socketId }, JSON.stringify(message));
         },
@@ -641,7 +729,12 @@ export default Plugin.define({
       // text/reasoning, tool lifecycle, permissions, usage, turn
       // terminals, steering/queue handoff).
       host.startEventPump();
-      cleanupHost = () => host.stopEventPump();
+      cleanupHost = () => {
+        // Kill the pty terminals before the listener stops — their final
+        // terminal/exited actions still reach subscribers while it is up.
+        host.stopTerminals();
+        host.stopEventPump();
+      };
       console.log(
         `${TAG} AHP 1.0.0 host listening on ws${opts.tls ? "s" : ""}://${opts.host}:${listener.port}${opts.path} ` +
           `(token ${opts.token ? "from options" : "auto-generated"}; health ${opts.healthPath})`,

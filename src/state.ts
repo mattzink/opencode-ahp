@@ -60,6 +60,13 @@ export interface TerminalStateStore {
   readonly state: TerminalState;
   /** Apply a terminal-channel action through the official reducer. */
   apply(action: TerminalAction): TerminalState;
+  /**
+   * Replace the held state outright. The one non-reducer transition the
+   * host makes: the pty-content trim (the official terminal reducer is
+   * append-only and never trims; the host mirrors the VS Code reference
+   * client's rolling-buffer trim — design §12.2).
+   */
+  replace(state: TerminalState): TerminalState;
 }
 
 export function createRootStateStore(initial: RootState): RootStateStore {
@@ -122,6 +129,10 @@ export function createTerminalStateStore(initial: TerminalState): TerminalStateS
     },
     apply(action: TerminalAction): TerminalState {
       state = terminalReducer(state, action);
+      return state;
+    },
+    replace(next: TerminalState): TerminalState {
+      state = next;
       return state;
     },
   };

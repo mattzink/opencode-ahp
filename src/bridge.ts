@@ -664,6 +664,15 @@ export function initialSessionState(input: {
   customizations?: Customization[];
   status?: SessionStatus;
   changesets?: Changeset[];
+  /**
+   * The session's working directories (AHP `SessionMetadata.workingDirectories`):
+   * the location directory the session's agent has tool access to. VS Code's
+   * session list groups sessions by this workspace (label = the folder name,
+   * host-suffixed for remote hosts); a session without it lands in the
+   * "Unknown" bucket. Single entry — the host advertises no
+   * `multipleWorkingDirectories` capability, so clients may not mutate it.
+   */
+  workingDirectories?: string[];
 }): SessionState {
   return {
     provider: input.provider,
@@ -673,6 +682,9 @@ export function initialSessionState(input: {
     activeClients: input.activeClients ?? [],
     chats: [],
     defaultChat: undefined,
+    ...(input.workingDirectories !== undefined && input.workingDirectories.length > 0
+      ? { workingDirectories: input.workingDirectories }
+      : {}),
     ...(input.customizations !== undefined && input.customizations.length > 0
       ? { customizations: input.customizations }
       : {}),
@@ -732,6 +744,10 @@ export function buildSessionSummary(input: {
   modifiedAt: string;
   chats: ChatSummary[];
   defaultChat: string;
+  /** The session's working directories (see `initialSessionState`) — the root
+   * channel's session catalog carries the same `SessionMetadata` the session
+   * channel does, so the list must show the same workspace. */
+  workingDirectories?: string[];
 }): SessionSummary {
   return {
     resource: input.channel,
@@ -739,6 +755,9 @@ export function buildSessionSummary(input: {
     title: input.title,
     status: input.status,
     ...(input.activity !== undefined ? { activity: input.activity } : {}),
+    ...(input.workingDirectories !== undefined && input.workingDirectories.length > 0
+      ? { workingDirectories: input.workingDirectories }
+      : {}),
     createdAt: input.createdAt,
     modifiedAt: input.modifiedAt,
     chats: input.chats,

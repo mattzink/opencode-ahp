@@ -152,7 +152,8 @@ location boots → setup(ctx)
   5. host.startEventPump()
   → logs the listening URL
 location tears down → cleanup()
-  → stop keep-alive, stop the pump (aborts the event subscription),
+  → stop keep-alive, kill the pty terminals (final terminal/exited),
+    stop the pump (aborts the event subscription),
     stop the listener (drops every client connection); logged
 ```
 
@@ -263,12 +264,15 @@ eviction is safe.
 | session | `ahp-session:/<suffix>` | One per AHP session. The suffix is opaque and client-chosen; opencode session ids (`ses…`) double as suffixes for externally created sessions. Suffixes containing `/changeset/` are rejected (they would collide with changeset URIs). |
 | chat | `ahp-chat:/<suffix>` | One per chat. The default chat reuses the session's opencode id as its suffix (zero wire change for single-chat clients); peer chats carry client-chosen suffixes. |
 | changeset | `<owner>/changeset/uncommitted` · `<owner>/changeset/session` · `<owner>/changeset/turn/<turnId>` | Owner is a session channel (session kind) or a chat channel (uncommitted, turn kinds). See [§11](#11-changesets). |
-| terminal | `ahp-terminal:/<toolCallId>` | One per foreground `shell`-tool call. Suffix is the opencode tool-call id (globally unique per invocation). See [§12](#12-synthetic-terminals). |
+| terminal | `ahp-terminal:/<toolCallId>` | Synthetic: one per foreground `shell`-tool call. Suffix is the opencode tool-call id (globally unique per invocation). See [§12](#12-terminals). |
+| terminal (pty) | client-chosen URI (any scheme outside the `ahp-` namespace) | Interactive pty shells created via `createTerminal` — VS Code uses `agenthost-terminal://<uuid>`. The URI is opaque to the host; it classifies "terminal" only while the record is live. See [§12](#12-terminals). |
 
 The `ChannelRegistry` tracks which sockets are subscribed to which
 channel (broadcast targets), the set of live session ids (a session/chat
 channel is subscribable only while its session is registered), and the
-set of live terminal URIs.
+set of live terminal URIs — synthetic `ahp-terminal:` channels **and**
+client-chosen pty channels (the host adds/removes them in step with the
+record map, so a disposed pty URI is unsubscribable again).
 
 ### 5.2 Sequencer & replay
 
@@ -331,7 +335,8 @@ Requests (methods with an `id`) routed by the host:
 | `disposeChat` | `null`. Removes a peer chat (never the default chat) and its opencode backend session; publishes `session/chatRemoved`. AHP-side unbind happens *before* the backend removal so the racing `session.deleted` event doesn't double-publish. |
 | `resourceRead` | File content for the URIs this host advertises in changesets: `file://` (live disk, confined to the location directory), `ahp-content://head/…` (content at git HEAD), `ahp-content://snap/…` (a turn's captured before/after). `encoding` is `base64` (default) or `utf-8`. Errors: `-32008` not found, `-32009` outside the location. |
 | `invokeChangesetOperation` | The only operation the host offers is `discard-changes` (resource-scoped). See [§11.4](#114-discard-changes). |
-| `createTerminal` / `disposeTerminal` | Always `-32010`: this host's terminals are read-only renderings of shell-tool executions; the plugin surface can neither create nor destroy ptys. |
+| `createTerminal` | `null`. Spawns an interactive pty shell (`spawnPty` seam — Bun in production) in the resolved working directory and registers the client-chosen channel. Params: `channel` (client-chosen; the host namespace, including the reserved `ahp-terminal:` prefix, is refused), `claim` (a client claim for the dispatching client, or a session claim), `name?`, `cwd?`, `cols?`/`rows?` (defaults 80×24). The `cwd` accepts plain `file://` (what VS Code sends), the client's `vscode-agent-host:`/`agent-host:` wrapper, or a bare absolute path; anything malformed or outside the location directory clamps to the location directory. Errors: `-32601` (capability off, or the runtime cannot spawn ptys), `-32600` (host-namespace channel), `-32010` (AHP AlreadyExists — duplicate channel), `-32602` (malformed params), `-32603` (the spawn threw — logged, R2: the host survives). |
+| `disposeTerminal` | `null`. Kills the pty (a still-running process gets a final `terminal/exited`), drops the record, and refreshes the catalog. Idempotent: an unknown channel answers `null` (VS Code's shutdown path disposes terminals that may already be gone). Synthetic (session-owned) terminals are host-managed: `-32009` (AHP PermissionDenied). Capability off: `-32601`; missing channel: `-32602`. |
 | `setClientManagedSettingsPermissions` | Accepted and logged as a no-op — a VS Code-specific post-init notification with no AHP 1.0.0 counterpart; the connection must stay up. |
 | anything else | `-32601` for requests; unknown notifications are logged and dropped. |
 
@@ -397,6 +402,37 @@ the owner registers, or — if the owner has vanished from opencode after
 the grace window — the peer falls back to standalone registration (the
 data stays reachable).
 
+### 7.3 Workspace (`workingDirectories`)
+
+Every session the host publishes carries
+`workingDirectories: [directoryUri(location directory)]` — on the
+`SessionState` (session-channel snapshot, via `initialSessionState`) and
+on every `SessionSummary` (root `sessionAdded` / `sessionSummaryChanged`
+notifications and `listSessions`, via `sessionSummary`). The location
+directory is the single directory the session's agent has tool access to;
+it is the same directory the agent-directory customization points at.
+One entry only: the host advertises no `multipleWorkingDirectories`
+capability, so clients MUST NOT mutate the set (AHP working-directory
+actions are unusable).
+
+**Why the field is required for a usable session list (VS Code 1.145
+finding):** the Sessions view groups sessions into workspace sections; a
+session's workspace label comes from its AHP metadata —
+`buildAgentHostSessionWorkspace` (vscode
+`src/vs/workbench/contrib/sessions/common/agentHostSessionWorkspace.ts`)
+labels the session with `SessionState.project.displayName` when a project
+is present, else with the first `workingDirectories` entry (the remote
+provider maps the host's `file://` URI to `agent-host://<host>/<path>` and
+suffixes the label with the host name, e.g. `test-project [dev.zinky.lan]`).
+When **neither** field is present the workspace is undefined and the
+session renders under the **"Unknown"** fallback
+(`sessionsList.ts` → `sessionWorkspaceLabel`). Copilot quick chats are
+unaffected: they carry a client-side quick-chat flag that routes them into
+the dedicated **"Chats"** section regardless of workspace. The host
+publishes `workingDirectories` rather than `project` because a location
+directory is not necessarily a repository — `project` would mark the
+workspace `isRepository: true` and hand it the repo icon, a false claim.
+
 ## 8. Turn lifecycle (event pump)
 
 `Host.startEventPump()` runs a **single sequential async loop** over the
@@ -450,7 +486,7 @@ exactly as written:
 | `text.delta` / `reasoning.delta` | first delta for a part lazily emits `chat/responsePart`; subsequent ones emit `chat/delta` / `chat/reasoning`. |
 | `text.ended` / `reasoning.ended` | fallback for non-streaming providers: if no delta opened the part, emit it with the full text. |
 | `tool.input.started` | `chat/toolCallStart` (with a `contributor` of kind *client* when one of the session's active clients provides the tool — [§10](#10-client-provided-tools)). |
-| `tool.input.ended` | records the raw input; captures the **pre-edit file content** for changesets (the event fires before execution — the last safe point); opens the synthetic terminal for foreground shell calls ([§12](#12-synthetic-terminals)); for client-executed calls, clears the confirmation gate and raises a `toolClientExecution` input request on the session channel. |
+| `tool.input.ended` | records the raw input; captures the **pre-edit file content** for changesets (the event fires before execution — the last safe point); opens the synthetic terminal for foreground shell calls ([§12.1](#121-synthetic-terminals-shell-tool-renderings)); for client-executed calls, clears the confirmation gate and raises a `toolClientExecution` input request on the session channel. |
 | `tool.progress` | first sign the tool is running: `chat/toolCallReady` with `confirmed: "not-needed"` → status *running*. |
 | `tool.success` / `tool.failed` | closes the synthetic terminal first (even after the turn was torn down); then `chat/toolCallComplete` with the result — suppressed when the call is already terminal (e.g. a client-executed call the client completed; the tracking, including the client-tool record, is still cleared). |
 | `usage.updated` | `chat/usage` (session-cumulative tokens; the chat reducer replaces the turn's usage, so the latest is the turn's view). |
@@ -502,7 +538,8 @@ identifies a single chat once multi-chat is on).
 | `session/activeClientRemoved` | Same clientId check; echo + tool-union re-sync. |
 | `changeset/filesReviewChanged` | The only client-dispatchable changeset action: validates the channel resolves to a live changeset, echoes (the reducer toggles `reviewed` per file). |
 | `chat/draftChanged`, `chat/isReadChanged`, `chat/isArchivedChanged`, `session/isReadChanged`, `session/isArchivedChanged` | Echo-only (the state is client-side UI bookkeeping). |
-| any other client-dispatchable action | Echoed with a `rejectionReason` ("unsupported action …"), including every client action on a terminal channel ([§12](#12-synthetic-terminals)). |
+| `terminal/input`, `terminal/resized`, `terminal/claimed`, `terminal/titleChanged`, `terminal/cleared` | On a **pty** terminal: input/resize drive the process, claim/title/clear apply through the official reducer (rejections for the invalid shapes and the non-holder claim — [§12.2](#122-pty-terminals-interactive-shells)). On a **synthetic** terminal: every one is rejected ("read-only terminal …"). |
+| any other client-dispatchable action | Echoed with a `rejectionReason` ("unsupported action …"). |
 
 **Reducer traps (AHP 1.0.0 `chatReducer`).** Two echo fields are
 *required on the wire*: `chat/turnStarted.startedAt` and
@@ -647,10 +684,20 @@ store gets `changeset/cleared` (the protocol's "channel going away"
 case) so subscribers release their references, and the stores are
 dropped (their URIs become un-subscribable).
 
-## 12. Synthetic terminals
+## 12. Terminals
 
-Gated by `capabilities.terminals` (default **on**). These are **read-only
-renderings of `shell`-tool executions** — not ptys.
+Two kinds of terminal channels share the root catalog
+(`root/terminalsChanged`) and the AHP `TerminalState` shape: **synthetic**
+(read-only renderings of `shell`-tool executions, host-managed) and
+**pty** (interactive shells a client spawns via `createTerminal`). Both
+are gated by `capabilities.terminals` (default **on**); the capability
+off means synthetic channels never open and the terminal commands answer
+`-32601`.
+
+### 12.1 Synthetic terminals (shell-tool renderings)
+
+These are **read-only renderings of `shell`-tool executions** — not
+ptys.
 
 - A foreground `shell`-tool call (opencode tool names `shell` / `bash`)
   opens `ahp-terminal:/<toolCallId>` at `tool.input.ended` — the only
@@ -668,20 +715,89 @@ renderings of `shell`-tool executions** — not ptys.
   and `terminal/exited`. Finishing is idempotent and runs *before* the
   turn guard, so a command that outlives its turn still exits its
   terminal.
-- **Root catalog** (`root/terminalsChanged`, full replacement):
-  membership is **turn-scoped** — a terminal row is listed while its
-  turn is still the owning chat's active turn, so finished commands keep
-  their final lifecycle row until the turn ends, then the row drops. The
-  channel *state* is retained: it stays subscribable until the owning
-  chat/record is removed (existing socket subscriptions linger — the
-  session-removal precedent — but no further actions reach them).
+- **Root catalog**: membership is **turn-scoped** — a synthetic row is
+  listed while its turn is still the owning chat's active turn, so
+  finished commands keep their final lifecycle row until the turn ends,
+  then the row drops. The channel *state* is retained: it stays
+  subscribable until the owning chat/record is removed (existing socket
+  subscriptions linger — the session-removal precedent — but no further
+  actions reach them).
 - When a chat is removed, a still-running command gets a final
   `terminal/exited`, then the records and registry entries are dropped.
-- `createTerminal`/`disposeTerminal` always get `-32010` ("this host's
-  terminals are read-only renderings of shell tool calls"), and every
-  client-dispatchable terminal action (`input`, `resized`, `claimed`,
-  `titleChanged`, `cleared`) gets an explicit rejection echo so
-  write-ahead clients roll back cleanly.
+- Every client-dispatchable terminal action on a synthetic channel
+  (`input`, `resized`, `claimed`, `titleChanged`, `cleared`) gets an
+  explicit rejection echo ("read-only terminal …") so write-ahead clients
+  roll back cleanly. `disposeTerminal` on a synthetic channel gets
+  `-32009` (AHP PermissionDenied — the client is not permitted to dispose
+  host-managed terminals).
+
+### 12.2 PTY terminals (interactive shells)
+
+A `createTerminal` request spawns a real shell in a pty — the mechanism
+VS Code's Agents window needs to make a session usable (clicking a
+session opens an interactive terminal; a host that refuses
+`createTerminal` surfaces a launch-error toast).
+
+- **Spawn seam.** The host never calls the runtime directly: it calls
+  `HostOptions.spawnPty` (a `SpawnPty` injected by the plugin entry).
+  In production the entry provides a `Bun.spawn`-backed factory — opencode
+  ships as a Bun-compiled binary, so `Bun.spawn(…, { terminal: {…} })`
+  gives a real pty with no external dependency (shell = `$SHELL`,
+  fallback `/bin/bash`; login shells `-l`; `TERM=xterm-256color`). Unit
+  tests inject a fake. When the runtime cannot spawn ptys the seam is
+  `undefined` and both terminal commands answer `-32601` (R2: no
+  crash, no dev-mode bypass).
+- **Channel.** The URI is **client-chosen** and opaque — VS Code uses
+  `agenthost-terminal://<uuid>`. It classifies "terminal" only while the
+  host's record map holds it (`kindOf`), so the registry's live-terminal
+  set (not a URI prefix) gates subscribability. The host refuses any
+  channel in the `ahp-` namespace — including the reserved
+  `ahp-terminal:` synthetic prefix (`-32600`). A duplicate channel gets
+  `-32010` (AHP AlreadyExists).
+- **Working directory.** `cwd` accepts a plain `file://` URI (what VS
+  Code sends — it unwraps its own wrapper before the wire), the client's
+  `vscode-agent-host:`/`agent-host:` wrapper (URI path, with the `_ah`
+  urlsafe-base64 meta path winning when present), or a bare absolute
+  path. Anything malformed, and anything outside the location directory,
+  clamps to the location directory: the shell is a tool of the session's
+  agent and must not spawn outside its working root.
+- **State & lifecycle.** The seed has `isPty: true`, the (resolved)
+  directory `cwd`, the requested `cols`/`rows` (default 80×24), the
+  requested `name` (default "Shell"), the creating client's claim, and a
+  running lifecycle. `supportsCommandDetection` is **omitted** (no OSC-633
+  in v1 — clients check `=== true`, so omission is "no"). `terminal/data`
+  streams the pty output to subscribers (the official reducer appends to
+  the content tail — one growing unclassified part while no command is
+  executing); `terminal/exited` carries the process exit code when the
+  runtime reported one.
+- **Client-dispatchable actions** (see [§9](#9-client-dispatchable-actions)):
+  `terminal/input` and `terminal/resized` drive the live process (rejected
+  once it has exited — a dead pty has no stdin to write to);
+  `terminal/claimed` applies only when the dispatching client currently
+  holds the client claim (a claim is not a credential — naming someone
+  else is rejected; session claims are host-mediated, never
+  client-dispatchable); `terminal/titleChanged` (non-empty) and
+  `terminal/cleared` apply through the official reducer and stay allowed
+  after exit (the state still exists). Accepted title/claim changes
+  refresh the root catalog (VS Code reference parity:
+  `_setTitle`/`_setClaim` → `_broadcastTerminalList`).
+- **Content trim.** The official terminal reducer is append-only and never
+  trims; the host mirrors the VS Code reference client's rolling buffer
+  after each `terminal/data` apply: once the stored content exceeds
+  100 000 chars it trims back to 80 000 (drop whole parts from the front,
+  then slice the head part) via a `store.replace` transition — the one
+  non-reducer state change the host makes. The replay window still
+  carries the raw `terminal/data` actions (inherent — the window is
+  shared with every other channel).
+- **Catalog & teardown.** A pty row is listed while its record is alive
+  (running **or** exited) until the client disposes it or the location
+  tears down. `disposeTerminal` publishes a final `terminal/exited` for a
+  still-running process (no exit code — a host kill), kills the process,
+  and drops the record + registry entry. The pty's own
+  `onOutput`/`onExit` callbacks re-look-up the record, so a dispose that
+  races them no-ops cleanly. `stopTerminals()` (location teardown, run
+  before the listener stops so the final `terminal/exited` actions still
+  reach subscribers) kills every live pty.
 
 ## 13. Reconnection & recovery
 
@@ -754,10 +870,13 @@ titles are re-derived (`Chat 2`, …) — a documented divergence.
 
 ### 13.4 Location teardown
 
-The plugin's cleanup stops the keep-alive timer, aborts the event
-pump (ending the `ctx.event.subscribe` iteration), and stops the
-listener (dropping every connection). The teardown logs a single line —
-a torn-down listener with no log line is otherwise undiagnosable.
+The plugin's cleanup stops the keep-alive timer, kills every live pty
+terminal (`stopTerminals` — a still-running process gets a final
+`terminal/exited` so subscribers see the row exit rather than the socket
+drop), aborts the event pump (ending the `ctx.event.subscribe`
+iteration), and stops the listener (dropping every connection). The
+teardown logs a single line — a torn-down listener with no log line is
+otherwise undiagnosable.
 
 ## 14. Error handling & graceful degradation
 
@@ -785,6 +904,8 @@ never opencode.
 | Client-tool sync failure | Logged; the AHP active-client state stays authoritative. |
 | Event pump failure | Logged; the pump stops and the host keeps serving. |
 | `disposeChat` backend-removal failure | The AHP chat is dropped anyway; the lingering opencode session shows in the TUI until deleted there. |
+| pty spawn failure (`createTerminal`) | Logged; the command answers `-32603`; the host keeps serving (R2). |
+| pty kill failure (dispose / teardown) | Logged; the record and registry entry are dropped anyway. |
 
 The JSON-RPC error code table used by the host:
 
@@ -792,16 +913,16 @@ The JSON-RPC error code table used by the host:
 | --- | --- |
 | `-32700` | Parse error (malformed JSON). |
 | `-32600` | Invalid request (not a 2.0 request object; pre/post-handshake misuse). |
-| `-32601` | Method not found. |
-| `-32602` | Invalid params (all command/action validation). |
-| `-32603` | Internal error (logged; unexpected router/bridge failure). |
+| `-32601` | Method not found — including the terminal commands when the `terminals` capability is off or the runtime cannot spawn ptys (no `spawnPty`). |
+| `-32602` | Invalid params (all command/action validation; subscribe to an unresolvable channel, incl. a disposed pty URI). |
+| `-32603` | Internal error (logged; unexpected router/bridge failure — incl. a pty spawn that threw). |
 | `-32001` | Session (or chat) not found. |
 | `-32002` | No agent for the requested provider. |
 | `-32003` | Session (or chat) already exists. |
 | `-32005` | Unsupported protocol version (with `data.supportedVersions`). |
-| `-32008` | Not found (channel/terminal/content ref). |
-| `-32009` | Permission denied (path outside the location directory, or a `file://` read failure). |
-| `-32010` | Not supported (`createTerminal`, `disposeTerminal`). |
+| `-32008` | Not found (channel/terminal/content ref; a synthetic terminal whose record is gone). |
+| `-32009` | Permission denied (path outside the location directory, a `file://` read failure, or `disposeTerminal` on a host-managed synthetic terminal). |
+| `-32010` | Already exists (`createTerminal` for a channel that is already open). AHP 1.0.0 defines no "not supported" code — the standard `-32600…-32603` range covers those shapes. |
 
 ## 15. Persistence & durability
 

@@ -137,7 +137,9 @@ export interface SubscribeOutcome {
 /**
  * Subscription bookkeeping keyed by transport socket id, plus the set of
  * live session ids and the set of live terminal channel URIs (the host
- * adds/removes them as synthetic terminals are opened and torn down).
+ * adds/removes them as terminals are opened and torn down — synthetic
+ * `ahp-terminal:` channels AND client-chosen pty terminal channels from
+ * `createTerminal`, whose URIs classify "unknown" by prefix alone).
  */
 export class ChannelRegistry {
   private readonly subs = new Map<number, Set<string>>();
@@ -147,8 +149,12 @@ export class ChannelRegistry {
   /** Subscribe a socket to a channel; fails for unknown URIs, dead sessions, or gone terminals. */
   subscribe(socketId: number, uri: string): SubscribeOutcome {
     const kind = channelKind(uri);
-    if (kind === "unknown") return { ok: false, reason: "unknown-uri" };
-    if (kind !== "root") {
+    if (kind === "unknown") {
+      // A client-chosen terminal URI (a live pty terminal) classifies
+      // "unknown" by prefix; it is subscribable while the host keeps it
+      // in the live-terminal set (in step with the record map).
+      if (!this.terminals.has(uri)) return { ok: false, reason: "unknown-uri" };
+    } else if (kind !== "root") {
       let id: string | null;
       if (kind === "changeset") {
         const parsed = parseChangesetChannel(uri);
@@ -206,7 +212,7 @@ export class ChannelRegistry {
     return this.sessions.has(sessionID);
   }
 
-  // ── live terminals (synthetic shell-command terminals) ────────────────
+  // ── live terminals (synthetic channels + client-chosen pty channels) ──
 
   addTerminal(uri: string): void {
     this.terminals.add(uri);

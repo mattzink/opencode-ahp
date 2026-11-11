@@ -92,11 +92,13 @@ testing: `docs/testing.md`).
 - **Never touch the daily `:80` `opencode serve --service`** (or its
   `~/.config/opencode/opencode.jsonc` config) — it is the user's running
   service.
-- The **LAN test server** (port 4098, AHP 8767, isolated XDG homes under
-  `/tmp/opencode/ahp-lan/`, config in
-  `/tmp/opencode/ahp-scratch/project-lan/.opencode/opencode.jsonc`) may be
-  reloaded (`POST /api/location/reload`) or restarted for testing.
-- Scratch state goes under `/tmp/opencode/`, never in tracked directories.
+- The **LAN test server** (port 4098, AHP 8767, everything under
+  `/tmp/ahp-server/` — isolated XDG homes plus the scaffolded
+  `test-project/` location whose `.opencode/opencode.jsonc` pins this
+  checkout) is brought up by `node scripts/ahp-server.mjs` (testing.md
+  §3.1) and may be reloaded (`POST /api/location/reload`) or restarted
+  (`--restart`) for testing.
+- Scratch state goes under `/tmp/`, never in tracked directories.
 
 ### Architecture constraints
 

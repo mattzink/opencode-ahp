@@ -28,7 +28,7 @@ options.
 ## 1. Unit tests (Vitest)
 
 `pnpm test` runs `vitest run` over `src/test/**/*.test.ts`
-(`vitest.config.ts`). Nine suites, 265 tests as of 2026-11-09, a few
+(`vitest.config.ts`). Nine suites, 285 tests as of 2026-11-10, a few
 seconds wall time:
 
 ```sh
@@ -55,7 +55,7 @@ under test used.
 | `bridge.test.ts` | the `mapV2Event` catalog — opencode V2 events → AHP chat actions (part deltas, tool lifecycle, permission events, usage, inbox, execution terminals); catalog mapping (providers/models/agents/customizations); changeset file builders + diff stats; content refs. |
 | `client-tools.test.ts` | client-provided tool definition normalization, the cross-session union, provider lookup, schema/description extraction. |
 | `keep-alive.test.ts` | `KeepAlive` start/tick/stop with injected capturing timers. |
-| `host.test.ts` | the whole host: `initialize`, `createSession`/`listSessions`, the turn lifecycle, permission round trips, steering/queue, cancel + terminal events, external sessions, changesets (catalogues, subscribe/refresh, turn before-capture), `resourceRead`, `invokeChangesetOperation`, `filesReviewChanged`, teardown + capability gating, client tools, multi-chat + chat-binding durability, synthetic terminals, `resolveSessionConfig`. |
+| `host.test.ts` | the whole host: `initialize`, `createSession`/`listSessions`, the turn lifecycle, permission round trips, steering/queue, cancel + terminal events, external sessions, changesets (catalogues, subscribe/refresh, turn before-capture), `resourceRead`, `invokeChangesetOperation`, `filesReviewChanged`, teardown + capability gating, client tools, multi-chat + chat-binding durability, terminals (synthetic shell-tool renderings + pty `createTerminal`/`disposeTerminal` with a fake `spawnPty` seam), `resolveSessionConfig`. |
 
 **Fixtures.** `src/test/fixtures/events.jsonl` holds a captured
 `V2EventEncoded` stream (one event per line, arrival order) that
@@ -98,41 +98,47 @@ Exit codes are uniform: `0` success · `1` protocol/verification failure ·
 
 The tests run against a **separate isolated server** — never the daily
 `:80` `opencode serve --service` (and its `opencode.jsonc`), which stays
-untouched. All scratch state lives under `/tmp/opencode/`.
+untouched. All scratch state lives under `/tmp/ahp-server/` (isolated XDG
+homes under `{data,state,cache}`, and the location/project directory at
+`test-project/`).
 
-Preconditions: opencode v2.2.6 and this repo on the host machine; the
-scratch project at `/tmp/opencode/ahp-scratch/project-lan` (its
-`.opencode/opencode.jsonc` pins this checkout as a dev plugin with
+[`scripts/ahp-server.mjs`](../scripts/ahp-server.mjs) (dependency-free
+Node) brings the whole thing up: it creates the isolated XDG homes and —
+on a fresh scratch tree, never copying previous state — scaffolds the
+location project `/tmp/ahp-server/test-project` (a
+`.opencode/opencode.jsonc` pinning this checkout as a dev plugin with
 `host: 0.0.0.0`, `port: 8767`, a fixed `token`, `allowedOrigins: "*"`,
-and a 1-minute keep-alive interval for live tests).
-
-**1. Start the test server** — isolated XDG homes (the user's real
-opencode state is untouched), bound to all interfaces:
+and a 1-minute keep-alive interval, plus a `.gitignore`, `git init`, and
+an initial commit of the scaffold so the working tree starts clean),
+generates the Basic-auth password itself via
+`OPENCODE_SERVER_PASSWORD` and prints it, boots the location — the
+one-time cold-boot step that starts the AHP listener (a location and its
+plugins only boot when a client opens it or the API is asked for it; the
+keep-alive then holds it indefinitely) — waits for the AHP healthz, and
+prints a summary (Basic-auth password, AHP URL, the PC B URL with token,
+the TUI command line, log path). It is idempotent: an already-running test server is reused (its
+password is recovered from the process environment), and the location boot
+is idempotent.
 
 ```sh
-mkdir -p /tmp/opencode/ahp-lan/{data,state,cache}
-cd /tmp/opencode/ahp-scratch/project-lan
-env XDG_DATA_HOME=/tmp/opencode/ahp-lan/data \
-    XDG_STATE_HOME=/tmp/opencode/ahp-lan/state \
-    XDG_CACHE_HOME=/tmp/opencode/ahp-lan/cache \
-    opencode serve --hostname 0.0.0.0 --port 4098
+node scripts/ahp-server.mjs              # start (or reuse) + boot location + wait for healthz; exit 0, server left running
+node scripts/ahp-server.mjs --foreground # same, but stay attached (Ctrl-C stops the server)
+node scripts/ahp-server.mjs --restart    # stop the running test server first, then start fresh
+node scripts/ahp-server.mjs --no-boot    # skip the location boot (AHP host state reported informationally)
+node scripts/ahp-server.mjs --stop       # stop the test server (isolated state is kept)
 ```
 
-Keep the terminal open. Expected stdout:
-
-```text
-server listening on http://0.0.0.0:4098
-server password <PASSWORD>          ← only when OPENCODE_SERVER_PASSWORD is NOT set
-[opencode-ahp] AHP 1.0.0 host listening on ws://0.0.0.0:8767/ahp (token from options; health /healthz)
-```
+Flags: `--port 4098` · `--hostname 0.0.0.0` · `--scratch /tmp/ahp-server`
+(the whole tree) · `--location-dir` (defaults to
+`<scratch>/test-project`).
 
 Notes:
 
-- `<PASSWORD>` is the Basic-auth password for the opencode HTTP API; it is
-  printed once when `OPENCODE_SERVER_PASSWORD` is not set (a set value is
-  used silently).
-- The AHP token is fixed in the project config, so no token line is
-  printed for it. R4 requires an explicit token for a non-loopback bind.
+- The Basic-auth password (`opencode / <PASSWORD>`) is generated for each
+  fresh server and printed by the script; a reused server's password comes
+  from its process environment.
+- The AHP token is fixed in the generated project config. R4 requires an
+  explicit token for a non-loopback bind.
 - `allowedOrigins: "*"` is test mode; production setups list exact
   Origins.
 - **No `experimental.location_idle_timeout` entry** — not needed. The
@@ -141,19 +147,7 @@ Notes:
   touches an internal anchor session, which opencode counts as location
   activity, so the 60-minute idle eviction never fires.
 
-**2. Boot the location.** A location (and its plugins) only boots when a
-client opens it or the API is asked for it:
-
-```sh
-curl -g -u "opencode:<PASSWORD>" \
-  'http://127.0.0.1:4098/api/location?location[directory]=/tmp/opencode/ahp-scratch/project-lan'
-```
-
-The AHP listener starts at the same moment. This one-time boot is the
-architectural cold-boot step (plugins cannot run before their location
-boots); the keep-alive then holds it indefinitely.
-
-**3. Verify the host side:**
+**Verify the host side** (the script already waited for the healthz):
 
 ```sh
 curl -s -o /dev/null -w '%{http_code}\n' http://127.0.0.1:8767/healthz            # 200
@@ -168,12 +162,32 @@ equivalent.)
 **Troubleshooting — AHP port dead but the server is up** (`healthz` →
 connection refused, :4098 still 200): with keep-alive active (check the
 server log for `keep-alive active`) this should not happen; if it does,
-the location was evicted or the plugin failed to start, and the same
-re-boot fixes it — the plugin setup re-runs and the listener comes back
-(same `curl` as step 2). VS Code reconnects on its own (the host's
-clientId registry resets, so the client re-initializes from a fresh
-snapshot). A clean location teardown logs `location teardown — stopping
-the AHP host`.
+the location was evicted or the plugin failed to start, and re-booting the
+location fixes it — the plugin setup re-runs and the listener comes back.
+Any of these re-boots the location (VS Code reconnects on its own — the
+host's clientId registry resets, so the client re-initializes from a fresh
+snapshot):
+
+1. **Re-run the script** (idempotent — reuses the server and re-boots the
+   location): `node scripts/ahp-server.mjs`
+2. **Open the location in the opencode TUI**, pointed at the test server
+   (`--server` is a global flag; the directory is a positional argument —
+   the TUI opens the location for it; the script prints this line in its
+   summary):
+
+   ```sh
+   OPENCODE_SERVER_PASSWORD=<password> opencode --server http://127.0.0.1:4098 /tmp/ahp-server/test-project
+   ```
+
+3. **Boot the location via the API**:
+
+   ```sh
+   curl -g -u "opencode:<password>" \
+     'http://127.0.0.1:4098/api/location?location[directory]=/tmp/ahp-server/test-project'
+   ```
+
+A clean location teardown logs `location teardown — stopping the AHP
+host`.
 
 ### 3.2 The scripts
 
@@ -184,22 +198,29 @@ the AHP host`.
 | `scripts/ahp-changesets.mjs` | Changesets end to end: catalogues (session + chat), a file-editing turn surfacing the file in the uncommitted changeset, the turn changeset with snap content refs, `resourceRead` (`file://`, `ahp-content://head`, snap before/after, plus the -32009/-32008 error cases), `filesReviewChanged`, and `discard-changes` through `invokeChangesetOperation`. |
 | `scripts/ahp-client-tools.mjs` | Client-provided tools through the real opencode tool registry: a `ping` tool registered via `createSession.activeClient.tools`, then three turns — happy path (client-executed contributor, single `toolCallComplete`, result in the snapshot), failed result (the model sees the error; the turn still completes), and `requiresResultConfirmation` (the call parks in `pending-result-confirmation`; approving via `chat/toolCallResultConfirmed` releases the held result). |
 | `scripts/ahp-multi-chat.mjs` | Multi-chat: the `multipleChats` capability in the root catalog, `createChat` minting a fresh opencode backend on a client-chosen URI, independent turns on both chats, the `listSessions` differential (peer backends never resurface as sessions), and reload durability with `--leave-peer` / `--recheck` across a location reload. |
+| `scripts/ahp-terminal-probe.mjs` | The pty terminal surface: `initialize` → `createTerminal` (a real shell pty on a client-chosen channel) → the root catalog row → the subscribe snapshot (`isPty`, title, size, directory cwd) → `terminal/input` (a marker command, expecting its output line back through `terminal/data` — the stream is stripped of ANSI/OSC/CSI prompt machinery first) → `terminal/resized` (state tracks it) → `disposeTerminal` (final `terminal/exited`, catalog row drops). |
 | `scripts/capture-events.mjs` | Offline fixture capture (no AHP involved): boots a scratch location, opens the server's SSE event stream, runs one small tool-using prompt, and records every V2Event envelope to `src/test/fixtures/events.jsonl` for the unit suites ([§1](#1-unit-tests-vitest)). |
 
 Usage (the token is the one from the project config):
 
 ```sh
 TOKEN=$(sed -n 's/.*"token": "\([^"]*\)".*/\1/p' \
-  /tmp/opencode/ahp-scratch/project-lan/.opencode/opencode.jsonc)
+  /tmp/ahp-server/test-project/.opencode/opencode.jsonc)
 
 node scripts/ahp-client.mjs  --token "$TOKEN" --base http://127.0.0.1:8767   # lifecycle probe
 node scripts/ahp-client.mjs  --token "$TOKEN" --base http://127.0.0.1:8767 --probe
 node scripts/ahp-turn-lifecycle.mjs --token "$TOKEN" --base http://127.0.0.1:8767
 node scripts/ahp-changesets.mjs  --token "$TOKEN" --base http://127.0.0.1:8767 \
-  --location-dir /tmp/opencode/ahp-scratch/project-lan
+  --location-dir /tmp/ahp-server/test-project
 node scripts/ahp-client-tools.mjs --token "$TOKEN" --base http://127.0.0.1:8767
 node scripts/ahp-multi-chat.mjs  --token "$TOKEN" --base http://127.0.0.1:8767
+node scripts/ahp-terminal-probe.mjs --token "$TOKEN" --base http://127.0.0.1:8767 \
+  --project-dir /tmp/ahp-server/test-project
 ```
+
+(`ahp-changesets.mjs` also ensures its git fixture — the `notes.txt`
+baseline committed at `line1\nline2` — so it can run right after a fresh
+`scripts/ahp-server.mjs` run.)
 
 **When to run them.** Changes that alter live behavior (transport, host,
 keep-alive) should be verified against the test server — at minimum
@@ -228,16 +249,16 @@ Nothing is installed on PC B — VS Code ships the AHP client.
 
 ### 4.2 PC A — host side
 
-1. **Start the test server** and **boot the location** exactly as in
-   [§3.1](#31-the-isolated-test-server) (steps 1–2).
-2. **Verify the host side** as in §3.1 (step 3), then hand over:
+1. **Start the test server and boot the location** with
+   `node scripts/ahp-server.mjs` ([§3.1](#31-the-isolated-test-server)).
+   It prints the "PC B URL" line for you:
 
    ```text
    ws://10.0.1.107:8767/ahp?token=xsnilxgywpthjZuhdRbjpf5O5mNATD3BaGXhdcw5ui0
    ```
 
-   (Replace the IP if step 3 says otherwise. The token in the URL is the
-   one from the project config — regenerate it if you changed it.)
+   (The IP is the machine's LAN IP; the token is the one from the project
+   config — regenerate it there and re-run the script if you change it.)
 
 ### 4.3 PC B — client side (VS Code 1.145.2)
 
@@ -265,10 +286,10 @@ Nothing is installed on PC B — VS Code ships the AHP client.
 
 ### 4.4 Teardown (PC A)
 
-- Ctrl-C in the serve terminal.
-- `rm -rf /tmp/opencode/ahp-lan` (isolated state).
-- The `project-lan/` directory and its config can stay; they are inert
-  until a server loads them.
+- `node scripts/ahp-server.mjs --stop` (or Ctrl-C in a `--foreground`
+  serve terminal).
+- `rm -rf /tmp/ahp-server` (isolated state, including the scaffolded
+  `test-project/`).
 
 ### 4.5 Known-open manual verifications
 
@@ -283,8 +304,10 @@ run them as part of this two-machine pass:
   rejected; correct token from a VS Code desktop Origin accepted).
 - Mid-turn disconnect (airplane mode / `ss -K`) → reconnect → replay or
   snapshot, no duplicate turns; mid-turn steering and queued messages.
-- Whether the Agents window renders session-claimed terminals (the wire
-  surface is fully verified; client-side rendering is not).
+- Clicking a session opens an **interactive terminal** (the pty path —
+  no "createTerminal is not supported" toast) and typing in it reaches the
+  shell (the wire surface is fully verified by
+  `scripts/ahp-terminal-probe.mjs`; client-side rendering is not).
 
 ---
 

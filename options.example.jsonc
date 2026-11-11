@@ -60,8 +60,10 @@
   // catalogues in the session/chat snapshots; changeset URIs resolve to
   // nothing). Changesets require the location directory to be a git
   // repository.
-  // "terminals": false disables the synthetic shell-command terminal
-  // channels (shell-tool calls open no ahp-terminal: channels and the
-  // root state carries no terminals list).
+  // "terminals": false disables both terminal kinds: the synthetic
+  // shell-command terminal channels (shell-tool calls open no
+  // ahp-terminal: channels and the root state carries no terminals list)
+  // and the interactive pty shells (createTerminal/disposeTerminal
+  // answer not-found).
   // "capabilities": { "changesets": false, "terminals": false, "automations": false }
 }

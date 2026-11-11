@@ -28,8 +28,11 @@
  *      echo (mid-turn), reconnect with the same clientId +
  *      lastSeenServerSeq → replay (or snapshot) with no duplicate turn
  *
- * The location directory must be a git repository with notes.txt
- * committed at "line1\nline2\n".
+ * The location directory must be a git repository (scripts/ahp-server.mjs
+ * scaffolds it with opencode.jsonc + .gitignore + git init + an initial
+ * commit, so the working tree starts clean). This script ensures the
+ * notes.txt baseline ("line1\nline2\n") is committed — and
+ * restores a dirty working tree to it — before the run.
  *
  * Dependency-free: Node ≥ 22 global WebSocket.
  *
@@ -37,14 +40,15 @@
  *   node scripts/ahp-changesets.mjs --token <token> \
  *     [--base http://127.0.0.1:8767] [--path /ahp] \
  *     [--channel ahp-session:/lan-changesets] [--provider opencode] \
- *     [--location-dir /tmp/opencode/ahp-scratch/project-lan] \
+ *     [--location-dir /tmp/ahp-server/test-project] \
  *     [--timeout-ms 120000]
  *
  * Exit codes: 0 success · 1 protocol/verification failure · 2 connection
  */
-import { readFileSync } from "node:fs";
+import { readFileSync, writeFileSync, existsSync } from "node:fs";
 import { join } from "node:path";
 import { randomBytes } from "node:crypto";
+import { execFileSync } from "node:child_process";
 
 const TAG = "[ahp-changesets]";
 const fail = (code, msg) => {
@@ -64,13 +68,42 @@ const opts = {
   token: arg("--token", null),
   channel: arg("--channel", "ahp-session:/lan-changesets"),
   provider: arg("--provider", "opencode"),
-  locationDir: arg("--location-dir", "/tmp/opencode/ahp-scratch/project-lan"),
+  locationDir: arg("--location-dir", "/tmp/ahp-server/test-project"),
   timeoutMs: Number(arg("--timeout-ms", "120000")),
 };
 if (!opts.token) fail(2, "--token is required");
 
 const FILE = join(opts.locationDir, "notes.txt");
 const FILE_BEFORE = "line1\nline2\n";
+
+/**
+ * Ensure the git fixture: the location dir is a git repo (scaffolded by
+ * scripts/ahp-server.mjs) and notes.txt is committed at the baseline.
+ * Restores a dirty working tree to the baseline so a prior interrupted
+ * run doesn't leave stale changes in the uncommitted changeset.
+ */
+function ensureGitFixture() {
+  if (!existsSync(join(opts.locationDir, ".git"))) {
+    fail(2, `${opts.locationDir} is not a git repository (run scripts/ahp-server.mjs to scaffold it)`);
+  }
+  const git = (...args) =>
+    execFileSync("git", args, { cwd: opts.locationDir, encoding: "utf8", stdio: "pipe" });
+  let headContent = null;
+  try {
+    headContent = git("show", "HEAD:notes.txt");
+  } catch {
+    headContent = null; // no HEAD yet or notes.txt not committed
+  }
+  if (headContent !== FILE_BEFORE) {
+    writeFileSync(FILE, FILE_BEFORE);
+    git("add", "notes.txt");
+    git("-c", "user.name=ahp-test", "-c", "user.email=ahp-test@local", "commit", "-m", "notes.txt baseline");
+    console.log(`${TAG} committed notes.txt baseline`);
+  } else if (readFileSync(FILE, "utf8") !== FILE_BEFORE) {
+    git("checkout", "--", "notes.txt");
+    console.log(`${TAG} restored notes.txt working tree to baseline`);
+  }
+}
 const b64 = (s) => Buffer.from(s, "utf-8").toString("base64");
 const b64url = (s) =>
   Buffer.from(s, "utf-8").toString("base64").replace(/\+/g, "-").replace(/\//g, "_").replace(/=+$/, "");
@@ -214,6 +247,8 @@ function startTurn(chatChannel, turnId, text) {
 }
 
 try {
+  ensureGitFixture();
+
   // ── 1. catalogues ──────────────────────────────────────────────────────
   await connect();
   console.log(`${TAG} connected (clientId ${clientId})`);
