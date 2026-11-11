@@ -52,6 +52,16 @@
   // Global actions kept for reconnect replay; older gaps → fresh snapshot.
   // "replayWindow": 1000,
 
+  // Timestamped capture of the raw opencode event stream to the server
+  // log — one line per raw V2 event: `event ok` (mapped to the host),
+  // `event dropped (missing: <fields>)` (known type, unusable instance —
+  // or a malformed envelope), `event unimplemented` (no handler for the
+  // type) — with the raw `data` JSON (truncated to 300 chars). Off by
+  // default: a busy turn emits dozens of lines. The LAN test server
+  // script (scripts/ahp-server.mjs) enables it. Use it to attribute turn
+  // latency to host vs client vs model (design.md §8.1).
+  // "logEvents": true,
+
   // Host-side capability switches — never advertise what we don't
   // implement (in AHP 1.0.0 none of these is a wire field; discovery is
   // the state's optionality).

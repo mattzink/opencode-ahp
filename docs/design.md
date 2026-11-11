@@ -506,6 +506,48 @@ If the pump itself fails (a bridge error), the error is logged and the
 pump stops — the host keeps serving; streaming for new turns is gone
 until the location is reloaded (R2, [§14](#14-error-handling--graceful-degradation)).
 
+### 8.1 Event capture (`logEvents`)
+
+With the `logEvents` option on, **every raw opencode V2 event the plugin
+receives** is written to the server log as one timestamped line *before*
+it is handled — so the log proves what the host saw and when. Purpose:
+attributing turn latency to host, client, or model. A blank window in the
+event stream means the host never received the events (e.g. the model
+provider produced no output — "Considering…" on the client is then
+correct, not a plugin stall). The keep-alive anchor's events are filtered
+before classification, as from every AHP surface.
+
+Classification (`mapV2EventRaw` in bridge.ts — the only place that knows
+the raw wire shape; `mapV2Event` is its thin `ok → event, else null`
+wrapper, so the pump's behavior is unchanged):
+
+| Outcome | Meaning | Line |
+| --- | --- | --- |
+| `ok` | mapped into the `FacadeEvent` union and pumped | `… event ok: session.tool.input.started {"…"}` |
+| `dropped (missing: <fields>)` | a known type whose instance carries no usable fields — e.g. `session.tool.input.ended` with `text: ""` (opencode emits the accumulated raw input text, empty for a no-arg tool call, and the bridge treats empty as missing) — or a malformed envelope (not an object, missing `type`/`sessionID`) | `… event dropped (missing: text): session.tool.input.ended {"…"}` |
+| `unimplemented` | an event type the host has no handler for (the switch `default`) | `… event unimplemented: shell.created {"…"}` |
+
+Line format (`eventLogLine` + `timeStamp`, both pure and unit-tested):
+
+```
+[opencode-ahp] 19:04:41.520 event ok: session.tool.input.started {"sessionID":"ses_…","id":"tc_…",…}
+```
+
+- The timestamp is **local server time** when the event reached the
+  plugin (`HH:MM:SS.mmm`) — compare against `opencode.db` message
+  timestamps or the client wall clock for latency attribution.
+- The type is the **raw** opencode type (what was received, not the
+  mapped `FacadeEvent` type), and the payload is the raw `data` JSON,
+  truncated to 300 characters with an ellipsis (malformed envelopes log
+  the whole raw value).
+
+Off by default — a busy turn emits dozens of lines (the captured fixture
+turn is 38). The LAN test server
+([scripts/ahp-server.mjs](../scripts/ahp-server.mjs),
+[testing.md §3.1](testing.md#31-the-isolated-test-server)) enables it in
+the scaffolded project config, so live verification gets the capture for
+free: `grep "event " /tmp/ahp-server/server.log`.
+
 ## 9. Client-dispatchable actions
 
 `dispatchAction` is a **notification** — there is no JSON-RPC response.

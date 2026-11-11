@@ -58,6 +58,7 @@ describe("resolveOptions: precedence ctx ▸ file ▸ built-in", () => {
       keepAlive: false,
       keepAliveIntervalMinutes: 2,
       replayWindow: 7,
+      logEvents: true,
     };
     const o = resolveOptions(ctx, FILE);
     expect(o.enabled).toBe(false);
@@ -70,11 +71,20 @@ describe("resolveOptions: precedence ctx ▸ file ▸ built-in", () => {
     expect(o.keepAlive).toBe(false);
     expect(o.keepAliveIntervalMinutes).toBe(2);
     expect(o.replayWindow).toBe(7);
+    expect(o.logEvents).toBe(true);
   });
 
   it("keep-alive defaults to on with a 10-minute interval", () => {
     expect(resolveOptions(undefined, null).keepAlive).toBe(true);
     expect(resolveOptions(undefined, null).keepAliveIntervalMinutes).toBe(10);
+  });
+
+  it("event capture defaults to off; invalid values fall back", () => {
+    expect(resolveOptions(undefined, null).logEvents).toBe(false);
+    expect(resolveOptions({ logEvents: false }, JSON.stringify({ logEvents: true })).logEvents).toBe(false);
+    expect(resolveOptions({ logEvents: "yes" }, JSON.stringify({ logEvents: "no" })).logEvents).toBe(
+      BUILTIN_OPTIONS.logEvents,
+    );
   });
 });
 

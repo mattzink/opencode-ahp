@@ -28,7 +28,7 @@ options.
 ## 1. Unit tests (Vitest)
 
 `pnpm test` runs `vitest run` over `src/test/**/*.test.ts`
-(`vitest.config.ts`). Nine suites, 285 tests as of 2026-11-10, a few
+(`vitest.config.ts`). Nine suites, 298 tests as of 2026-11-10, a few
 seconds wall time:
 
 ```sh
@@ -52,7 +52,7 @@ under test used.
 | `handshake.test.ts` | `handleInitialize`: parameter validation, version negotiation (delegated to the pinned package — see [§5.3](#53-what-it-covers-for-this-host)), result shape. |
 | `seq.test.ts` | the global `Sequencer`: monotonic seq, snapshot `fromSeq`, replay window (within → replay, evicted → snapshot). |
 | `channels.test.ts` | channel kind + session/changeset URI helpers; `ChannelRegistry`: snapshot on subscribe, broadcast targets and sockets, live sessions. |
-| `bridge.test.ts` | the `mapV2Event` catalog — opencode V2 events → AHP chat actions (part deltas, tool lifecycle, permission events, usage, inbox, execution terminals); catalog mapping (providers/models/agents/customizations); changeset file builders + diff stats; content refs. |
+| `bridge.test.ts` | the `mapV2Event` catalog — opencode V2 events → AHP chat actions (part deltas, tool lifecycle, permission events, usage, inbox, execution terminals); `mapV2EventRaw` classification (ok / dropped-with-reason / unimplemented / malformed envelopes) + the `eventLogLine`/`timeStamp` capture-line format; catalog mapping (providers/models/agents/customizations); changeset file builders + diff stats; content refs. |
 | `client-tools.test.ts` | client-provided tool definition normalization, the cross-session union, provider lookup, schema/description extraction. |
 | `keep-alive.test.ts` | `KeepAlive` start/tick/stop with injected capturing timers. |
 | `host.test.ts` | the whole host: `initialize`, `createSession`/`listSessions`, the turn lifecycle, permission round trips, steering/queue, cancel + terminal events, external sessions, changesets (catalogues, subscribe/refresh, turn before-capture), `resourceRead`, `invokeChangesetOperation`, `filesReviewChanged`, teardown + capability gating, client tools, multi-chat + chat-binding durability, terminals (synthetic shell-tool renderings + pty `createTerminal`/`disposeTerminal` with a fake `spawnPty` seam), `resolveSessionConfig`. |
@@ -108,7 +108,9 @@ on a fresh scratch tree, never copying previous state — scaffolds the
 location project `/tmp/ahp-server/test-project` (a
 `.opencode/opencode.jsonc` pinning this checkout as a dev plugin with
 `host: 0.0.0.0`, `port: 8767`, a fixed `token`, `allowedOrigins: "*"`,
-and a 1-minute keep-alive interval, plus a `.gitignore`, `git init`, and
+a 1-minute keep-alive interval, and event capture on
+(`logEvents: true` — design.md [§8.1](design.md#81-event-capture-logevents)),
+plus a `.gitignore`, `git init`, and
 an initial commit of the scaffold so the working tree starts clean),
 generates the Basic-auth password itself via
 `OPENCODE_SERVER_PASSWORD` and prints it, boots the location — the
@@ -146,6 +148,14 @@ Notes:
   [design.md §15.3](design.md#153-keep-alive-anchor)) periodically
   touches an internal anchor session, which opencode counts as location
   activity, so the 60-minute idle eviction never fires.
+- **Event capture is on** (`logEvents: true` in the scaffolded config):
+  `grep "event " /tmp/ahp-server/server.log` shows one timestamped
+  `event ok|dropped|unimplemented` line per opencode event the plugin
+  saw — use it to attribute turn latency to host vs client vs model
+  (design.md [§8.1](design.md#81-event-capture-logevents)). An existing
+  project tree is not rewritten — edit its
+  `.opencode/opencode.jsonc` and re-boot the location (re-run the
+  script) to pick the option up.
 
 **Verify the host side** (the script already waited for the healthz):
 

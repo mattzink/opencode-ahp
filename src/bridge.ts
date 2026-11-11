@@ -153,6 +153,24 @@ export interface FacadeTokens {
 }
 
 /**
+ * The classified result of one raw opencode V2 event (event capture,
+ * design §8.1):
+ *  - `ok` — mapped into the narrow `FacadeEvent` union;
+ *  - `dropped` — a known type whose instance carries nothing usable
+ *    (`reason` names the missing fields), or a malformed envelope
+ *    (not an object, missing `type`/`sessionID`);
+ *  - `unimplemented` — an event type the host has no handler for.
+ *
+ * `mapV2Event` is the thin `ok → event, else null` wrapper over this;
+ * src/index.ts's events() generator uses the full outcome for the
+ * timestamped capture lines.
+ */
+export type V2EventOutcome =
+  | { status: "ok"; event: FacadeEvent }
+  | { status: "dropped"; type: string; reason: string }
+  | { status: "unimplemented"; type: string };
+
+/**
  * The narrow opencode surface the bridge needs. Implemented in
  * src/index.ts against the plugin `ctx` (the only ctx call sites — this
  * module stays pure); a fake in unit tests.
@@ -430,76 +448,103 @@ function num(v: unknown): number | undefined {
   return typeof v === "number" && Number.isFinite(v) ? v : undefined;
 }
 
+/** "a, b" — the names of the undefined values (drop reasons). */
+function missingOf(vals: Record<string, unknown>): string {
+  return Object.keys(vals).filter((k) => vals[k] === undefined).join(", ");
+}
+
 /**
- * Map a raw opencode V2 event (`{id, type, data}` — the fixture shape) to
- * the narrow `FacadeEvent` union, or null when the event carries nothing
- * the AHP host needs. Unknown types map to null (log-and-continue).
+ * Classify a raw opencode V2 event (`{id, type, data}` — the fixture
+ * shape) — `mapV2Event` is the thin `ok → event, else null` wrapper
+ * over this, and the timestamped capture lines (design §8.1) are
+ * formatted from the full outcome. Unknown types classify as
+ * `unimplemented` (log-and-continue, as before).
  */
-export function mapV2Event(raw: unknown): FacadeEvent | null {
-  if (!isObj(raw)) return null;
+export function mapV2EventRaw(raw: unknown): V2EventOutcome {
+  if (!isObj(raw)) return { status: "dropped", type: "?", reason: "not an event envelope" };
   const type = str(raw["type"]);
+  if (type === undefined) return { status: "dropped", type: "?", reason: "missing: type" };
   const data = isObj(raw["data"]) ? raw["data"] : {};
   const sessionID = str(data["sessionID"]);
-  if (type === undefined || sessionID === undefined) return null;
+  if (sessionID === undefined) return { status: "dropped", type, reason: "missing: sessionID" };
+
+  /** The `dropped` outcome for missing fields inside a known type. */
+  const drop = (fields: string): V2EventOutcome => ({ status: "dropped", type, reason: `missing: ${fields}` });
 
   switch (type) {
     case "session.created":
       return {
-        type: "session.created",
-        sessionID,
-        title: str(data["title"]),
-        agent: str(data["agent"]),
-        model: mapModelRef(data["model"]),
+        status: "ok",
+        event: {
+          type: "session.created",
+          sessionID,
+          title: str(data["title"]),
+          agent: str(data["agent"]),
+          model: mapModelRef(data["model"]),
+        },
       };
     case "session.deleted":
-      return { type: "session.deleted", sessionID };
+      return { status: "ok", event: { type: "session.deleted", sessionID } };
     case "session.renamed": {
       const title = str(data["title"]);
-      return title !== undefined ? { type: "session.renamed", sessionID, title } : null;
+      if (title === undefined) return drop("title");
+      return { status: "ok", event: { type: "session.renamed", sessionID, title } };
     }
     case "session.inbox.enqueued": {
       const inboxID = str(data["inboxID"]);
       const item = isObj(data["item"]) ? data["item"] : undefined;
       const payload = item !== undefined && isObj(item["payload"]) ? item["payload"] : undefined;
       const text = payload !== undefined ? str(payload["text"]) : undefined;
-      if (inboxID === undefined || text === undefined) return null;
+      if (inboxID === undefined || text === undefined)
+        return drop(missingOf({ inboxID, text }));
       const delivery = str(data["delivery"]) ?? str(item?.["delivery"]);
       return {
-        type: "inbox.enqueued",
-        sessionID,
-        inboxID,
-        text,
-        delivery: delivery === "steer" || delivery === "queue" ? delivery : "default",
+        status: "ok",
+        event: {
+          type: "inbox.enqueued",
+          sessionID,
+          inboxID,
+          text,
+          delivery: delivery === "steer" || delivery === "queue" ? delivery : "default",
+        },
       };
     }
     case "session.inbox.delivered": {
       const inboxID = str(data["inboxID"]);
-      return inboxID !== undefined ? { type: "inbox.delivered", sessionID, inboxID } : null;
+      if (inboxID === undefined) return drop("inboxID");
+      return { status: "ok", event: { type: "inbox.delivered", sessionID, inboxID } };
     }
     case "session.execution.started":
-      return { type: "execution.started", sessionID };
+      return { status: "ok", event: { type: "execution.started", sessionID } };
     case "session.execution.succeeded":
-      return { type: "execution.succeeded", sessionID };
+      return { status: "ok", event: { type: "execution.succeeded", sessionID } };
     case "session.execution.failed": {
       const error = isObj(data["error"]) ? data["error"] : undefined;
       return {
-        type: "execution.failed",
-        sessionID,
-        error: { type: error !== undefined ? (str(error["type"]) ?? "error") : "error", message: error !== undefined ? (str(error["message"]) ?? "") : "" },
+        status: "ok",
+        event: {
+          type: "execution.failed",
+          sessionID,
+          error: { type: error !== undefined ? (str(error["type"]) ?? "error") : "error", message: error !== undefined ? (str(error["message"]) ?? "") : "" },
+        },
       };
     }
     case "session.execution.interrupted":
-      return { type: "execution.interrupted", sessionID, reason: str(data["reason"]) ?? "user" };
+      return { status: "ok", event: { type: "execution.interrupted", sessionID, reason: str(data["reason"]) ?? "user" } };
     case "session.step.started": {
       const assistantMessageID = str(data["assistantMessageID"]);
       const model = mapModelRef(data["model"]);
-      if (assistantMessageID === undefined || model === undefined) return null;
+      if (assistantMessageID === undefined || model === undefined)
+        return drop(missingOf({ assistantMessageID, model }));
       return {
-        type: "step.started",
-        sessionID,
-        assistantMessageID,
-        agent: str(data["agent"]) ?? "build",
-        model,
+        status: "ok",
+        event: {
+          type: "step.started",
+          sessionID,
+          assistantMessageID,
+          agent: str(data["agent"]) ?? "build",
+          model,
+        },
       };
     }
     case "session.text.delta":
@@ -507,13 +552,17 @@ export function mapV2Event(raw: unknown): FacadeEvent | null {
       const assistantMessageID = str(data["assistantMessageID"]);
       const delta = str(data["delta"]);
       const ordinal = num(data["ordinal"]);
-      if (assistantMessageID === undefined || delta === undefined || ordinal === undefined) return null;
+      if (assistantMessageID === undefined || delta === undefined || ordinal === undefined)
+        return drop(missingOf({ assistantMessageID, delta, ordinal }));
       return {
-        type: type === "session.text.delta" ? "text.delta" : "reasoning.delta",
-        sessionID,
-        assistantMessageID,
-        ordinal,
-        delta,
+        status: "ok",
+        event: {
+          type: type === "session.text.delta" ? "text.delta" : "reasoning.delta",
+          sessionID,
+          assistantMessageID,
+          ordinal,
+          delta,
+        },
       };
     }
     case "session.text.ended":
@@ -521,71 +570,84 @@ export function mapV2Event(raw: unknown): FacadeEvent | null {
       const assistantMessageID = str(data["assistantMessageID"]);
       const text = str(data["text"]);
       const ordinal = num(data["ordinal"]);
-      if (assistantMessageID === undefined || text === undefined || ordinal === undefined) return null;
+      if (assistantMessageID === undefined || text === undefined || ordinal === undefined)
+        return drop(missingOf({ assistantMessageID, text, ordinal }));
       return {
-        type: type === "session.text.ended" ? "text.ended" : "reasoning.ended",
-        sessionID,
-        assistantMessageID,
-        ordinal,
-        text,
+        status: "ok",
+        event: {
+          type: type === "session.text.ended" ? "text.ended" : "reasoning.ended",
+          sessionID,
+          assistantMessageID,
+          ordinal,
+          text,
+        },
       };
     }
     case "session.tool.input.started": {
       const id = str(data["id"]);
       const name = str(data["name"]);
       const assistantMessageID = str(data["assistantMessageID"]);
-      if (id === undefined || name === undefined || assistantMessageID === undefined) return null;
-      return { type: "tool.input.started", sessionID, assistantMessageID, id, name };
+      if (id === undefined || name === undefined || assistantMessageID === undefined)
+        return drop(missingOf({ id, name, assistantMessageID }));
+      return { status: "ok", event: { type: "tool.input.started", sessionID, assistantMessageID, id, name } };
     }
     case "session.tool.input.ended": {
       const id = str(data["id"]);
       const text = str(data["text"]);
       const assistantMessageID = str(data["assistantMessageID"]);
-      if (id === undefined || text === undefined || assistantMessageID === undefined) return null;
-      return { type: "tool.input.ended", sessionID, assistantMessageID, id, text };
+      if (id === undefined || text === undefined || assistantMessageID === undefined)
+        return drop(missingOf({ id, text, assistantMessageID }));
+      return { status: "ok", event: { type: "tool.input.ended", sessionID, assistantMessageID, id, text } };
     }
     case "session.tool.progress": {
       const id = str(data["id"]);
-      return id !== undefined ? { type: "tool.progress", sessionID, id } : null;
+      if (id === undefined) return drop("id");
+      return { status: "ok", event: { type: "tool.progress", sessionID, id } };
     }
     case "session.tool.success": {
       const id = str(data["id"]);
-      if (id === undefined) return null;
+      if (id === undefined) return drop("id");
       const content = Array.isArray(data["content"])
         ? (data["content"] as unknown[]).map((c) => (isObj(c) ? mapToolContent(c) : undefined)).filter((c): c is FacadeToolContent => c !== undefined)
         : [];
-      return { type: "tool.success", sessionID, id, content, executed: data["executed"] === true };
+      return { status: "ok", event: { type: "tool.success", sessionID, id, content, executed: data["executed"] === true } };
     }
     case "session.tool.failed": {
       const id = str(data["id"]);
       const error = isObj(data["error"]) ? data["error"] : undefined;
-      if (id === undefined) return null;
+      if (id === undefined) return drop("id");
       return {
-        type: "tool.failed",
-        sessionID,
-        id,
-        error: { type: error !== undefined ? (str(error["type"]) ?? "error") : "error", message: error !== undefined ? (str(error["message"]) ?? "") : "" },
-        executed: data["executed"] === true,
+        status: "ok",
+        event: {
+          type: "tool.failed",
+          sessionID,
+          id,
+          error: { type: error !== undefined ? (str(error["type"]) ?? "error") : "error", message: error !== undefined ? (str(error["message"]) ?? "") : "" },
+          executed: data["executed"] === true,
+        },
       };
     }
     case "session.usage.updated": {
       const tokens = isObj(data["tokens"]) ? data["tokens"] : undefined;
-      if (tokens === undefined) return null;
+      if (tokens === undefined) return drop("tokens");
       const cache = isObj(tokens["cache"]) ? tokens["cache"] : undefined;
       return {
-        type: "usage.updated",
-        sessionID,
-        tokens: {
-          input: num(tokens["input"]) ?? 0,
-          output: num(tokens["output"]) ?? 0,
-          reasoning: num(tokens["reasoning"]) ?? 0,
-          cache: { read: cache !== undefined ? (num(cache["read"]) ?? 0) : 0, write: cache !== undefined ? (num(cache["write"]) ?? 0) : 0 },
+        status: "ok",
+        event: {
+          type: "usage.updated",
+          sessionID,
+          tokens: {
+            input: num(tokens["input"]) ?? 0,
+            output: num(tokens["output"]) ?? 0,
+            reasoning: num(tokens["reasoning"]) ?? 0,
+            cache: { read: cache !== undefined ? (num(cache["read"]) ?? 0) : 0, write: cache !== undefined ? (num(cache["write"]) ?? 0) : 0 },
+          },
         },
       };
     }
     case "permission.asked": {
       const id = str(data["id"]);
-      if (id === undefined) return null;
+      if (id === undefined) return drop("id");
       const source = isObj(data["source"]) && data["source"]["type"] === "tool" && str(data["source"]["id"]) !== undefined
         ? {
             type: "tool" as const,
@@ -594,24 +656,38 @@ export function mapV2Event(raw: unknown): FacadeEvent | null {
           }
         : undefined;
       return {
-        type: "permission.asked",
-        sessionID,
-        id,
-        action: str(data["action"]) ?? "",
-        message: str(data["message"]),
-        source,
+        status: "ok",
+        event: {
+          type: "permission.asked",
+          sessionID,
+          id,
+          action: str(data["action"]) ?? "",
+          message: str(data["message"]),
+          source,
+        },
       };
     }
     case "permission.replied": {
       const requestID = str(data["requestID"]);
       const reply = str(data["reply"]);
-      return requestID !== undefined && reply !== undefined
-        ? { type: "permission.replied", sessionID, requestID, reply }
-        : null;
+      if (requestID === undefined || reply === undefined)
+        return drop(missingOf({ requestID, reply }));
+      return { status: "ok", event: { type: "permission.replied", sessionID, requestID, reply } };
     }
     default:
-      return null;
+      return { status: "unimplemented", type };
   }
+}
+
+/**
+ * Map a raw opencode V2 event to the narrow `FacadeEvent` union, or
+ * null when the event carries nothing the AHP host needs — the `ok`
+ * view of `mapV2EventRaw` (`dropped`/`unimplemented` outcomes are
+ * log-and-continue; the capture lines see the full outcome).
+ */
+export function mapV2Event(raw: unknown): FacadeEvent | null {
+  const outcome = mapV2EventRaw(raw);
+  return outcome.status === "ok" ? outcome.event : null;
 }
 
 function mapModelRef(v: unknown): FacadeModelRef | undefined {
@@ -633,6 +709,56 @@ function mapToolContent(c: Record<string, unknown>): FacadeToolContent | undefin
     return { type: t, text: str(c["text"]) ?? str(c["patch"]) ?? "" };
   }
   return undefined;
+}
+
+// ── event capture lines ───────────────────────────────────────────
+
+/** The house log tag (shared with src/index.ts's console lines). */
+export const EVENT_LOG_TAG = "[opencode-ahp]";
+
+/** Max characters of the raw `data` JSON on a capture line. */
+const EVENT_LOG_PAYLOAD_MAX = 300;
+
+/**
+ * Local `HH:MM:SS.mmm` (zero-padded) for capture lines. The `Date` is
+ * passed in (not read here) so the formatter stays pure and unit-testable
+ * with a fixed instant.
+ */
+export function timeStamp(date: Date): string {
+  const pad = (n: number, width = 2) => String(n).padStart(width, "0");
+  return `${pad(date.getHours())}:${pad(date.getMinutes())}:${pad(date.getSeconds())}.${pad(date.getMilliseconds(), 3)}`;
+}
+
+/**
+ * One capture line per raw opencode event (design §8.1):
+ *
+ *   [opencode-ahp] 19:04:41.520 event ok: session.tool.input.started {"…"}
+ *   [opencode-ahp] 19:04:41.525 event dropped (missing: text): session.tool.input.ended {"…"}
+ *   [opencode-ahp] 19:04:41.530 event unimplemented: shell.created {"…"}
+ *
+ * The type is the **raw** opencode type (what the plugin received), and
+ * the payload is the raw `data` JSON — truncated to
+ * `EVENT_LOG_PAYLOAD_MAX` with an ellipsis — or the whole raw value when
+ * the envelope is malformed. `stamp` is precomputed (`timeStamp`) so this
+ * stays pure.
+ */
+export function eventLogLine(outcome: V2EventOutcome, raw: unknown, stamp: string): string {
+  const type = isObj(raw) ? (str(raw["type"]) ?? "?") : "?";
+  const payloadSource = isObj(raw) && isObj(raw["data"]) ? raw["data"] : raw;
+  let payload: string;
+  try {
+    payload = JSON.stringify(payloadSource) ?? "null";
+  } catch {
+    payload = "(unserializable)";
+  }
+  if (payload.length > EVENT_LOG_PAYLOAD_MAX) payload = `${payload.slice(0, EVENT_LOG_PAYLOAD_MAX)}…`;
+  const kind =
+    outcome.status === "ok"
+      ? "ok"
+      : outcome.status === "dropped"
+        ? `dropped (${outcome.reason})`
+        : "unimplemented";
+  return `${EVENT_LOG_TAG} ${stamp} event ${kind}: ${type} ${payload}`;
 }
 
 // ── state builders & summary mappers ────────────────────────────

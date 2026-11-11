@@ -111,20 +111,16 @@ Per-key resolution: the config entry's `options` ▸ an `options.jsonc`
 sibling of `src/index.ts` (checkouts only — copy
 [`options.example.jsonc`](options.example.jsonc)) ▸ built-in defaults.
 
+[`options.example.jsonc`](options.example.jsonc) documents the full
+option set — every key, its default, and what it does. A few of the
+important ones:
+
 | Key | Default | Description |
 | --- | --- | --- |
-| `enabled` | `true` | Master switch; `false` → no listener, the plugin is fully inert |
-| `port` | `8765` | WS listen port |
-| `host` | `"127.0.0.1"` | Bind address; a **non-loopback bind requires an explicit `token`** (the listener refuses to start otherwise) |
-| `path` | `"/ahp"` | WS path — VS Code's URL carries it verbatim |
 | `token` | auto | Omit → generated on first start, persisted in opencode's plugin storage, printed once to the service log. Accepted via the `?token=` query param and `Authorization: Bearer <token>`. **Always enforced**, loopback or not |
-| `allowedOrigins` | `"*"` | `"*"` or an exact list, e.g. `["vscode://vscode"]`. The token is still always required regardless |
-| `tls` | `null` | `{ keyPath, certPath }` — native TLS termination → `wss://` (off-LAN transports, D3). PEM **file paths**; the port becomes TLS-only (plain-HTTP requests to it fail) and the health endpoint is then HTTPS: `curl -k https://…:8765/healthz`. A missing/unreadable file disables the AHP listener — the opencode server keeps running |
-| `healthPath` | `"/healthz"` | Health endpoint (no auth): `curl …:8765/healthz` → `ok` (over the same TLS termination when `tls` is set) |
-| `keepAlive` | `true` | Keep the opencode location loaded against its idle timeout (`experimental.location_idle_timeout`, default 60 min) by periodically touching an internal anchor session — with this on, **no `location_idle_timeout` config entry is needed**. The anchor (`opencode-ahp (keep-alive)`) is a real opencode session: it shows in the TUI session list but is hidden from AHP clients (opencode's plugin surface cannot archive it) |
-| `keepAliveIntervalMinutes` | `10` | Minutes between keep-alive touches; keep well below the effective idle timeout |
-| `replayWindow` | `1000` | Per-channel actions kept for reconnect replay; older gaps → fresh snapshot |
-| `capabilities` | `{ changesets: true, terminals: true, automations: false }` | Host-side switches — never advertise what we don't implement (in AHP 1.0.0 none of these is a wire field; discovery is the state's optionality). Set `changesets` to `false` to disable the diff channels (the session/chat snapshots then carry no changeset catalogues and changeset URIs resolve to nothing); set `terminals` to `false` to disable both terminal kinds (no `root/terminals` list, `shell` calls open no `ahp-terminal:` channels, and `createTerminal`/`disposeTerminal` answer not-found) |
+| `host` | `"127.0.0.1"` | Bind address; a **non-loopback bind requires an explicit `token`** (the listener refuses to start otherwise) |
+| `port` | `8765` | WS listen port |
+| `keepAlive` | `true` | Keep the opencode location loaded against its idle timeout by periodically touching an internal anchor session — with this on, **no `location_idle_timeout` config entry is needed**. See the example file for the anchor's visibility details |
 
 ## Remote access (local LAN)
 

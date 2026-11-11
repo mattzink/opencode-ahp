@@ -57,7 +57,9 @@ import type { SpawnPty } from "./host-types.js";
 import { KeepAlive, KEEPALIVE_SESSION_ID } from "./keep-alive.js";
 import { errorMessage } from "./error.js";
 import {
-  mapV2Event,
+  eventLogLine,
+  mapV2EventRaw,
+  timeStamp,
   type FacadeAgent,
   type FacadeClientTool,
   type FacadeModel,
@@ -317,10 +319,19 @@ function isEnoent(err: unknown): boolean {
  * `execute` bridge needs the host, but the facade is constructed as part
  * of the host's own options — a mutable holder assigned right after
  * `new Host(...)` returns (the `listener` closure pattern).
+ *
+ * `logEvent`: the timestamped event-capture sink (the `logEvents`
+ * option, design §8.1) — one line per raw opencode event, or null when
+ * capture is off.
  */
 type HostRef = { current: Host | null };
 
-function implementFacade(ctx: Context, hiddenSessionID: string | null, hostRef: HostRef): OpencodeFacade {
+function implementFacade(
+  ctx: Context,
+  hiddenSessionID: string | null,
+  hostRef: HostRef,
+  logEvent: ((line: string) => void) | null,
+): OpencodeFacade {
   const locationDir = ctx.location.directory;
 
   // The cross-session client-tool set (client-provided tools).
@@ -473,15 +484,19 @@ function implementFacade(ctx: Context, hiddenSessionID: string | null, hostRef: 
       });
     },
     /**
-     * The mapped event stream (bridge.ts `mapV2Event` is the only place
-     * that knows the raw wire shape). Ends without error when the host's
-     * pump signal aborts (teardown).
+     * The mapped event stream (bridge.ts `mapV2EventRaw` is the only
+     * place that knows the raw wire shape). With the `logEvents` option
+     * on, every event is first written as a timestamped capture line
+     * (ok / dropped with reason / unimplemented, design §8.1); only
+     * `ok` events are yielded. Ends without error when the host's pump
+     * signal aborts (teardown).
      */
     async *events(signal: AbortSignal) {
       for await (const event of ctx.event.subscribe({ signal })) {
         if (hiddenSessionID !== null && isHiddenSessionEvent(event, hiddenSessionID)) continue;
-        const mapped = mapV2Event(event);
-        if (mapped !== null) yield mapped;
+        const outcome = mapV2EventRaw(event);
+        if (logEvent !== null) logEvent(eventLogLine(outcome, event, timeStamp(new Date())));
+        if (outcome.status === "ok") yield outcome.event;
       }
     },
     // ── changesets ────────────────────────────────
@@ -684,7 +699,12 @@ export default Plugin.define({
     try {
       const host = new Host({
         serverInfo: { name: "opencode-ahp", version: pluginVersion(), title: "OpenCode" },
-        facade: implementFacade(ctx, hiddenSessionID, hostRef),
+        facade: implementFacade(
+          ctx,
+          hiddenSessionID,
+          hostRef,
+          opts.logEvents ? (line) => console.log(line) : null,
+        ),
         replayWindow: opts.replayWindow,
         defaultDirectory: ctx.location.directory,
         changesets: opts.capabilities.changesets,

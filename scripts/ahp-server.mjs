@@ -8,7 +8,8 @@
  * serving the location /tmp/ahp-server/test-project. On a fresh scratch
  * dir it scaffolds that project itself (nothing is ever copied over):
  * .opencode/opencode.jsonc pinning this repo as a dev plugin with the AHP
- * host on 0.0.0.0:8767, a .gitignore, `git init`, and an initial commit
+ * host on 0.0.0.0:8767, a 1-minute keep-alive touch interval, and event
+ * capture on (logEvents), a .gitignore, `git init`, and an initial commit
  * of the scaffold so the working tree starts clean. By default it
  * also boots
  * the location — the one-time cold-boot step that starts the AHP listener
@@ -131,8 +132,11 @@ const repoRoot = path.resolve(path.dirname(new URL(import.meta.url).pathname), "
  * Scaffold the location project on a fresh scratch tree — only when the
  * location config is missing (an existing project is left untouched, git
  * repo or not). Creates .opencode/opencode.jsonc pinning this repo as a
- * dev plugin with the AHP host on 0.0.0.0:8767, a .gitignore (keeps
- * .opencode/ out of the git status the changeset surface reads),
+ * dev plugin with the AHP host on 0.0.0.0:8767, a 1-minute keep-alive
+ * touch interval, and event capture on (logEvents — the server log gets
+ * a timestamped event ok/dropped/unimplemented line per opencode event),
+ * a .gitignore (keeps .opencode/ out of the git status the changeset
+ * surface reads),
  * `git init`, and an initial commit of whatever is uncommitted — the
  * changeset surface reads git status, so the tree must start clean (the
  * notes.txt baseline stays with scripts/ahp-changesets.mjs). Nothing is
@@ -149,14 +153,15 @@ function ensureLocation() {
   "plugins": [
     {
       // LAN test — dev checkout, AHP host on 0.0.0.0:8767, 1-minute
-      // keep-alive touch interval (testing.md §3.1).
+      // keep-alive touch interval, event capture on (testing.md §3.1).
       "package": ${JSON.stringify(repoRoot)},
       "options": {
         "host": "0.0.0.0",
         "port": 8767,
         "token": "xsnilxgywpthjZuhdRbjpf5O5mNATD3BaGXhdcw5ui0",
         "allowedOrigins": "*",
-        "keepAliveIntervalMinutes": 1
+        "keepAliveIntervalMinutes": 1,
+        "logEvents": true
       }
     }
   ]

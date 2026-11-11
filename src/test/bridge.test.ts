@@ -14,14 +14,17 @@ import {
   computeLineDiffStats,
   DISCARD_OPERATION_ID,
   discardOperation,
+  eventLogLine,
   fileUri,
   headContentRef,
   mapAgentCustomizations,
   mapCatalog,
   mapV2Event,
+  mapV2EventRaw,
   parseContentRef,
   sessionChangesetCatalog,
   snapContentRef,
+  timeStamp,
   type FacadeAgent,
   type FacadeProvider,
 } from "../bridge.js";
@@ -796,6 +799,203 @@ describe("mapV2Event", () => {
       expect(mapV2Event({ id: "e" })).toBeNull();
       expect(mapV2Event({ id: "e", type: 7, data: { sessionID: "s" } })).toBeNull();
     });
+  });
+});
+
+// ── mapV2EventRaw (event capture classification) ─────────────────────────
+
+describe("mapV2EventRaw", () => {
+  it("ok: carries the mapped FacadeEvent", () => {
+    expect(
+      mapV2EventRaw(
+        v2("session.tool.input.started", {
+          assistantMessageID: "msg_a",
+          id: "tc1",
+          name: "shell",
+        }),
+      ),
+    ).toEqual({
+      status: "ok",
+      event: {
+        type: "tool.input.started",
+        sessionID: "ses_test",
+        assistantMessageID: "msg_a",
+        id: "tc1",
+        name: "shell",
+      },
+    });
+  });
+
+  it("dropped: a known type whose instance lacks usable fields names them", () => {
+    // The real-world case: opencode emits Tool.Input.Ended with the
+    // accumulated raw text — "" for a no-arg tool call — and str() drops
+    // empty strings, so the event is unusable.
+    expect(
+      mapV2EventRaw(
+        v2("session.tool.input.ended", {
+          assistantMessageID: "msg_a",
+          id: "tc1",
+          text: "",
+        }),
+      ),
+    ).toEqual({
+      status: "dropped",
+      type: "session.tool.input.ended",
+      reason: "missing: text",
+    });
+    expect(mapV2EventRaw(v2("session.text.delta", { ordinal: 1, delta: "x" }))).toEqual({
+      status: "dropped",
+      type: "session.text.delta",
+      reason: "missing: assistantMessageID",
+    });
+    expect(
+      mapV2EventRaw(v2("session.text.delta", { assistantMessageID: "m", ordinal: 1 })),
+    ).toEqual({
+      status: "dropped",
+      type: "session.text.delta",
+      reason: "missing: delta",
+    });
+    expect(
+      mapV2EventRaw(v2("session.text.delta", { assistantMessageID: "m", delta: "x" })),
+    ).toEqual({
+      status: "dropped",
+      type: "session.text.delta",
+      reason: "missing: ordinal",
+    });
+    // Multi-missing fields are listed in field order.
+    expect(mapV2EventRaw(v2("session.inbox.enqueued", { delivery: "steer" }))).toEqual({
+      status: "dropped",
+      type: "session.inbox.enqueued",
+      reason: "missing: inboxID, text",
+    });
+    expect(mapV2EventRaw(v2("session.usage.updated", { tokens: "nonsense" }))).toEqual({
+      status: "dropped",
+      type: "session.usage.updated",
+      reason: "missing: tokens",
+    });
+  });
+
+  it("dropped: a known type without a sessionID in its data", () => {
+    expect(mapV2EventRaw({ id: "e", type: "session.deleted", data: {} })).toEqual({
+      status: "dropped",
+      type: "session.deleted",
+      reason: "missing: sessionID",
+    });
+  });
+
+  it("unimplemented: event types the host has no handler for", () => {
+    expect(mapV2EventRaw(v2("server.connected"))).toEqual({
+      status: "unimplemented",
+      type: "server.connected",
+    });
+    expect(mapV2EventRaw(v2("session.message.updated"))).toEqual({
+      status: "unimplemented",
+      type: "session.message.updated",
+    });
+  });
+
+  it("dropped: malformed envelopes (not an object, missing type)", () => {
+    expect(mapV2EventRaw(null)).toEqual({
+      status: "dropped",
+      type: "?",
+      reason: "not an event envelope",
+    });
+    expect(mapV2EventRaw("session.deleted")).toEqual({
+      status: "dropped",
+      type: "?",
+      reason: "not an event envelope",
+    });
+    expect(mapV2EventRaw(42)).toEqual({
+      status: "dropped",
+      type: "?",
+      reason: "not an event envelope",
+    });
+    expect(mapV2EventRaw({ id: "e" })).toEqual({
+      status: "dropped",
+      type: "?",
+      reason: "missing: type",
+    });
+    expect(mapV2EventRaw({ id: "e", type: 7, data: { sessionID: "s" } })).toEqual({
+      status: "dropped",
+      type: "?",
+      reason: "missing: type",
+    });
+  });
+
+  it("mapV2Event stays the ok→event, else null wrapper over the raw outcome", () => {
+    expect(mapV2Event(v2("session.deleted"))).toEqual({ type: "session.deleted", sessionID: "ses_test" });
+    expect(mapV2Event(v2("server.connected"))).toBeNull();
+    expect(mapV2Event(v2("session.tool.input.ended", { text: "" }))).toBeNull();
+  });
+});
+
+// ── event capture lines ───────────────────────────────────────────────────
+
+describe("timeStamp", () => {
+  it("formats local HH:MM:SS.mmm, zero-padded", () => {
+    expect(timeStamp(new Date(2026, 10, 9, 5, 4, 3, 7))).toBe("05:04:03.007");
+    expect(timeStamp(new Date(2026, 10, 9, 0, 0, 0, 0))).toBe("00:00:00.000");
+    expect(timeStamp(new Date(2026, 10, 9, 23, 59, 58, 999))).toBe("23:59:58.999");
+  });
+});
+
+describe("eventLogLine", () => {
+  it("formats an ok line with the raw type and the raw data", () => {
+    const raw = v2("session.tool.input.started", {
+      id: "tc1",
+      name: "shell",
+      assistantMessageID: "msg_a",
+    });
+    expect(eventLogLine(mapV2EventRaw(raw), raw, "19:04:41.520")).toBe(
+      '[opencode-ahp] 19:04:41.520 event ok: session.tool.input.started {"sessionID":"ses_test","id":"tc1","name":"shell","assistantMessageID":"msg_a"}',
+    );
+  });
+
+  it("formats a dropped line with the reason", () => {
+    const raw = v2("session.tool.input.ended", {
+      id: "tc1",
+      text: "",
+      assistantMessageID: "msg_a",
+    });
+    expect(eventLogLine(mapV2EventRaw(raw), raw, "19:04:41.525")).toBe(
+      '[opencode-ahp] 19:04:41.525 event dropped (missing: text): session.tool.input.ended {"sessionID":"ses_test","id":"tc1","text":"","assistantMessageID":"msg_a"}',
+    );
+  });
+
+  it("formats an unimplemented line", () => {
+    const raw = v2("shell.created", { shellID: "sh_1" });
+    expect(eventLogLine(mapV2EventRaw(raw), raw, "19:04:41.530")).toBe(
+      '[opencode-ahp] 19:04:41.530 event unimplemented: shell.created {"sessionID":"ses_test","shellID":"sh_1"}',
+    );
+  });
+
+  it("truncates the data payload to 300 chars with an ellipsis", () => {
+    const raw = v2("session.text.delta", {
+      assistantMessageID: "m",
+      ordinal: 0,
+      delta: "x".repeat(400),
+    });
+    const full = JSON.stringify({
+      sessionID: "ses_test",
+      assistantMessageID: "m",
+      ordinal: 0,
+      delta: "x".repeat(400),
+    });
+    expect(eventLogLine(mapV2EventRaw(raw), raw, "00:00:00.000")).toBe(
+      `[opencode-ahp] 00:00:00.000 event ok: session.text.delta ${full.slice(0, 300)}…`,
+    );
+  });
+
+  it("logs malformed envelopes with the raw value as the payload", () => {
+    expect(eventLogLine(mapV2EventRaw(42), 42, "00:00:00.000")).toBe(
+      "[opencode-ahp] 00:00:00.000 event dropped (not an event envelope): ? 42",
+    );
+    expect(eventLogLine(mapV2EventRaw(null), null, "00:00:00.000")).toBe(
+      "[opencode-ahp] 00:00:00.000 event dropped (not an event envelope): ? null",
+    );
+    expect(eventLogLine(mapV2EventRaw({ id: "e" }), { id: "e" }, "00:00:00.000")).toBe(
+      '[opencode-ahp] 00:00:00.000 event dropped (missing: type): ? {"id":"e"}',
+    );
   });
 });
 

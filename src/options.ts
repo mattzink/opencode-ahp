@@ -55,6 +55,13 @@ export interface Options {
   keepAliveIntervalMinutes: number;
   /** Global actions kept for reconnect replay; older gaps → snapshot. */
   replayWindow: number;
+  /**
+   * Timestamped capture of the raw opencode event stream to the server
+   * log — one `event ok|dropped|unimplemented` line per event (design
+   * §8.1). Off by default: a busy turn emits dozens of lines. The LAN
+   * test server script (scripts/ahp-server.mjs) enables it.
+   */
+  logEvents: boolean;
   /** Advertised in `initialize`. */
   capabilities: CapabilityFlags;
 }
@@ -71,6 +78,9 @@ export const BUILTIN_OPTIONS: Options = {
   keepAlive: true,
   keepAliveIntervalMinutes: 10,
   replayWindow: 1000,
+  // Event capture is off by default (a busy turn emits dozens of lines);
+  // the LAN test server script enables it.
+  logEvents: false,
   // Changesets and the synthetic shell-command terminals are both on by
   // default; opt out with `capabilities.changesets: false` and
   // `capabilities.terminals: false` respectively.
@@ -251,6 +261,7 @@ export function resolveOptions(
       BUILTIN_OPTIONS.keepAliveIntervalMinutes,
     ),
     replayWindow: pick("replayWindow", isPosInt, BUILTIN_OPTIONS.replayWindow),
+    logEvents: pick("logEvents", isBool, BUILTIN_OPTIONS.logEvents),
     capabilities: resolveCapabilities(file["capabilities"], ctx["capabilities"]),
   };
 }
