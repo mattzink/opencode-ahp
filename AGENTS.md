@@ -62,9 +62,10 @@ testing: `docs/testing.md`).
   explicit `.js` suffix (TS source references `.js` not `.ts`).
 - **AHP wire contract**: protocol behavior is defined by AHP 1.0.0 — when in
   doubt about a method/field, check `node_modules/@microsoft/agent-host-protocol`
-  dist and the VS Code 1.145.2 AHP client sources (`/tmp/opencode/vscode-*.ts`),
-  and record findings in `docs/design.md`. The host's `serverInfo.version` is
-  read from `package.json` at runtime (`pluginVersion()` in `src/index.ts`).
+  dist and the extracted VS Code AHP client sources (the local path is
+  recorded in `docs/local.md` if present), and record findings in
+  `docs/design.md`. The host's `serverInfo.version` is read from
+  `package.json` at runtime (`pluginVersion()` in `src/index.ts`).
 - **opencode v2 is per-location**: plugins load per location (a location
   boots on first use and is idle-evicted after 60 min by default). The
   keep-alive module (`src/keep-alive.ts`; design §15.3) is what holds the
@@ -89,9 +90,9 @@ testing: `docs/testing.md`).
 
 ### Environment boundaries
 
-- **Never touch the daily `:80` `opencode serve --service`** (or its
-  `~/.config/opencode/opencode.jsonc` config) — it is the user's running
-  service.
+- **Never touch the user's daily opencode service** — the
+  `opencode serve --service` instance (its port and config location are
+  recorded in `docs/local.md` if present) is the user's running service.
 - The **LAN test server** (port 4098, AHP 8767, everything under
   `/tmp/ahp-server/` — isolated XDG homes plus the scaffolded
   `test-project/` location whose `.opencode/opencode.jsonc` pins this
@@ -99,6 +100,15 @@ testing: `docs/testing.md`).
   §3.1) and may be reloaded (`POST /api/location/reload`) or restarted
   (`--restart`) for testing.
 - Scratch state goes under `/tmp/`, never in tracked directories.
+
+### Local environment (git-ignored)
+
+- `docs/local.md` is an optional, git-ignored file holding this
+  machine's local dev environment specifics (the README's Development
+  section documents what belongs there). If it exists, read it before
+  any work that touches live servers, machine-specific values, or local
+  reference checkouts, and keep it current when such facts change.
+  Never commit it.
 
 ### Architecture constraints
 

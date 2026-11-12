@@ -17,7 +17,7 @@
  * Usage:
  *   node scripts/ahp-turn-lifecycle.mjs --token <token> \
  *     [--base http://127.0.0.1:8767] [--path /ahp] \
- *     [--channel ahp-session:/lan-turn] [--provider gpuz] \
+ *     [--channel ahp-session:/lan-turn] [--provider opencode] \
  *     [--prompt "Reply with exactly: ok"] [--timeout-ms 90000]
  *
  * Exit codes: 0 success · 1 protocol/verification failure · 2 connection
@@ -41,7 +41,7 @@ const opts = {
   path: arg("--path", "/ahp"),
   token: arg("--token", null),
   channel: arg("--channel", "ahp-session:/lan-turn"),
-  provider: arg("--provider", "gpuz"),
+  provider: arg("--provider", "opencode"),
   prompt: arg("--prompt", "Reply with exactly: ok"),
   timeoutMs: Number(arg("--timeout-ms", "90000")),
 };

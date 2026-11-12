@@ -96,8 +96,8 @@ Exit codes are uniform: `0` success · `1` protocol/verification failure ·
 
 ### 3.1 The isolated test server
 
-The tests run against a **separate isolated server** — never the daily
-`:80` `opencode serve --service` (and its `opencode.jsonc`), which stays
+The tests run against a **separate isolated server** — never the user's
+daily `opencode serve --service` (and its config), which stays
 untouched. All scratch state lives under `/tmp/ahp-server/` (isolated XDG
 homes under `{data,state,cache}`, and the location/project directory at
 `test-project/`).
@@ -107,8 +107,9 @@ Node) brings the whole thing up: it creates the isolated XDG homes and —
 on a fresh scratch tree, never copying previous state — scaffolds the
 location project `/tmp/ahp-server/test-project` (a
 `.opencode/opencode.jsonc` pinning this checkout as a dev plugin with
-`host: 0.0.0.0`, `port: 8767`, a fixed `token`, `allowedOrigins: "*"`,
-a 1-minute keep-alive interval, and event capture on
+`host: 0.0.0.0`, `port: 8767`, a `token` (generated per fresh tree, or
+pinned with `--token`), `allowedOrigins: "*"`, a 1-minute keep-alive
+interval, and event capture on
 (`logEvents: true` — design.md [§8.1](design.md#81-event-capture-logevents)),
 plus a `.gitignore`, `git init`, and
 an initial commit of the scaffold so the working tree starts clean),
@@ -139,8 +140,9 @@ Notes:
 - The Basic-auth password (`opencode / <PASSWORD>`) is generated for each
   fresh server and printed by the script; a reused server's password comes
   from its process environment.
-- The AHP token is fixed in the generated project config. R4 requires an
-  explicit token for a non-loopback bind.
+- The AHP token is generated for each fresh scratch tree (or pinned with
+  `--token` for a stable PC B URL) and written into the generated project
+  config. R4 requires an explicit token for a non-loopback bind.
 - `allowedOrigins: "*"` is test mode; production setups list exact
   Origins.
 - **No `experimental.location_idle_timeout` entry** — not needed. The
@@ -160,12 +162,12 @@ Notes:
 **Verify the host side** (the script already waited for the healthz):
 
 ```sh
-curl -s -o /dev/null -w '%{http_code}\n' http://127.0.0.1:8767/healthz            # 200
-curl -s -o /dev/null -w '%{http_code}\n' 'http://10.0.1.107:8767/ahp'             # 401 (no token, LAN-reachable)
-curl -s -o /dev/null -w '%{http_code}\n' 'http://10.0.1.107:8767/ahp?token=wrong' # 401
+curl -s -o /dev/null -w '%{http_code}\n' http://127.0.0.1:8767/healthz                # 200
+curl -s -o /dev/null -w '%{http_code}\n' 'http://<host-lan-ip>:8767/ahp'              # 401 (no token, LAN-reachable)
+curl -s -o /dev/null -w '%{http_code}\n' 'http://<host-lan-ip>:8767/ahp?token=wrong'  # 401
 ```
 
-If the LAN IP is not `10.0.1.107`: `hostname -I | awk '{print $1}'`.
+The machine's LAN IP: `hostname -I | awk '{print $1}'`.
 (If the firewall blocks the port: `sudo ufw allow 8767/tcp` or
 equivalent.)
 
@@ -236,8 +238,8 @@ baseline committed at `line1\nline2` — so it can run right after a fresh
 keep-alive) should be verified against the test server — at minimum
 `ahp-turn-lifecycle.mjs`, plus the script dedicated to the changed surface —
 **before** asking the user to publish. The test server may be reloaded
-(`POST /api/location/reload`) or restarted for testing; the daily `:80`
-service may not be touched.
+(`POST /api/location/reload`) or restarted for testing; the user's daily
+opencode service may not be touched.
 
 ---
 
@@ -252,10 +254,11 @@ Nothing is installed on PC B — VS Code ships the AHP client.
 
 ### 4.1 Preconditions
 
-- PC A (this machine): opencode v2.2.6, repo at `/home/mattzink/opencode-ahp`.
-- PC B: VS Code 1.145.2, same LAN, reachable from PC A.
-- The daily `:80` service is **not touched** — the test runs the separate
-  isolated server from [§3.1](#31-the-isolated-test-server).
+- PC A (the host machine): opencode v2 (≥ 2.2.6) with this repo checked
+  out.
+- PC B: VS Code (≥ 1.144) on the same LAN, reachable from PC A.
+- The user's daily opencode service is **not touched** — the test runs the
+  separate isolated server from [§3.1](#31-the-isolated-test-server).
 
 ### 4.2 PC A — host side
 
@@ -264,13 +267,13 @@ Nothing is installed on PC B — VS Code ships the AHP client.
    It prints the "PC B URL" line for you:
 
    ```text
-   ws://10.0.1.107:8767/ahp?token=xsnilxgywpthjZuhdRbjpf5O5mNATD3BaGXhdcw5ui0
+   ws://<host-lan-ip>:8767/ahp?token=<token>
    ```
 
-   (The IP is the machine's LAN IP; the token is the one from the project
-   config — regenerate it there and re-run the script if you change it.)
+   (The IP is the host machine's LAN IP; the token is the one from the
+   generated project config.)
 
-### 4.3 PC B — client side (VS Code 1.145.2)
+### 4.3 PC B — client side
 
 1. Open the Agents window: `code --agents`, or Command Palette →
    **`Chat: Open Agents Window`**.
@@ -281,10 +284,9 @@ Nothing is installed on PC B — VS Code ships the AHP client.
 3. The host appears in the Agents window picker → select it → start a new
    session.
 4. Check:
-   - Agent picker lists the opencode providers (free `opencode` models and
-     `gpuz`).
-   - Model picker shows the real catalog (~16 models); pick
-     `gpuz/qwen3.8-27b-q5xl`.
+   - Agent picker lists the opencode providers the server exposes.
+   - Model picker shows the real catalog; pick any model with a working
+     provider.
    - Prompt: *Use your bash tool to run exactly: `echo hello-lan` — then
      reply with the command output.* → text streams in, the tool runs on
      PC A (watch the server terminal), the output comes back.

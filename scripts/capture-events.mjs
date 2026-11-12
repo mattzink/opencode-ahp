@@ -13,7 +13,7 @@
  * Usage:
  *   node scripts/capture-events.mjs --server http://127.0.0.1:4097 \
  *     [--project /tmp/opencode/ahp-scratch/project] \
- *     [--model gpuz/qwen3.8-27b-q5xl] [--prompt "…"] \
+ *     [--model providerID/modelID] [--prompt "…"] \
  *     [--out src/test/fixtures/events.jsonl] [--timeout-ms 120000]
  *
  * Exit codes: 0 captured a terminal execution event · 1 setup failure ·

@@ -90,6 +90,13 @@ opencode plugin add opencode-ahp
 opencode plugin add github:mattzink/opencode-ahp
 ```
 
+Installed copies don't auto-update. To update:
+
+```sh
+opencode plugin update opencode-ahp
+opencode service restart
+```
+
 **Dev (local checkout):**
 
 ```jsonc
@@ -253,6 +260,18 @@ node scripts/ahp-multi-chat.mjs --token <token> --base http://127.0.0.1:8765 --r
 NODE_TLS_REJECT_UNAUTHORIZED=0 node scripts/ahp-changesets.mjs --token <token> --base https://127.0.0.1:8765
 ```
 
+### Local environment (git-ignored)
+
+`docs/local.md` is the designated place for each developer to keep
+local development environment specifics — facts about their own machine
+that never belong in the committed tree, such as LAN IPs and hostnames,
+per-machine versions, the port and config location of a daily opencode
+service, the current LAN test server token/URL, reference checkouts
+(the opencode and AHP repos, the extracted VS Code AHP client
+sources), and scratch roots. The file is git-ignored and optional: it
+does not exist on machines that have never created it, and nothing in
+this repo requires it.
+
 ## Publishing
 
 House pattern: push to `main` → CI (`typecheck` + `test`) → the publish
@@ -260,9 +279,6 @@ workflow computes the version as `<major>.<minor>.<run-number>` and
 `npm publish`es via **npm trusted publishing (OIDC)** — no npm token or
 repo secret is stored (one-time setup: npmjs.com → package → *Package
 settings* → *Trusted publishers* → this workflow).
-
-Installed copies don't auto-update: `opencode plugin update opencode-ahp`
-- `opencode service restart`.
 
 ## Documentation
 

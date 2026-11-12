@@ -423,7 +423,7 @@ session's workspace label comes from its AHP metadata —
 labels the session with `SessionState.project.displayName` when a project
 is present, else with the first `workingDirectories` entry (the remote
 provider maps the host's `file://` URI to `agent-host://<host>/<path>` and
-suffixes the label with the host name, e.g. `test-project [dev.zinky.lan]`).
+suffixes the label with the host name, e.g. `test-project [host.lan]`).
 When **neither** field is present the workspace is undefined and the
 session renders under the **"Unknown"** fallback
 (`sessionsList.ts` → `sessionWorkspaceLabel`). Copilot quick chats are

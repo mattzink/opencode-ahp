@@ -8,7 +8,8 @@
  * serving the location /tmp/ahp-server/test-project. On a fresh scratch
  * dir it scaffolds that project itself (nothing is ever copied over):
  * .opencode/opencode.jsonc pinning this repo as a dev plugin with the AHP
- * host on 0.0.0.0:8767, a 1-minute keep-alive touch interval, and event
+ * host on 0.0.0.0:8767, an AHP token (random per fresh tree, or pinned
+ * with --token), a 1-minute keep-alive touch interval, and event
  * capture on (logEvents), a .gitignore, `git init`, and an initial commit
  * of the scaffold so the working tree starts clean. By default it
  * also boots
@@ -27,11 +28,15 @@
  * Usage:
  *   node scripts/ahp-server.mjs [--port 4098] [--hostname 0.0.0.0]
  *     [--location-dir /tmp/ahp-server/test-project]
- *     [--scratch /tmp/ahp-server]
+ *     [--scratch /tmp/ahp-server] [--token <value>]
  *     [--foreground] [--restart] [--stop] [--no-boot]
  *
  *   --location-dir defaults to <scratch>/test-project (pass --scratch to
  *   move the whole tree; the project follows unless --location-dir is set).
+ *
+ *   --token pins the AHP token written into the scaffolded project config
+ *   (a stable PC B URL across re-scaffolds); without it a random token is
+ *   generated per fresh tree.
  *
  *   (default)     ensure the server is up, boot the location, wait for the
  *                 AHP healthz, print a summary (Basic-auth password, AHP
@@ -75,6 +80,7 @@ const opts = {
   hostname: arg("--hostname", "0.0.0.0"),
   scratch: arg("--scratch", "/tmp/ahp-server"),
   locationDir: null, // resolved below: <scratch>/test-project unless --location-dir
+  token: null, // resolved below: --token value, or random per fresh scaffold
   foreground: has("--foreground"),
   restart: has("--restart"),
   stop: has("--stop"),
@@ -84,6 +90,11 @@ if (!Number.isInteger(opts.port) || opts.port <= 0) {
   fail(2, "--port must be a positive integer");
 }
 opts.locationDir = arg("--location-dir", path.join(opts.scratch, "test-project"));
+if (has("--token")) {
+  const t = arg("--token");
+  if (typeof t !== "string" || t.length === 0) fail(2, "--token requires a non-empty value");
+  opts.token = t;
+}
 
 const logFile = path.join(opts.scratch, "server.log");
 const configPath = path.join(opts.locationDir, ".opencode", "opencode.jsonc");
@@ -132,7 +143,8 @@ const repoRoot = path.resolve(path.dirname(new URL(import.meta.url).pathname), "
  * Scaffold the location project on a fresh scratch tree — only when the
  * location config is missing (an existing project is left untouched, git
  * repo or not). Creates .opencode/opencode.jsonc pinning this repo as a
- * dev plugin with the AHP host on 0.0.0.0:8767, a 1-minute keep-alive
+ * dev plugin with the AHP host on 0.0.0.0:8767, an AHP token (random per
+ * fresh tree, or the --token value when given), a 1-minute keep-alive
  * touch interval, and event capture on (logEvents — the server log gets
  * a timestamped event ok/dropped/unimplemented line per opencode event),
  * a .gitignore (keeps .opencode/ out of the git status the changeset
@@ -146,6 +158,9 @@ function ensureLocation() {
   fs.mkdirSync(opts.locationDir, { recursive: true });
   if (fs.existsSync(configPath)) return;
   fs.mkdirSync(path.dirname(configPath), { recursive: true });
+  // R4: a non-loopback bind requires an explicit token. Fresh trees get a
+  // random one; --token pins a stable value for the PC B URL.
+  const ahpToken = opts.token ?? randomBytes(30).toString("base64url");
   fs.writeFileSync(
     configPath,
     `{
@@ -158,7 +173,7 @@ function ensureLocation() {
       "options": {
         "host": "0.0.0.0",
         "port": 8767,
-        "token": "xsnilxgywpthjZuhdRbjpf5O5mNATD3BaGXhdcw5ui0",
+        "token": ${JSON.stringify(ahpToken)},
         "allowedOrigins": "*",
         "keepAliveIntervalMinutes": 1,
         "logEvents": true

@@ -219,10 +219,6 @@ above are worth pursuing (notably terminal rendering,
   accepted); mid-turn disconnect (airplane mode / `ss -K`) →
   reconnect → replay or snapshot, no duplicate turns; mid-turn steering
   reaches the active turn, queued messages wait for turn completion.
-- **Optional: an AHP entry in the user's daily `:80` service config** —
-  that service currently has no AHP plugin entry, so same-machine
-  VS Code use would need one. This is user-side configuration; the
-  daily service is off-limits to agents.
 
 ---
 
@@ -500,5 +496,4 @@ case changes:
 | Elicitation settlement design — options (a) / (b) / (c) | [§1.1](#11-elicitation-completion-decision-pending) | user decision |
 | PC B composer first-send retry (also settles terminal rendering) | [§1.5](#15-open-live-verification-items) | user action on PC B |
 | Second-machine items still open | [§1.5](#15-open-live-verification-items) | user action on PC B |
-| Optional AHP entry in the daily `:80` service config | [§1.5](#15-open-live-verification-items) | user configuration |
 | Filing the opencode feature requests | [§4.1](#41-opencode--feature-requests-to-file) | "investigate upstream later" |
