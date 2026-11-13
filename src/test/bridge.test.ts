@@ -2,7 +2,9 @@ import { describe, expect, it } from "vitest";
 import {
   ChangesetOperationScope,
   ChangesetOperationStatus,
+  SessionStatus,
   type AgentCustomization,
+  type ChatSummary,
   type DirectoryCustomization,
 } from "@microsoft/agent-host-protocol";
 import {
@@ -23,6 +25,7 @@ import {
   mapV2EventRaw,
   parseContentRef,
   sessionChangesetCatalog,
+  sessionSummaryStatus,
   snapContentRef,
   timeStamp,
   type FacadeAgent,
@@ -1258,5 +1261,84 @@ describe("buildTurnChangesetFiles", () => {
         },
       },
     ]);
+  });
+});
+
+// ── sessionSummaryStatus ───────────────────────────────────────────────
+
+describe("sessionSummaryStatus", () => {
+  const chat = (resource: string, status: SessionStatus, modifiedAt = "2026-01-01T00:00:00.000Z"): ChatSummary => ({
+    resource,
+    title: "Chat",
+    status,
+    modifiedAt,
+  });
+  const IDLE_READ = (SessionStatus.Idle | SessionStatus.IsRead) as SessionStatus;
+
+  it("passes the default chat's activity bits through (single-chat sessions)", () => {
+    // Idle stays idle…
+    expect(sessionSummaryStatus(IDLE_READ, [chat("c1", IDLE_READ)], "c1")).toBe(IDLE_READ);
+    // …an in-progress turn shows as InProgress (the "Working…" bit the
+    // session list needs)…
+    expect(sessionSummaryStatus(IDLE_READ, [chat("c1", SessionStatus.InProgress)], "c1")).toBe(
+      (SessionStatus.InProgress | SessionStatus.IsRead) as SessionStatus,
+    );
+    // …and so does a turn blocked on input.
+    expect(sessionSummaryStatus(IDLE_READ, [chat("c1", SessionStatus.InputNeeded)], "c1")).toBe(
+      (SessionStatus.InputNeeded | SessionStatus.IsRead) as SessionStatus,
+    );
+  });
+
+  it("ignores the session store's own activity bits (the reducer cannot lower InProgress)", () => {
+    // The regression: after an input-needed round trip the session store
+    // keeps `InProgress | IsRead` (40) even though the chat is idle again —
+    // the summary must report the chat's idle state (with the session-scoped
+    // IsRead flag preserved).
+    const stale = (SessionStatus.InProgress | SessionStatus.IsRead) as SessionStatus;
+    expect(sessionSummaryStatus(stale, [chat("c1", SessionStatus.Idle)], "c1")).toBe(IDLE_READ);
+    expect(sessionSummaryStatus(stale, [chat("c1", SessionStatus.Idle)], "c1") & SessionStatus.InProgress).toBe(0);
+  });
+
+  it("promotes InputNeeded from any chat, overriding the default chat", () => {
+    const peers = [chat("c1", IDLE_READ, "2026-01-01T00:00:00.000Z"), chat("c2", SessionStatus.InputNeeded, "2026-01-02T00:00:00.000Z")];
+    expect(sessionSummaryStatus(IDLE_READ, peers, "c1")).toBe(
+      (SessionStatus.InputNeeded | SessionStatus.IsRead) as SessionStatus,
+    );
+  });
+
+  it("promotes Error from any chat when no chat needs input", () => {
+    const peers = [chat("c1", IDLE_READ), chat("c2", SessionStatus.Error, "2026-01-02T00:00:00.000Z")];
+    expect(sessionSummaryStatus(IDLE_READ, peers, "c1")).toBe(
+      (SessionStatus.Error | SessionStatus.IsRead) as SessionStatus,
+    );
+    // …but InputNeeded wins over Error (the user can unblock; the error cannot).
+    const both = [chat("c1", SessionStatus.Error), chat("c2", SessionStatus.InputNeeded, "2026-01-02T00:00:00.000Z")];
+    expect(sessionSummaryStatus(IDLE_READ, both, "c1")).toBe(
+      (SessionStatus.InputNeeded | SessionStatus.IsRead) as SessionStatus,
+    );
+  });
+
+  it("reads the activity from the most recently modified chat when there is no default chat", () => {
+    const peers = [chat("c1", IDLE_READ, "2026-01-01T00:00:00.000Z"), chat("c2", SessionStatus.InProgress, "2026-01-02T00:00:00.000Z")];
+    expect(sessionSummaryStatus(IDLE_READ, peers, undefined)).toBe(
+      (SessionStatus.InProgress | SessionStatus.IsRead) as SessionStatus,
+    );
+    // A default chat that is not in the list falls back the same way.
+    expect(sessionSummaryStatus(IDLE_READ, peers, "missing")).toBe(
+      (SessionStatus.InProgress | SessionStatus.IsRead) as SessionStatus,
+    );
+  });
+
+  it("preserves the session-scoped flags (IsRead / IsArchived)", () => {
+    const archived = (SessionStatus.Idle | SessionStatus.IsRead | SessionStatus.IsArchived) as SessionStatus;
+    expect(sessionSummaryStatus(archived, [chat("c1", SessionStatus.InProgress)], "c1")).toBe(
+      (SessionStatus.InProgress | SessionStatus.IsRead | SessionStatus.IsArchived) as SessionStatus,
+    );
+    const unread = SessionStatus.Idle;
+    expect(sessionSummaryStatus(unread, [chat("c1", SessionStatus.InputNeeded)], "c1")).toBe(SessionStatus.InputNeeded);
+  });
+
+  it("is idle for a session with no chats (flags preserved)", () => {
+    expect(sessionSummaryStatus(IDLE_READ, [], undefined)).toBe(IDLE_READ);
   });
 });

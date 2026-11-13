@@ -303,24 +303,6 @@ Nothing is installed on PC B — VS Code ships the AHP client.
 - `rm -rf /tmp/ahp-server` (isolated state, including the scaffolded
   `test-project/`).
 
-### 4.5 Known-open manual verifications
-
-The single-machine checklist is done; the items below are still open and
-tracked in [futures.md §1.5](futures.md#15-open-live-verification-items) —
-run them as part of this two-machine pass:
-
-- PC B composer first-send retry (fresh session from the composer).
-- Permission round trip through the window (approve → tool runs, deny →
-  blocked).
-- Token enforcement from the desktop client (no token / wrong token
-  rejected; correct token from a VS Code desktop Origin accepted).
-- Mid-turn disconnect (airplane mode / `ss -K`) → reconnect → replay or
-  snapshot, no duplicate turns; mid-turn steering and queued messages.
-- Clicking a session opens an **interactive terminal** (the pty path —
-  no "createTerminal is not supported" toast) and typing in it reaches the
-  shell (the wire surface is fully verified by
-  `scripts/ahp-terminal-probe.mjs`; client-side rendering is not).
-
 ---
 
 ## 5. Conformance (AHP official fixtures)

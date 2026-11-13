@@ -855,6 +855,63 @@ export function userMessage(text: string, model?: string, agentUri?: string): Me
   return message;
 }
 
+/** Bitmask covering the mutually-exclusive activity bits (bits 0–4). */
+const STATUS_ACTIVITY_MASK = (1 << 5) - 1;
+
+/**
+ * The bit that uniquely marks an input-needed status: `InputNeeded` (24)
+ * *includes* the `InProgress` bit (8), so `status & InputNeeded` also
+ * matches plain in-progress — bit 16 (`InputNeeded & ~InProgress`) is the
+ * discriminator (the same bit the official reducer's
+ * `withInputNeededStatus` clears on drain).
+ */
+const INPUT_NEEDED_MARKER = (SessionStatus.InputNeeded & ~SessionStatus.InProgress) as SessionStatus;
+
+/**
+ * Derive `SessionSummary.status` per the AHP aggregation rules: the
+ * activity bits (0–4) come from the default chat, else the most recently
+ * modified chat; they are **promoted** to `InputNeeded` whenever any chat
+ * is blocked on input, else to `Error` whenever any chat is in an error
+ * state. The orthogonal flags (`IsRead` / `IsArchived`) are session-scoped
+ * and are preserved from `sessionStatus`.
+ *
+ * The activity bits are deliberately NOT taken from `sessionStatus`: the
+ * session reducer only reaches them through the input-queue path, and that
+ * path cannot lower them back to `Idle` once a turn ends (draining the
+ * queue leaves `InProgress` behind — the official reducer's "unblocked
+ * turn falls back to `InProgress`" assumes the session was promoted to
+ * `InProgress` when the turn started, which it is not; only the chat is).
+ * The chat summaries are the activity source of truth.
+ */
+export function sessionSummaryStatus(
+  sessionStatus: SessionStatus,
+  chats: readonly ChatSummary[],
+  defaultChat: string | undefined,
+): SessionStatus {
+  const flags = sessionStatus & ~STATUS_ACTIVITY_MASK;
+  let source = defaultChat !== undefined ? chats.find((c) => c.resource === defaultChat) : undefined;
+  if (source === undefined) {
+    for (const c of chats) {
+      if (source === undefined || c.modifiedAt > source.modifiedAt) source = c;
+    }
+  }
+  let promoted: SessionStatus | undefined;
+  for (const c of chats) {
+    if (c.status & INPUT_NEEDED_MARKER) {
+      promoted = SessionStatus.InputNeeded;
+      break;
+    }
+    if (c.status & SessionStatus.Error) promoted = SessionStatus.Error;
+  }
+  const activity =
+    promoted !== undefined
+      ? promoted
+      : source !== undefined
+        ? ((source.status & STATUS_ACTIVITY_MASK) as SessionStatus)
+        : SessionStatus.Idle;
+  return (flags | activity) as SessionStatus;
+}
+
 /**
  * Build the `SessionSummary` for root notifications / `listSessions` from
  * a live record's denormalized fields. `chats` is the full catalog in

@@ -63,9 +63,10 @@ testing: `docs/testing.md`).
 - **AHP wire contract**: protocol behavior is defined by AHP 1.0.0 — when in
   doubt about a method/field, check `node_modules/@microsoft/agent-host-protocol`
   dist and the extracted VS Code AHP client sources (the local path is
-  recorded in `docs/local.md` if present), and record findings in
-  `docs/design.md`. The host's `serverInfo.version` is read from
-  `package.json` at runtime (`pluginVersion()` in `src/index.ts`).
+  recorded in `docs/local.md` if present), and record the result in the
+  affected `docs/design.md` section as current-state prose. The host's
+  `serverInfo.version` is read from `package.json` at runtime
+  (`pluginVersion()` in `src/index.ts`).
 - **opencode v2 is per-location**: plugins load per location (a location
   boots on first use and is idle-evicted after 60 min by default). The
   keep-alive module (`src/keep-alive.ts`; design §15.3) is what holds the
@@ -123,9 +124,24 @@ testing: `docs/testing.md`).
 
 ### Documentation updates
 
-- Behavior, architecture, or wire-contract changes MUST update
-  [`docs/design.md`](docs/design.md) (findings go in the relevant
-  section, new topics get a new §).
+- **Docs are not notepads.** Every doc has one purpose (below); all doc
+  changes MUST preserve it, land in the doc whose purpose covers the
+  content, and be written in its register. House style is prose: no
+  checkboxes, no strikethrough.
+- [`docs/design.md`](docs/design.md) — the **current** design: use cases,
+  architecture, lifecycle, protocol surface, error/recovery/persistence,
+  and *why* the code is shaped that way. Behavior, architecture, and
+  wire-contract changes MUST update it; new topics get a new §. It states
+  what is true **now**, in present tense: fold learnings from debugging or
+  live verification into the relevant section as current-state prose (a
+  short "(verified <date>)" note is fine). Dated "findings" labels,
+  discovery-log phrasing, and completed checklists do not belong there.
+- [`docs/futures.md`](docs/futures.md) — **potential work only**: work
+  candidates, gaps, upstream requests. Durable facts (e.g. how a client
+  behaves today) belong in design.md; futures items cross-reference them.
+- [`docs/testing.md`](docs/testing.md) — **how to verify**: unit/static/
+  live suites, the test server, the scripts. Open verification checklists
+  live here and are deleted wholesale when done, never ticked off.
 - User-facing behavior (install, config, options) MUST update
   [`README.md`](README.md) and/or `options.example.jsonc`.
 

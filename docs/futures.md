@@ -194,32 +194,6 @@ becomes worth doing only once that happens.
   rejection echo. Potential, not planned: it is small, and nothing
   currently demands it.
 
-### 1.5 Open live-verification items
-
-Open verifications and one optional user-side configuration item —
-not implementation work, but they gate whether several of the items
-above are worth pursuing (notably terminal rendering,
-[§4.2](#42-vs-code--client-side-observations)).
-
-- **PC B composer first-send retry.** The `resolveSessionConfig`
-  host-side fix is live-verified by script, but the user-side retry on
-  the second machine (create a fresh session from the composer, send a
-  prompt) is still pending. That retry also settles the terminal
-  question below.
-- **Does the Agents window render session-claimed terminals?** The
-  terminal *wire* surface is fully verified (catalog row, snapshot,
-  full action stream, read-only rejections); the **client-side
-  rendering** is not. If VS Code does not render them, that is a
-  client-behavior finding and the terminal feature's scope is
-  reassessed per [§4.2](#42-vs-code--client-side-observations).
-- **Second-machine items still open** (the single-machine checklist is
-  done): permission round trip through the window (approve → tool
-  runs, deny → blocked); token enforcement (no token rejected, wrong
-  token rejected, correct token from a VS Code desktop Origin
-  accepted); mid-turn disconnect (airplane mode / `ss -K`) →
-  reconnect → replay or snapshot, no duplicate turns; mid-turn steering
-  reaches the active turn, queued messages wait for turn completion.
-
 ---
 
 ## 2. The AHP 1.0.0 surface the host does not implement
@@ -432,36 +406,37 @@ a visible TUI artifact, #3 is the only path to remote elicitation — the
 three that change the shape of the product. #4–#6 are on-demand feature
 unlocks.
 
-### 4.2 VS Code — client-side observations
+### 4.2 VS Code — upstream requests & watches
 
-- **Terminal rendering (open question).** Does the Agents window render
-  *session-claimed* terminals at all? The wire is verified; the client
-  side is not ([§1.5](#15-open-live-verification-items)). The 1.145.2
-  source shows the remote agent-host contribution consuming terminal
-  channels (`reconnectTerminals` after reconnection, recovery
-  telemetry), but the terminal service itself was not extractable from
-  the 1.145.2 build. If it does not render them, the synthetic terminal
-  feature is wire-only until the client does — record it as a
-  client-behavior finding and reassess scope; rendering `isPty: false`
-  terminals may itself be a VS Code request.
-- **`resolveSessionConfig` is a hard requirement for new-session
-  sends.** VS Code 1.145.2 fires it when the new-session composer
-  *opens* (failure swallowed — the composer still renders) and again
-  **strictly** before the first send of a new session (failure is
-  fatal: "Failed to start session"). This host originally answered
-  -32601 (method unrouted) and new-session sends were broken until the
-  host answered the honest empty result (`{ schema: { type: "object",
-  properties: {} }, values: {} }`). Latent requirement for **every**
-  third-party host — worth an upstream documentation note for host
-  implementers.
-- **`fetchTurns` is unused by the 1.145.2 client.** Type-only in the
-  official TS client; the Agents window does not page turn history.
-  Turn hydration ([§1.3](#13-turn-history-hydration-fetchturns)) has no
-  user-visible effect until client adoption.
-- **`setClientManagedSettingsPermissions`** has no AHP 1.0.0
-  counterpart; the host accepts it as a no-op ([§2.4](#24-notifications)).
-  If VS Code expects a specific response or behavior, that is worth
-  clarifying upstream.
+Work candidates the 1.145.2 client (and the two-machine pass,
+testing.md §4) point at. The client-behavior facts themselves live in
+design.md — terminal rendering (§12.1), the permission-card UI (§7.4),
+command requirements (§6).
+
+- **Request to VS Code: render session-claimed terminals.** The current
+  Agents window renders none of the host's `ahp-terminal:` channels
+  (design.md §12.1) — until it does, the synthetic terminal feature is
+  wire-only ([§1.2](#12-terminals-beyond-the-synthetic-command-terminals)).
+- **Request to the AHP docs: note that `resolveSessionConfig` is a hard
+  requirement for new-session sends.** VS Code fires it when the
+  composer opens (failure swallowed) and strictly before the first send
+  (failure fatal — design.md §6); this host's original -32601 broke
+  new-session sends. Latent for **every** third-party host — worth a
+  host-implementer documentation note.
+- **Clarify with VS Code: what `setClientManagedSettingsPermissions`
+  expects.** VS Code-specific post-init notification with no AHP 1.0.0
+  counterpart; the host accepts it as a no-op (design.md §6). If the
+  client expects a specific response or behavior, that should be
+  documented.
+- **Potential host work: publish `ConfirmationOption`s for a richer
+  permission card** (custom labels instead of the plain approve/deny UI
+  whose deny action reads "Skip" — design.md §7.4). An AHP 1.0.0 field,
+  but the options can only express what opencode's permission reply can
+  answer with (`once` / `reject` today) — blocked by the `always` gap
+  ([§1.4](#14-small-chat-surface-gaps)).
+- **`fetchTurns` is unused by the 1.145.2 client** (type-only in the
+  official TS client) — turn hydration ([§1.3](#13-turn-history-hydration-fetchturns))
+  has no user-visible effect until client adoption.
 - **Watch:** AHP client updates in VS Code that drive more of the
   protocol surface (resource watches, `root/progress`, automations,
   elicitations) — each becomes a candidate for host support in the
@@ -494,6 +469,4 @@ case changes:
 | Item | Where | Awaiting |
 | --- | --- | --- |
 | Elicitation settlement design — options (a) / (b) / (c) | [§1.1](#11-elicitation-completion-decision-pending) | user decision |
-| PC B composer first-send retry (also settles terminal rendering) | [§1.5](#15-open-live-verification-items) | user action on PC B |
-| Second-machine items still open | [§1.5](#15-open-live-verification-items) | user action on PC B |
 | Filing the opencode feature requests | [§4.1](#41-opencode--feature-requests-to-file) | "investigate upstream later" |

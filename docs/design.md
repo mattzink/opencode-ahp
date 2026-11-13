@@ -415,8 +415,8 @@ One entry only: the host advertises no `multipleWorkingDirectories`
 capability, so clients MUST NOT mutate the set (AHP working-directory
 actions are unusable).
 
-**Why the field is required for a usable session list (VS Code 1.145
-finding):** the Sessions view groups sessions into workspace sections; a
+**Why the field is required for a usable session list (VS Code 1.145):**
+the Sessions view groups sessions into workspace sections; a
 session's workspace label comes from its AHP metadata —
 `buildAgentHostSessionWorkspace` (vscode
 `src/vs/workbench/contrib/sessions/common/agentHostSessionWorkspace.ts`)
@@ -432,6 +432,47 @@ the dedicated **"Chats"** section regardless of workspace. The host
 publishes `workingDirectories` rather than `project` because a location
 directory is not necessarily a repository — `project` would mark the
 workspace `isRepository: true` and hand it the repo icon, a false claim.
+
+### 7.4 Session-summary status aggregation
+
+`SessionSummary.status` — the status the session list renders ("Working…",
+input-needed badge, error) — is **aggregated by the host** in
+`sessionSummary()` via `sessionSummaryStatus` (bridge.ts), per the AHP
+`SessionSummary` aggregation rule:
+
+- the **activity bits** (0–4: `Idle`/`Error`/`InProgress`/`InputNeeded`)
+  come from the **default chat**, else the most recently modified chat;
+- they are **promoted** to `InputNeeded` whenever *any* chat is blocked on
+  input, else to `Error` whenever any chat is in an error state
+  (`InputNeeded` wins over `Error` — the user can unblock, the error
+  cannot);
+- the orthogonal flags (`IsRead`/`IsArchived`) stay **session-scoped** and
+  are preserved from the session store's status.
+
+The activity bits are deliberately **not** read from the session store:
+the official session reducer reaches them only through the input-queue
+path (`withInputNeededStatus` — promote: `(status & ~31) | InputNeeded`;
+drain: clears only bit 16, leaving `InProgress`), and no reducer action
+exists to lower the activity back to `Idle` when a turn ends. The reducer's
+"an unblocked turn falls back to `InProgress`" assumes the session was
+promoted to `InProgress` when the turn started — which it is not; only the
+**chat** is (the chat reducer self-maintains its status correctly across
+turn start/end). The session store's own `status` therefore keeps the
+reducer's residue and is authoritative only for the flags. The chat
+summaries (synced via `session/chatUpdated`) are the activity source of
+truth.
+
+Reading the store instead would mis-track in both directions: a plain
+streaming turn never lifts the store's activity out of `Idle`, so the
+list would stay idle while the chat is working, and any turn containing a
+user-blocking input round trip would stick it in "Working…" forever —
+`permission.asked` promotes the store to `InputNeeded|IsRead` (56), the
+client's answer drains the queue to `InProgress|IsRead` (40), and the
+turn's end (denied tool → `execution.interrupted` → `chat/turnCancelled`)
+clears only the **chat**'s status. Aggregating from the chats instead
+gives the list "Working…" for the duration of any turn (including plain
+streaming turns, which are otherwise invisible at the session level) and
+idle again when the turn ends, regardless of input round trips.
 
 ## 8. Turn lifecycle (event pump)
 
@@ -570,7 +611,7 @@ identifies a single chat once multi-chat is on).
 | `chat/turnStarted` | Rejected when a turn is already active ("follow-ups go via `chat/pendingMessageSet`"). Otherwise: apply the message's model/agent selection to this chat's opencode session, **claim the turn before the prompt** (write-ahead, so a racing `execution.started` still joins it; reverted on prompt failure), prompt, then echo (with a host-normalized `startedAt` — see the reducer-trap note after this table). |
 | `chat/pendingMessageSet` | `steering` mid-turn → prompt with `delivery: "steer"`; `queued` mid-turn → `delivery: "queue"`; with no active turn the message starts a turn right now (echo, then a host-minted `chat/turnStarted` carrying `queuedMessageId`). |
 | `chat/pendingMessageRemoved` | Always rejected: opencode has no inbox cancel — a pending message cannot be withdrawn once sent. |
-| `chat/toolCallConfirmed` | Replies to the pending opencode permission (`once` / `reject`), echoes (reducer → running/cancelled), and clears the session input request. |
+| `chat/toolCallConfirmed` | Replies to the pending opencode permission (`once` / `reject`), echoes (reducer → running/cancelled), and clears the session input request. The confirmation UI is the plain approve/deny card because the host publishes no `ConfirmationOption`s — that field on `ToolCallPendingConfirmationState` is optional, and when present the client renders them *instead of* the plain UI. VS Code therefore shows "Allow in this Session ⌄" plus **"Skip"**, where **Skip is the deny action**: it sends `approved:false`, which maps to `reject` (the reject → `tool.failed` → `execution.interrupted` chain then flows on the event stream). A richer card (e.g. an explicit "Deny" label) would require the host to publish `ConfirmationOption`s, but the options can only express what opencode's permission reply can answer with (`once` / `reject` today — the `always` gap is tracked in futures.md §1.4). |
 | `chat/toolCallComplete` | Client-executed tool calls only ([§10](#10-client-provided-tools)): contributor-only, status must be running/pending-confirmation; echoes, then either settles the opencode-side waiter with the client's result or holds it for result confirmation. The reducer inlines the result fields (`success`, `pastTenseMessage`, `content`, `error`) onto the completed call — state has no `result` property — and applies the action only from Running/PendingConfirmation/AuthRequired (a success while auth-required is ignored). |
 | `chat/toolCallContentChanged` | Contributor-only echo of streamed partial content (reducer replaces the running call's `content`); opencode needs no counterpart. |
 | `chat/toolCallResultConfirmed` | Contributor-only; approves or denies a held client result (deny settles the waiter with a `Tool.Error` the model sees). |
@@ -772,6 +813,17 @@ ptys.
   roll back cleanly. `disposeTerminal` on a synthetic channel gets
   `-32009` (AHP PermissionDenied — the client is not permitted to dispose
   host-managed terminals).
+- **Client visibility: the reference client (VS Code 1.145) renders none
+  of these.** The Agents window discovers an output terminal only via the
+  tool result's terminal content block — which this host never emits; it
+  publishes standalone `ahp-terminal:` channels instead — and the remote
+  agent-host contribution consumes terminal channels only for
+  reconnection and recovery (`reconnectTerminals`, recovery telemetry).
+  The feature is therefore wire-only against the current client: the wire
+  surface (catalog row, snapshot, full action stream, read-only
+  rejections) is exercised by the host's unit suite (testing.md §1),
+  while the window renders nothing. Rendering `isPty: false` / standalone
+  terminal channels is a candidate VS Code request (futures.md §4.2).
 
 ### 12.2 PTY terminals (interactive shells)
 

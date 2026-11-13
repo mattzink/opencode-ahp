@@ -912,6 +912,50 @@ describe("permissions", () => {
     h.stop();
   });
 
+  it("summary status: InputNeeded while blocked, back to Idle after a denied, interrupted turn (no stuck Working…)", async () => {
+    const h = makeHarness();
+    h.init(1, "c1");
+    await waitInit(h, 1);
+    await createSession(h, 1, sessionChannelURI(SES), { provider: "gpuz" });
+    const { chatURI, TOOL } = await startTurnToPermission(h, 1);
+
+    // The session summary (the session-list view) of this session.
+    const summaryStatus = async (id: number): Promise<SessionStatus> => {
+      h.send(1, "listSessions", {}, id);
+      await waitFor(() => h.frames.some((f) => f.message.id === id && f.message.result !== undefined), `listSessions ${id}`);
+      const item = (h.frames.find((f) => f.message.id === id)!.message.result as { items: Array<Record<string, any>> }).items.find(
+        (s) => s.resource === sessionChannelURI(SES),
+      );
+      if (item === undefined) throw new Error("session not in listSessions");
+      return item.status as SessionStatus;
+    };
+
+    // While the turn awaits the user's confirmation, the summary is
+    // promoted to InputNeeded.
+    expect(await summaryStatus(300)).toBe((SessionStatus.InputNeeded | SessionStatus.IsRead) as SessionStatus);
+
+    // Deny (VS Code's "Skip" sends toolCallConfirmed approved:false) and let
+    // opencode finish the interrupted execution.
+    h.send(1, "dispatchAction", {
+      channel: chatURI,
+      clientSeq: 2,
+      action: { type: "chat/toolCallConfirmed", turnId: "tP", toolCallId: TOOL, approved: false, reason: "user-declined" },
+    });
+    await waitFor(() => h.facade.permissionReplies.length === 1, "reply");
+    h.facade.push({ type: "tool.failed", sessionID: SES, id: TOOL, error: { type: "cancelled", message: "denied" } });
+    h.facade.push({ type: "execution.interrupted", sessionID: SES, reason: "shutdown" });
+    await waitForAction(h, chatURI, "chat/turnCancelled");
+
+    // The session store's own status still carries the reducer's
+    // InProgress residue (draining the input queue only clears bit 16)…
+    const store = await sessionSnapshotState(h, 1, sessionChannelURI(SES), 310);
+    expect(store.status & SessionStatus.InProgress).toBe(SessionStatus.InProgress);
+    // …but the summary aggregates from the chat, which is idle again —
+    // the session list must no longer show "Working…".
+    expect(await summaryStatus(311)).toBe((SessionStatus.Idle | SessionStatus.IsRead) as SessionStatus);
+    h.stop();
+  });
+
   it("ignores non-tool permission.asked (logged, no inputNeeded)", async () => {
     const h = makeHarness();
     h.init(1, "c1");

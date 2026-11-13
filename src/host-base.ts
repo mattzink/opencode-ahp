@@ -3,7 +3,7 @@
  */
 
 import { ActionType, ChangesetStatus, ActionEnvelope, ActionOrigin, ChatAction, ChatSummary, ChangesetAction, RootAction, SessionAction, SessionSummary, StateAction, TerminalAction } from "@microsoft/agent-host-protocol";
-import { buildSessionSummary, chatSummaryOf, directoryUri, FacadeSession } from "./bridge.js";
+import { buildSessionSummary, chatSummaryOf, directoryUri, sessionSummaryStatus, type FacadeSession } from "./bridge.js";
 import { ChannelRegistry, ChannelKind, ROOT_CHANNEL, channelKind, parseChangesetChannel, sessionIDOf } from "./channels.js";
 import { Sequencer } from "./seq.js";
 import { createChangesetStateStore, createRootStateStore, ChangesetStateStore, RootStateStore } from "./state.js";
@@ -154,7 +154,9 @@ export class HostBase {
    * Propagate a changed chat summary into the session store's chat catalog
    * (`session/chatUpdated`) — the session status itself is only
    * reducer-reachable for read/archive/input-needed bits, so the chat
-   * summary is the activity source of truth.
+   * summary is the activity source of truth (the summary-level
+   * `SessionSummary.status` is aggregated from the chats by
+   * `sessionSummaryStatus`, never read back from the session store).
    */
   private syncChatSummary(rec: SessionRecord, chatURI: string): void {
     const chat = rec.chats.get(chatURI)?.chatStore.state;
@@ -225,7 +227,12 @@ export class HostBase {
       channel: rec.channel,
       provider: rec.provider,
       title: s.title,
-      status: s.status,
+      // Activity bits aggregated from the chat summaries (AHP rule): the
+      // session store's own status cannot source them — its reducer only
+      // reaches them through the input-queue path, which leaves
+      // `InProgress` set after an input-needed round trip when the turn
+      // ends. The `IsRead`/`IsArchived` flags stay session-scoped.
+      status: sessionSummaryStatus(s.status, chats, rec.defaultChatURI),
       activity: s.activity,
       createdAt: rec.createdAt,
       modifiedAt,
