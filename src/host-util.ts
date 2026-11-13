@@ -50,16 +50,14 @@ export function shellExitCodeOf(content: FacadeToolContent[]): number | null {
  *   - on the default backend of a minted-id session:
  *     `{ channel: <session channel URI> }` — the client-chosen session
  *     channel (a "ses" suffix is its own opencode id and needs none).
- * (The keep-alive anchor uses the same key with a STRING value —
- * `parseAhpMarker` ignores non-record markers.)
  */
 export const AHP_METADATA_KEY = "opencode-ahp";
 
 /**
  * Parse the AHP markers from an opencode session's durable metadata.
- * Defensive: a malformed shape (missing key, non-record marker — e.g.
- * the keep-alive anchor — or wrong-kind fields) means "no marker" —
- * standalone registration under the opencode id.
+ * Defensive: a malformed shape (missing key, non-record marker, or
+ * wrong-kind fields) means "no marker" — standalone registration under
+ * the opencode id.
  */
 export function parseAhpMarker(metadata: unknown): { chat?: string; owner?: string; channel?: string } | null {
   if (!isRecord(metadata)) return null;

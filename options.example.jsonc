@@ -37,18 +37,6 @@
   // Plain-HTTP health endpoint (no auth).
   // "healthPath": "/healthz",
 
-  // Keep the opencode location loaded against the idle timeout
-  // (experimental.location_idle_timeout, default 60 min) by touching an
-  // internal anchor session periodically. On, the
-  // location_idle_timeout config entry is not needed. The anchor shows in
-  // the TUI session list as "opencode-ahp (keep-alive)"; AHP clients never
-  // see it.
-  // "keepAlive": true,
-
-  // Minutes between keep-alive touches; keep well below the effective idle
-  // timeout (10 leaves sixfold headroom under the 60-minute default).
-  // "keepAliveIntervalMinutes": 10,
-
   // Global actions kept for reconnect replay; older gaps → fresh snapshot.
   // "replayWindow": 1000,
 

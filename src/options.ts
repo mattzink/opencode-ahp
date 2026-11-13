@@ -39,20 +39,6 @@ export interface Options {
   tls: TlsOptions | null;
   /** Plain-HTTP health endpoint (no auth). */
   healthPath: string;
-  /**
-   * Keep the opencode location loaded against the idle timeout (default
-   * `experimental.location_idle_timeout`, 60 minutes) via a periodic durable
-   * touch of an internal anchor session. With this on, the
-   * `location_idle_timeout: false` config entry is not needed. The anchor
-   * shows in the TUI session list as "opencode-ahp (keep-alive)"; AHP
-   * clients never see it.
-   */
-  keepAlive: boolean;
-  /**
-   * Minutes between keep-alive touches; must be well below the effective
-   * idle timeout. 10 leaves sixfold headroom under the 60-minute default.
-   */
-  keepAliveIntervalMinutes: number;
   /** Global actions kept for reconnect replay; older gaps → snapshot. */
   replayWindow: number;
   /**
@@ -75,8 +61,6 @@ export const BUILTIN_OPTIONS: Options = {
   allowedOrigins: "*",
   tls: null,
   healthPath: "/healthz",
-  keepAlive: true,
-  keepAliveIntervalMinutes: 10,
   replayWindow: 1000,
   // Event capture is off by default (a busy turn emits dozens of lines);
   // the LAN test server script enables it.
@@ -254,12 +238,6 @@ export function resolveOptions(
       BUILTIN_OPTIONS.allowedOrigins,
     tls: pickNullable("tls", validateTls, BUILTIN_OPTIONS.tls),
     healthPath: pick("healthPath", isUrlPath, BUILTIN_OPTIONS.healthPath),
-    keepAlive: pick("keepAlive", isBool, BUILTIN_OPTIONS.keepAlive),
-    keepAliveIntervalMinutes: pick(
-      "keepAliveIntervalMinutes",
-      isPosInt,
-      BUILTIN_OPTIONS.keepAliveIntervalMinutes,
-    ),
     replayWindow: pick("replayWindow", isPosInt, BUILTIN_OPTIONS.replayWindow),
     logEvents: pick("logEvents", isBool, BUILTIN_OPTIONS.logEvents),
     capabilities: resolveCapabilities(file["capabilities"], ctx["capabilities"]),

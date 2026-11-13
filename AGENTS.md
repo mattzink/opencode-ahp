@@ -9,8 +9,8 @@ Host Protocol (AHP) 1.0.0** in-process (`@microsoft/agent-host-protocol`,
 strict-pinned — the installed dist is the wire ground truth). House pattern
 (shared with llama-sync): **no build step** — `package.json` `exports` point
 at `./src/index.ts` and opencode (Bun runtime) loads the TS source directly;
-pure, dependency-injected modules (`host.ts`, `bridge.ts`, `transport.ts`,
-`keep-alive.ts`) unit-tested with Vitest without an opencode runtime.
+pure, dependency-injected modules (`host.ts`, `bridge.ts`, `transport.ts`)
+unit-tested with Vitest without an opencode runtime.
 `docs/design.md` is the canonical design doc — the source of truth for
 *why* the code is shaped the way it is (future work: `docs/futures.md`;
 testing: `docs/testing.md`).
@@ -49,12 +49,12 @@ testing: `docs/testing.md`).
 - **Pure modules + DI (house pattern)**: every module that is unit-tested is
   a pure function/class with its dependencies (session access, timers,
   logging, sockets) injected — tests never touch the opencode runtime, the
-  network, or the filesystem (see `src/test/keep-alive.test.ts` for the
-  current idiom, including injected fake timers).
+  network, or the filesystem (see `src/test/transport.test.ts` for the
+  current idiom).
 - **R2 — the opencode server must stay up**: the plugin never throws out of
   `setup(ctx)`; every failure path (bad options, token failure, listener
-  failure, keep-alive failure) logs and degrades gracefully with AHP off
-  while opencode itself keeps serving. Follow this on any new failure mode.
+  failure) logs and degrades gracefully with AHP off while opencode itself
+  keeps serving. Follow this on any new failure mode.
 - **Token always enforced**: the AHP listener refuses to start without a
   token, and a non-loopback bind requires one (R4). Never add a
   no-token dev mode.
@@ -68,10 +68,11 @@ testing: `docs/testing.md`).
   `serverInfo.version` is read from `package.json` at runtime
   (`pluginVersion()` in `src/index.ts`).
 - **opencode v2 is per-location**: plugins load per location (a location
-  boots on first use and is idle-evicted after 60 min by default). The
-  keep-alive module (`src/keep-alive.ts`; design §15.3) is what holds the
-  location loaded; its anchor session `ses_ahp_keepalive` is deliberately
-  filtered from every AHP surface — keep it that way if the anchor changes.
+  boots on first use and is idle-evicted after 60 min by default). A
+  plugin cannot stop the idle sweep — its published events carry no
+  envelope `location`, so `LocationActivity` ignores them (design §15.3) —
+  so an AHP location requires
+  `experimental.location_idle_timeout: false` in its config.
 - **Typecheck gotcha**: when piping `tsc` output (e.g. through `head`), use
   `set -o pipefail` first — otherwise the pipe masks `tsc`'s exit code and a
   broken build looks clean.
@@ -150,7 +151,7 @@ testing: `docs/testing.md`).
 - After ANY code change, run `pnpm typecheck` and `pnpm test` before marking
   the task complete. Tests MUST pass — debug and fix root causes, never
   complete a task with failing tests.
-- Changes that alter live behavior (transport, host, keep-alive) should be
+- Changes that alter live behavior (transport, host) should be
   verified against the LAN test server with `scripts/ahp-turn-lifecycle.mjs` before
   asking the user to publish.
 

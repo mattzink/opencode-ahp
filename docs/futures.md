@@ -364,8 +364,7 @@ Read from the registry maps on `main` (2026-11-09):
 
 ### 4.1 opencode — feature requests to file
 
-Queued as "investigate upstream later" from the keep-alive work;
-ordered by impact. Findings verified against v2.2.6 source and current
+Ordered by impact. Findings verified against v2.2.6 source and current
 `main` (88 commits ahead) where noted.
 
 1. **Auto-boot / server-scoped plugin hook** — the **cold-boot
@@ -374,37 +373,50 @@ ordered by impact. Findings verified against v2.2.6 source and current
    cannot run before the location boots; the AHP client never touches
    the opencode API (it dials the AHP WebSocket), so it cannot trigger
    a boot. No auto-boot / initialLocation / defaultLocation config
-   exists. The in-plugin keep-alive covers **idle eviction only**
-   (the 60-minute TTL); a fresh server process still needs the one-time
-   boot step (README step 3). A zero-touch boot needs an auto-boot
-   config (a location that boots at server start) or a server-scoped
-   plugin hook.
-2. **`session.update` dropping `archived`** — the plugin host's
+   exists. The mandatory
+   `experimental.location_idle_timeout: false` entry
+   ([design.md §15.3](design.md#153-location-idle-timeout)) keeps a
+   booted location loaded, but a fresh server process still needs the
+   one-time boot step (README step 3). A zero-touch boot needs an
+   auto-boot config (a location that boots at server start) or a
+   server-scoped plugin hook.
+2. **Plugin-published events don't reset the location idle timeout** —
+   `LocationActivity` touches a location only for durable session
+   events whose envelope carries a `location`, and events a plugin
+   publishes don't have one: the plugin host runs plugin effects in a
+   minimal fiber context (Scope and loggers only —
+   `packages/core/src/plugin.ts`), so the envelope's optional
+   `location` is unset and any durable touch from a plugin (e.g.
+   `Session.setMetadata`) is invisible to the idle sweep. Fix
+   candidates: `LocationActivity` falls back to the session's owner
+   location for durable session events without an envelope location, or
+   the plugin fiber context carries `Location.Service`. Until then
+   `experimental.location_idle_timeout: false` is mandatory for an AHP
+   location ([design.md §15.3](design.md#153-location-idle-timeout)).
+3. **`session.update` dropping `archived`** — the plugin host's
    `session.update` forwards only title / metadata / permissions and
    **silently drops `input.archived`** (v2.2.6 and current dev); HTTP
-   `PATCH /api/session/{id}` accepts `{archived}`. Consequence today:
-   the keep-alive anchor session (`ses_ahp_keepalive`) cannot be
-   archived and is visible in the opencode TUI session list as
-   "opencode-ahp (keep-alive)"; it is filtered from every AHP surface
-   by ID ([design.md §15.3](design.md#153-keep-alive-anchor)).
-3. **Form reply surface for plugins** (`ctx.form` with `reply` /
+   `PATCH /api/session/{id}` accepts `{archived}`. Consequence: a
+   plugin cannot archive a session from the plugin surface — no current
+   product consequence.
+4. **Form reply surface for plugins** (`ctx.form` with `reply` /
    `cancel`) — the load-bearing blocker for elicitation completion
    ([§1.1](#11-elicitation-completion-decision-pending), option (a));
    the Form system is the only way to unblock the `question` tool.
-4. **pty surface for plugins** (`write` / `attach`, or at minimum
+5. **pty surface for plugins** (`write` / `attach`, or at minimum
    `list` / `create` for persistent-pty) — needed **only** for fully
    *interactive* remote terminals ([§1.2](#12-terminals-beyond-the-synthetic-command-terminals),
    option (d)). The read-only mirror (option (b)) does not need it.
-5. **Inbox cancel** — a way to withdraw a pending steer/queue message;
+6. **Inbox cancel** — a way to withdraw a pending steer/queue message;
    unlocks `chat/pendingMessageRemoved` ([§1.4](#14-small-chat-surface-gaps)).
-6. **File-watch subscription** (or a durable file-change event stream)
+7. **File-watch subscription** (or a durable file-change event stream)
    — would back `createResourceWatch` / `ahp-resource-watch:`
    ([§2.1](#21-commands)). Long-term; no current client need.
 
 Impact note: #1 changes the deployment UX (zero-touch boot), #2 removes
-a visible TUI artifact, #3 is the only path to remote elicitation — the
-three that change the shape of the product. #4–#6 are on-demand feature
-unlocks.
+the mandatory config entry (the idle timeout), #4 is the only path to
+remote elicitation — the three that change the shape of the product.
+#3 and #5–#7 are on-demand feature unlocks.
 
 ### 4.2 VS Code — upstream requests & watches
 

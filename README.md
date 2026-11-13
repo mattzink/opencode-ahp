@@ -127,7 +127,6 @@ important ones:
 | `token` | auto | Omit → generated on first start, persisted in opencode's plugin storage, printed once to the service log. Accepted via the `?token=` query param and `Authorization: Bearer <token>`. **Always enforced**, loopback or not |
 | `host` | `"127.0.0.1"` | Bind address; a **non-loopback bind requires an explicit `token`** (the listener refuses to start otherwise) |
 | `port` | `8765` | WS listen port |
-| `keepAlive` | `true` | Keep the opencode location loaded against its idle timeout by periodically touching an internal anchor session — with this on, **no `location_idle_timeout` config entry is needed**. See the example file for the anchor's visibility details |
 
 ## Remote access (local LAN)
 
@@ -156,11 +155,22 @@ port forward, any `wss://` proxy) are operational; the host accepts any
    }
    ```
 
-   No `experimental.location_idle_timeout` entry needed: by default the
-   plugin keeps its own location loaded (`keepAlive`, see Options) by
-   periodically touching an internal anchor session (visible in the TUI
-   session list as "opencode-ahp (keep-alive)", hidden from AHP clients)
-   — opencode's idle sweep never fires.
+   **Mandatory for now: disable the location idle timeout.** opencode
+   unloads a location after it has been idle for
+   `experimental.location_idle_timeout` (default 60 minutes), and a
+   plugin cannot prevent the sweep — events a plugin publishes carry no
+   location, so they never count as location activity (see
+   [`docs/design.md`](docs/design.md) §15.3). Add, to the project's
+   `opencode.jsonc` (the one that selects this location):
+
+   ```jsonc
+   {
+     "experimental": { "location_idle_timeout": false }
+   }
+   ```
+
+   With this set, the location (and the AHP listener) stays loaded
+   indefinitely once booted.
 
 3. **Boot the location once** — the AHP listener exists only while the
    location is up, and a location boots on first use. After a fresh server
@@ -172,12 +182,13 @@ port forward, any `wss://` proxy) are operational; the host accepts any
      'http://127.0.0.1:<port>/api/location?location[directory]=<project-dir>'
    ```
 
-   This is a one-time step per server process: the keep-alive then holds
-   the location (and the listener) indefinitely, and reloading the
-   location (config change, `opencode service restart`) re-boots it
-   automatically. (The one-time boot itself is an opencode limitation —
-   plugins cannot run before their location has booted; a zero-touch boot
-   needs an upstream auto-boot option.)
+   This is a one-time step per server process: with
+   `location_idle_timeout: false` (step 2) the location (and the
+   listener) then stays loaded indefinitely, and reloading the location
+   (config change, `opencode service restart`) re-boots it automatically.
+   (The one-time boot itself is an opencode limitation — plugins cannot
+   run before their location has booted; a zero-touch boot needs an
+   upstream auto-boot option.)
 4. Verify: `curl -s http://<host-lan-ip>:<port>/healthz` → `ok`.
 
 Full two-machine walkthrough (and the complete testing strategy: unit,

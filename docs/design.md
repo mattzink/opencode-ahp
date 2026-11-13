@@ -92,7 +92,6 @@ flowchart TB
 
     subgraph proc["opencode server process (Bun)"]
         subgraph plugin["opencode-ahp plugin (in-process)"]
-            KA["src/keep-alive.ts — anchor-session periodic touch"]
             ENTRY["src/index.ts — setup(ctx) · token · OpencodeFacade impl"]
             TR["src/transport.ts — Bun.serve WS accept · token · Origin · TLS · health"]
             HS["src/handshake.ts — initialize · semver negotiation"]
@@ -107,7 +106,6 @@ flowchart TB
 
     A1 -- "ws(s)://host:8765/ahp?token=…" --> TR
     A2 -- "ws(s)://host:8765/ahp?token=…" --> TR
-    ENTRY -. "starts keep-alive · builds Host · creates listener" .-> KA
     ENTRY -. "builds Host · creates listener" .-> HOST
     TR <-->|"onOpen / onMessage / onClose"| HOST
     HOST <--> HS
@@ -122,7 +120,7 @@ flowchart TB
 
 | Module | Role |
 | --- | --- |
-| `src/index.ts` | Plugin entry (`Plugin.define({ id: "opencode-ahp", setup })`). Resolves options, ensures the token, starts keep-alive, constructs the `Host` + transport, starts the event pump, registers client tools on the opencode tool registry (`ctx.tool.transform` + `ctx.tool.reload`), and returns the location-teardown cleanup. The only `ctx` call site; implements `OpencodeFacade` (including the git-backed changeset helpers, since the plugin surface has no HEAD-read or single-file-discard API). |
+| `src/index.ts` | Plugin entry (`Plugin.define({ id: "opencode-ahp", setup })`). Resolves options, ensures the token, constructs the `Host` + transport, starts the event pump, registers client tools on the opencode tool registry (`ctx.tool.transform` + `ctx.tool.reload`), and returns the location-teardown cleanup. The only `ctx` call site; implements `OpencodeFacade` (including the git-backed changeset helpers, since the plugin surface has no HEAD-read or single-file-discard API). |
 | `src/transport.ts` | Pure policy functions (loopback check, token extraction/comparison, Origin policy, path routing) plus a thin `Bun.serve` listener implementing the `Listener` interface. Auth happens at the WebSocket **upgrade**. |
 | `src/handshake.ts` | The `initialize` command: validation and semver capability negotiation via the official package's `negotiateProtocolVersion`. |
 | `src/host.ts` | The `Host` class — the JSON-RPC 2.0 router that ties transport, handshake, channels, sequencer, state stores, and the facade together: command handling, client-action dispatch, session/chat records, the opencode event pump, changesets, synthetic terminals, and client-tool routing. |
@@ -131,7 +129,6 @@ flowchart TB
 | `src/state.ts` | Channel state stores. Every store simply applies the **official reducers** from `@microsoft/agent-host-protocol` (`rootReducer`, `sessionReducer`, `chatReducer`, `changesetReducer`, `terminalReducer`) — the host never hand-rolls a state transition. |
 | `src/bridge.ts` | The opencode-aware mapping layer: the `OpencodeFacade` contract, `mapV2Event` (raw v2 event → narrow `FacadeEvent` union), catalog/summary/changeset builders, and the content-ref URI helpers (`file://`, `ahp-content://head/…`, `ahp-content://snap/…`). |
 | `src/client-tools.ts` | Pure helpers for client-provided tools: wire validation of `ToolDefinition`s, the cross-session tool union, and per-session provider lookup. |
-| `src/keep-alive.ts` | Periodic durable touch of an anchor session that keeps the opencode location loaded against its idle timeout. |
 | `src/options.ts` | Option validation + resolution (ctx options ▸ `options.jsonc` sibling ▸ built-ins) and a dependency-free JSONC stripper. |
 | `src/error.ts` | `errorMessage` normalizer. |
 | `src/test/*` | Vitest suites for the pure modules (`state.ts` and `error.ts` covered indirectly through the host suites), including a captured-turn fixture replayed through the real AHP reducers. |
@@ -147,21 +144,21 @@ lives and dies with its location:
 location boots → setup(ctx)
   1. resolve options; enabled: false → fully inert (no listener)
   2. token: explicit option, else persisted (generated once)
-  3. keep-alive: get-or-create the anchor session, start touching it
-  4. build Host (facade injected) + createListener (TLS material read)
-  5. host.startEventPump()
+  3. build Host (facade injected) + createListener (TLS material read)
+  4. host.startEventPump()
   → logs the listening URL
 location tears down → cleanup()
-  → stop keep-alive, kill the pty terminals (final terminal/exited),
+  → kill the pty terminals (final terminal/exited),
     stop the pump (aborts the event subscription),
     stop the listener (drops every client connection); logged
 ```
 
-Steps 2–5 each have a failure path that logs and leaves the opencode
-server running without AHP (see [§14](#14-error-handling--graceful-degradation)). Keep-alive starts **before** the
-host so the anchor session's `session.created` event fires before the
-event pump subscribes (the facade also filters the anchor from every
-client-facing surface, so this is belt-and-braces).
+Steps 2–4 each have a failure path that logs and leaves the opencode
+server running without AHP (see [§14](#14-error-handling--graceful-degradation)).
+The idle sweep itself cannot be stopped from a plugin
+([§15.3](#153-location-idle-timeout)) —
+`experimental.location_idle_timeout: false` in the project config is
+mandatory for an indefinitely-loaded AHP location.
 
 ## 3. Transport & security
 
@@ -555,8 +552,7 @@ it is handled — so the log proves what the host saw and when. Purpose:
 attributing turn latency to host, client, or model. A blank window in the
 event stream means the host never received the events (e.g. the model
 provider produced no output — "Considering…" on the client is then
-correct, not a plugin stall). The keep-alive anchor's events are filtered
-before classification, as from every AHP surface.
+correct, not a plugin stall).
 
 Classification (`mapV2EventRaw` in bridge.ts — the only place that knows
 the raw wire shape; `mapV2Event` is its thin `ok → event, else null`
@@ -964,7 +960,7 @@ titles are re-derived (`Chat 2`, …) — a documented divergence.
 
 ### 13.4 Location teardown
 
-The plugin's cleanup stops the keep-alive timer, kills every live pty
+The plugin's cleanup kills every live pty
 terminal (`stopTerminals` — a still-running process gets a final
 `terminal/exited` so subscribers see the row exit rather than the socket
 drop), aborts the event pump (ending the `ctx.event.subscribe`
@@ -980,12 +976,10 @@ never opencode.
 
 | Failure | Behavior |
 | --- | --- |
-| `enabled: false` | The plugin is fully inert — no listener, no keep-alive. |
+| `enabled: false` | The plugin is fully inert — no listener. |
 | Malformed `options.jsonc` sibling | One error log; options re-resolved without the file. |
 | Token cannot be resolved | Error log; the plugin returns — opencode serves without AHP. |
-| Keep-alive anchor fails | Keep-alive stays off (logged); opencode's idle timeout applies as if the plugin weren't there. |
-| Keep-alive touch fails | Logged; retried on the next tick. |
-| TLS key/cert unreadable | The listener never binds; error log; keep-alive stopped; opencode serves without AHP. |
+| TLS key/cert unreadable | The listener never binds; error log; opencode serves without AHP. |
 | `Bun.serve` bind failure (port in use, etc.) | Same degrade path as above. |
 | Non-loopback bind without a token | The listener refuses to start (before binding) — the same degrade path. |
 | Malformed JSON frame | `-32700` parse error; the connection stays up. |
@@ -1048,7 +1042,6 @@ read-merge):
 | --- | --- | --- |
 | `{ chat: <chat URI>, owner: <opencode session id> }` | peer-chat backends | re-attach the backend to the owning session's chat catalog at its original URI after a restart. `owner` is the opencode id, not the channel suffix (client-chosen suffixes differ from minted ids). |
 | `{ channel: <session channel URI> }` | the default backend of a minted-id session | resurface the standalone session under the **original client-chosen channel** after a restart (a `ses…` suffix *is* the opencode id and needs no marker). |
-| the string `"keep-alive"` (+ `keepAliveAt`) | the anchor session | identifies the keep-alive anchor (also its touch record). |
 
 Markers are defensive on read: a malformed shape means "no marker"
 (standalone registration under the opencode id). Forked sessions inherit
@@ -1056,26 +1049,33 @@ metadata from their parent — when an inherited marker's target is
 already bound, the marker is ignored and the session registers
 standalone (logged).
 
-### 15.3 Keep-alive anchor
+### 15.3 Location idle timeout
 
-To survive the location idle timeout without any user config,
-`keep-alive.ts` keeps a dedicated anchor session — deterministic id
-`ses_ahp_keepalive`, titled **"opencode-ahp (keep-alive)"** — and
-periodically updates its metadata (default every 10 minutes, well under
-the 60-minute default timeout). The metadata update publishes a durable
-`session.metadata.updated` event, which is exactly what touches the
-location's activity counter. Consequences:
+The plugin cannot stop the location idle sweep, so an AHP-enabled
+location requires `experimental.location_idle_timeout: false` in the
+project's `opencode.jsonc` (documented as mandatory in the README).
 
-- No `experimental.location_idle_timeout: false` config is needed.
-- The anchor is a **real** opencode session and therefore shows in the
-  TUI session list; the plugin surface cannot archive it. Instead the
-  facade filters it **by id** from every AHP surface: session list,
-  `getSession`, and the event stream (no `session.created` leak).
-- Deterministic id ⇒ reloads reuse the same session (no accumulation).
-- A cold boot is an architectural limit: plugins cannot run before their
-  location boots, so a one-time boot step (open the project once, or a
-  headless `POST /api/location`) is still required after a fresh server
-  start; the keep-alive then holds the location indefinitely.
+Why a plugin cannot do it: opencode's `LocationActivity` touches a
+location's activity counter only for durable session events whose
+**envelope** carries a `location`. Events a plugin publishes do not —
+the plugin host runs plugin effects in a minimal fiber context (Scope
+and loggers only, `packages/core/src/plugin.ts`), so when
+`Session.setMetadata` publishes `session.metadata.updated`, the envelope's
+optional `location` is unset and the touch is ignored. Verified live
+2026-11-12: the anchor-session touches arrived on the raw event stream
+(`GET /api/event`) every minute **without** a `location` field, while
+the location was still idle-evicted exactly 60 minutes after the last
+real activity. A plugin-side keep-alive based on periodic durable
+touches (an anchor session `ses_ahp_keepalive`, filtered from every AHP
+surface) was therefore removed — it could never reset the TTL.
+
+A one-time boot is still required after a fresh server start (plugins
+cannot run before their location boots; the README documents the
+headless one-liner); with `location_idle_timeout: false` the location —
+and the AHP listener — then stays loaded indefinitely. If upstream makes
+plugin-published events count as location activity (or exposes
+retention to plugins), the config entry becomes unnecessary again —
+tracked in [`futures.md`](futures.md).
 
 ### 15.4 What is intentionally not durable
 

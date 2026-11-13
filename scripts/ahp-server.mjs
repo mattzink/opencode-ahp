@@ -9,8 +9,10 @@
  * dir it scaffolds that project itself (nothing is ever copied over):
  * .opencode/opencode.jsonc pinning this repo as a dev plugin with the AHP
  * host on 0.0.0.0:8767, an AHP token (random per fresh tree, or pinned
- * with --token), a 1-minute keep-alive touch interval, and event
- * capture on (logEvents), a .gitignore, `git init`, and an initial commit
+ * with --token), event capture on (logEvents), and
+ * experimental.location_idle_timeout: false (a plugin cannot stop the
+ * idle sweep — design.md §15.3 — so the test location must not
+ * idle-evict), a .gitignore, `git init`, and an initial commit
  * of the scaffold so the working tree starts clean. By default it
  * also boots
  * the location — the one-time cold-boot step that starts the AHP listener
@@ -144,11 +146,13 @@ const repoRoot = path.resolve(path.dirname(new URL(import.meta.url).pathname), "
  * location config is missing (an existing project is left untouched, git
  * repo or not). Creates .opencode/opencode.jsonc pinning this repo as a
  * dev plugin with the AHP host on 0.0.0.0:8767, an AHP token (random per
- * fresh tree, or the --token value when given), a 1-minute keep-alive
- * touch interval, and event capture on (logEvents — the server log gets
- * a timestamped event ok/dropped/unimplemented line per opencode event),
- * a .gitignore (keeps .opencode/ out of the git status the changeset
- * surface reads),
+ * fresh tree, or the --token value when given), event capture on
+ * (logEvents — the server log gets a timestamped event
+ * ok/dropped/unimplemented line per opencode event), and
+ * experimental.location_idle_timeout: false (a plugin cannot stop the
+ * idle sweep — design.md §15.3 — so the test location must not
+ * idle-evict), a .gitignore (keeps .opencode/ out of the git status the
+ * changeset surface reads),
  * `git init`, and an initial commit of whatever is uncommitted — the
  * changeset surface reads git status, so the tree must start clean (the
  * notes.txt baseline stays with scripts/ahp-changesets.mjs). Nothing is
@@ -167,19 +171,23 @@ function ensureLocation() {
   "$schema": "https://opencode.ai/config.json",
   "plugins": [
     {
-      // LAN test — dev checkout, AHP host on 0.0.0.0:8767, 1-minute
-      // keep-alive touch interval, event capture on (testing.md §3.1).
+      // LAN test — dev checkout, AHP host on 0.0.0.0:8767, event capture
+      // on (testing.md §3.1).
       "package": ${JSON.stringify(repoRoot)},
       "options": {
         "host": "0.0.0.0",
         "port": 8767,
         "token": ${JSON.stringify(ahpToken)},
         "allowedOrigins": "*",
-        "keepAliveIntervalMinutes": 1,
         "logEvents": true
       }
     }
-  ]
+  ],
+  "experimental": {
+    // a plugin cannot stop the idle sweep (design.md §15.3) — keep the
+    // test location loaded
+    "location_idle_timeout": false
+  }
 }
 `,
   );

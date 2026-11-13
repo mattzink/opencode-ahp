@@ -40,10 +40,8 @@ pnpm test -t "turn lifecycle"    # tests whose name matches
 **Design (house pattern).** Every module under test is a pure
 function/class with its dependencies — session access, timers, logging,
 sockets — **injected**, so tests never touch the opencode runtime, the
-network, or the filesystem. `src/test/keep-alive.test.ts` is the reference
-idiom: injected capturing timers (no real `setInterval`), and the returned
-mocks are the effective deps, so assertions observe exactly what the unit
-under test used.
+network, or the filesystem; the returned mocks are the effective deps,
+so assertions observe exactly what the unit under test used.
 
 | Suite | What it covers |
 | --- | --- |
@@ -54,7 +52,6 @@ under test used.
 | `channels.test.ts` | channel kind + session/changeset URI helpers; `ChannelRegistry`: snapshot on subscribe, broadcast targets and sockets, live sessions. |
 | `bridge.test.ts` | the `mapV2Event` catalog — opencode V2 events → AHP chat actions (part deltas, tool lifecycle, permission events, usage, inbox, execution terminals); `mapV2EventRaw` classification (ok / dropped-with-reason / unimplemented / malformed envelopes) + the `eventLogLine`/`timeStamp` capture-line format; catalog mapping (providers/models/agents/customizations); changeset file builders + diff stats; content refs. |
 | `client-tools.test.ts` | client-provided tool definition normalization, the cross-session union, provider lookup, schema/description extraction. |
-| `keep-alive.test.ts` | `KeepAlive` start/tick/stop with injected capturing timers. |
 | `host.test.ts` | the whole host: `initialize`, `createSession`/`listSessions`, the turn lifecycle, permission round trips, steering/queue, cancel + terminal events, external sessions, changesets (catalogues, subscribe/refresh, turn before-capture), `resourceRead`, `invokeChangesetOperation`, `filesReviewChanged`, teardown + capability gating, client tools, multi-chat + chat-binding durability, terminals (synthetic shell-tool renderings + pty `createTerminal`/`disposeTerminal` with a fake `spawnPty` seam), `resolveSessionConfig`. |
 
 **Fixtures.** `src/test/fixtures/events.jsonl` holds a captured
@@ -108,16 +105,18 @@ on a fresh scratch tree, never copying previous state — scaffolds the
 location project `/tmp/ahp-server/test-project` (a
 `.opencode/opencode.jsonc` pinning this checkout as a dev plugin with
 `host: 0.0.0.0`, `port: 8767`, a `token` (generated per fresh tree, or
-pinned with `--token`), `allowedOrigins: "*"`, a 1-minute keep-alive
-interval, and event capture on
+pinned with `--token`), `allowedOrigins: "*"`, event capture on
 (`logEvents: true` — design.md [§8.1](design.md#81-event-capture-logevents)),
-plus a `.gitignore`, `git init`, and
-an initial commit of the scaffold so the working tree starts clean),
-generates the Basic-auth password itself via
+and `experimental.location_idle_timeout: false` (the test location must
+not idle-evict — design.md
+[§15.3](design.md#153-location-idle-timeout)), plus a `.gitignore`,
+`git init`, and an initial commit of the scaffold so the working tree
+starts clean), generates the Basic-auth password itself via
 `OPENCODE_SERVER_PASSWORD` and prints it, boots the location — the
 one-time cold-boot step that starts the AHP listener (a location and its
-plugins only boot when a client opens it or the API is asked for it; the
-keep-alive then holds it indefinitely) — waits for the AHP healthz, and
+plugins only boot when a client opens it or the API is asked for it;
+with `location_idle_timeout: false` it then stays loaded indefinitely) —
+waits for the AHP healthz, and
 prints a summary (Basic-auth password, AHP URL, the PC B URL with token,
 the TUI command line, log path). It is idempotent: an already-running test server is reused (its
 password is recovered from the process environment), and the location boot
@@ -145,11 +144,11 @@ Notes:
   config. R4 requires an explicit token for a non-loopback bind.
 - `allowedOrigins: "*"` is test mode; production setups list exact
   Origins.
-- **No `experimental.location_idle_timeout` entry** — not needed. The
-  plugin's keep-alive (on by default; see
-  [design.md §15.3](design.md#153-keep-alive-anchor)) periodically
-  touches an internal anchor session, which opencode counts as location
-  activity, so the 60-minute idle eviction never fires.
+- **`experimental.location_idle_timeout: false` is set** in the
+  scaffolded config: a plugin cannot stop the idle sweep (its published
+  events carry no envelope location —
+  [design.md §15.3](design.md#153-location-idle-timeout)), so the test
+  location would otherwise idle-evict after 60 minutes.
 - **Event capture is on** (`logEvents: true` in the scaffolded config):
   `grep "event " /tmp/ahp-server/server.log` shows one timestamped
   `event ok|dropped|unimplemented` line per opencode event the plugin
@@ -172,10 +171,11 @@ The machine's LAN IP: `hostname -I | awk '{print $1}'`.
 equivalent.)
 
 **Troubleshooting — AHP port dead but the server is up** (`healthz` →
-connection refused, :4098 still 200): with keep-alive active (check the
-server log for `keep-alive active`) this should not happen; if it does,
-the location was evicted or the plugin failed to start, and re-booting the
-location fixes it — the plugin setup re-runs and the listener comes back.
+connection refused, :4098 still 200): the location was evicted or the
+plugin failed to start, and re-booting the location fixes it — the
+plugin setup re-runs and the listener comes back. With the scaffolded
+`location_idle_timeout: false`, an idle eviction should not happen — if
+it does, check the location config still carries the entry.
 Any of these re-boots the location (VS Code reconnects on its own — the
 host's clientId registry resets, so the client re-initializes from a fresh
 snapshot):
@@ -234,8 +234,8 @@ node scripts/ahp-terminal-probe.mjs --token "$TOKEN" --base http://127.0.0.1:876
 baseline committed at `line1\nline2` — so it can run right after a fresh
 `scripts/ahp-server.mjs` run.)
 
-**When to run them.** Changes that alter live behavior (transport, host,
-keep-alive) should be verified against the test server — at minimum
+**When to run them.** Changes that alter live behavior (transport, host)
+should be verified against the test server — at minimum
 `ahp-turn-lifecycle.mjs`, plus the script dedicated to the changed surface —
 **before** asking the user to publish. The test server may be reloaded
 (`POST /api/location/reload`) or restarted for testing; the user's daily
@@ -457,7 +457,7 @@ dependency.
 | Trigger | Layers |
 | --- | --- |
 | Any code change (required before work is complete) | §1 `pnpm test` + §2 `pnpm typecheck` — both green, root-caused, never skipped. |
-| Live-behavior change (transport, host, keep-alive) — before asking the user to publish | §3 test server + `ahp-turn-lifecycle.mjs` minimum, plus the script dedicated to the changed surface. |
+| Live-behavior change (transport, host) — before asking the user to publish | §3 test server + `ahp-turn-lifecycle.mjs` minimum, plus the script dedicated to the changed surface. |
 | opencode event-catalog change | §3 `capture-events.mjs` to refresh `src/test/fixtures/events.jsonl`, then §1. |
 | Publish (user's push; CI trusted publisher) | §2 re-runs in CI; `prepublishOnly` runs the same pair first. |
 | Conformance gate | §5 — re-run on new capabilities, pin changes, or corpus moves (§5.5). |
