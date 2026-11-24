@@ -392,6 +392,16 @@ is the authoritative view.
 - root — re-derived from the facade on every call (the catalog read
   reflects every registration so far).
 
+Catalog models with variants advertise `SessionModelInfo.configSchema` with
+a `reasoningEffort` choice. Its values are the OpenCode variant IDs in
+catalog order, plus an empty string labelled **Default**. Models without
+variants omit the schema. This is model configuration, not session creation
+configuration: VS Code sends the choice in `message.model.config` when it
+starts a turn. The host passes the selected ID as `Model.Ref.variant` when
+it switches the OpenCode session's model before sending the prompt. A
+missing or empty choice selects the base model without a variant. The same
+mapping applies to `createChat.initialMessage`.
+
 ## 6. Command surface
 
 Requests (methods with an `id`) routed by the host:

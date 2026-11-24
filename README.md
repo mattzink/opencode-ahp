@@ -20,7 +20,8 @@ In the Agents window, an `opencode` host with:
   agent, changesets, terminal, and file reads are scoped to that
   directory (sessions without one use the plugin's own location).
 - **Model picker** — the real opencode catalog: every provider and model
-  your server exposes.
+  your server exposes. Models with variants offer a **Reasoning Effort**
+  picker; **Default** uses the model without a variant.
 - **Agent picker** — opencode's user-invocable agents (Build, Plan, and
   anything you define) appear as selectable agents; subagent-only agents
   are hidden.

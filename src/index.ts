@@ -599,6 +599,7 @@ function implementFacade(
             input: m.limit.input,
           },
           inputModalities: [...m.capabilities.input],
+          variants: m.variants.map((variant) => String(variant.id)),
         });
       }
       return providers.data.map((p) => ({

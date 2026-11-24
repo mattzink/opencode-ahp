@@ -4,7 +4,7 @@
 
 import { HostClientTools } from "./host-client-tools.js";
 import { ActionType, Message } from "@microsoft/agent-host-protocol";
-import { agentIDFromUri, chatChangesetCatalog, chatSummaryOf, initialChatState } from "./bridge.js";
+import { agentIDFromUri, chatChangesetCatalog, chatSummaryOf, initialChatState, modelRefFromSelection } from "./bridge.js";
 import { channelKind, isSessionChannel, sessionIDOf } from "./channels.js";
 import { ERROR_INVALID_PARAMS } from "./handshake.js";
 import { isRecord } from "./options.js";
@@ -287,13 +287,9 @@ export class HostChats extends HostClientTools {
    */
   protected async applyMessageSelection(chat: ChatRuntime, message: Message): Promise<string | null> {
     try {
-      if (message.model?.id !== undefined && message.model.id.includes("/")) {
-        const sep = message.model.id.indexOf("/");
-        const providerID = message.model.id.slice(0, sep);
-        const modelID = message.model.id.slice(sep + 1);
-        if (providerID.length > 0 && modelID.length > 0) {
-          await this.opts.facade.switchModel({ sessionID: chat.sessionID, model: { providerID, modelID } });
-        }
+      const model = modelRefFromSelection(message.model);
+      if (model !== undefined) {
+        await this.opts.facade.switchModel({ sessionID: chat.sessionID, model });
       }
       if (message.agent?.uri !== undefined) {
         const agentID = agentIDFromUri(message.agent.uri);

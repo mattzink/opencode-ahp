@@ -47,13 +47,15 @@ describe("turn lifecycle", () => {
         message: {
           text: FIX_PROMPT,
           origin: { kind: "user" },
-          model: { id: "gpuz/qwen3.8-27b-q5xl" },
+          model: { id: "gpuz/qwen3.8-27b-q5xl", config: { reasoningEffort: "high" } },
           agent: { uri: "opencode:agent/build" },
         },
       },
     });
     await waitFor(() => h.facade.promptCalls.length === 1, "prompt");
-    expect(h.facade.switchModelCalls).toEqual([{ sessionID: FIX_SES, model: { providerID: "gpuz", modelID: "qwen3.8-27b-q5xl" } }]);
+    expect(h.facade.switchModelCalls).toEqual([
+      { sessionID: FIX_SES, model: { providerID: "gpuz", modelID: "qwen3.8-27b-q5xl", variant: "high" } },
+    ]);
     expect(h.facade.switchAgentCalls).toEqual([{ sessionID: FIX_SES, agent: "build" }]);
     expect(h.facade.promptCalls[0]).toEqual({ sessionID: FIX_SES, text: FIX_PROMPT });
     // Accepted echo on the chat channel (no rejectionReason).

@@ -115,7 +115,15 @@ describe("multi-chat", () => {
     const res = await createChat(
       h,
       1,
-      { channel: sessionChannelURI("im-sess"), chat: peer, initialMessage: { text: "first message" } },
+      {
+        channel: sessionChannelURI("im-sess"),
+        chat: peer,
+        initialMessage: {
+          text: "first message",
+          origin: { kind: "user" },
+          model: { id: "gpuz/qwen3.8-27b-q5xl", config: { reasoningEffort: "low" } },
+        },
+      },
       410,
     );
     expect(res.error).toBeUndefined();
@@ -129,6 +137,9 @@ describe("multi-chat", () => {
     expect(h.facade.promptCalls).toHaveLength(1);
     expect(h.facade.promptCalls[0]!.sessionID).toBe(h.facade.createdIds[1]!);
     expect(h.facade.promptCalls[0]!.text).toBe("first message");
+    expect(h.facade.switchModelCalls).toEqual([
+      { sessionID: h.facade.createdIds[1], model: { providerID: "gpuz", modelID: "qwen3.8-27b-q5xl", variant: "low" } },
+    ]);
     h.stop();
   });
 

@@ -24,6 +24,7 @@ import {
   inputSchemaOf,
   mapAgentCustomizations,
   mapCatalog,
+  modelRefFromSelection,
   mapMcpServerCustomizations,
   mapServerTools,
   mapSkillCustomizations,
@@ -69,6 +70,24 @@ const facadeAgent = (over: Partial<FacadeAgent> = {}): FacadeAgent => ({
   ...over,
 });
 
+describe("modelRefFromSelection", () => {
+  it("passes the chosen variant while preserving slash-delimited model IDs", () => {
+    expect(modelRefFromSelection({
+      id: "openrouter/vendor/model",
+      config: { reasoningEffort: "high" },
+    })).toEqual({ providerID: "openrouter", modelID: "vendor/model", variant: "high" });
+  });
+
+  it("uses the base model when Default is selected or there is no variant choice", () => {
+    const id = "gpuz/qwen3.8-27b-q5xl";
+    const expected = { providerID: "gpuz", modelID: "qwen3.8-27b-q5xl" };
+    expect(modelRefFromSelection({ id, config: { reasoningEffort: "" } })).toEqual(expected);
+    expect(modelRefFromSelection({ id, config: { reasoningEffort: 42 } })).toEqual(expected);
+    expect(modelRefFromSelection({ id })).toEqual(expected);
+    expect(modelRefFromSelection({ id: "not-qualified" })).toBeUndefined();
+  });
+});
+
 describe("mapCatalog", () => {
   it("maps a provider to an AgentInfo with the model ref and limits", () => {
     const agents = mapCatalog([provider()]);
@@ -102,6 +121,33 @@ describe("mapCatalog", () => {
     expect(agents[0]!.capabilities?.multipleChats?.fork).toBeUndefined();
     expect(agents[0]!.capabilities?.multipleChats?.sideChat).toBeUndefined();
     expect(agents[0]!.capabilities?.multipleWorkingDirectories).toBeUndefined();
+  });
+
+  it("advertises variant choices on one model without changing its ID", () => {
+    const p = provider();
+    p.models[0]!.variants = ["low", "high", "deep", "none"];
+    const models = mapCatalog([p])[0]!.models;
+    expect(models).toHaveLength(1);
+    expect(models[0]).toMatchObject({
+      id: "gpuz/qwen3.8-27b-q5xl",
+      configSchema: {
+        type: "object",
+        properties: {
+          reasoningEffort: {
+            type: "string",
+            default: "",
+            enum: ["", "low", "high", "deep", "none"],
+            enumLabels: ["Default", "Low", "High", "Deep", "None"],
+          },
+        },
+      },
+    });
+  });
+
+  it("omits the picker for a model without variants", () => {
+    const p = provider();
+    p.models[0]!.variants = [];
+    expect(mapCatalog([p])[0]!.models[0]!.configSchema).toBeUndefined();
   });
 
   it("uses an explicit description when present", () => {

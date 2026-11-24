@@ -34,6 +34,7 @@ import {
   type McpServerCustomization,
   type McpServerState,
   type Message,
+  type ModelSelection,
   type SessionActiveClient,
   type SessionState,
   type SessionSummary,
@@ -52,6 +53,8 @@ export interface FacadeModel {
   limit: { context?: number; output?: number; input?: number };
   /** ModelInfo.capabilities.input (e.g. ["text", "image"]). */
   inputModalities: string[];
+  /** Selectable OpenCode variant IDs, in catalog order. */
+  variants?: readonly string[];
 }
 
 export interface FacadeProvider {
@@ -128,6 +131,23 @@ export interface FacadeModelRef {
   providerID: string;
   modelID: string;
   variant?: string;
+}
+
+// VS Code groups this AHP model config key with the reasoning controls.
+const REASONING_EFFORT = "reasoningEffort";
+const DEFAULT_VARIANT = "";
+
+export function modelRefFromSelection(selection?: ModelSelection): FacadeModelRef | undefined {
+  const id = selection?.id;
+  if (typeof id !== "string") return undefined;
+  const sep = id.indexOf("/");
+  if (sep <= 0 || sep === id.length - 1) return undefined;
+  const variant = selection?.config?.[REASONING_EFFORT];
+  return {
+    providerID: id.slice(0, sep),
+    modelID: id.slice(sep + 1),
+    ...(typeof variant === "string" && variant !== DEFAULT_VARIANT ? { variant } : {}),
+  };
 }
 
 /** A narrow opencode session (`ctx.session.*` → `SessionInfo`). */
@@ -749,7 +769,9 @@ export function mapServerTools(
  *  - SessionModelInfo.id is a "<providerID>/<modelID>" ref;
  *  - maxContextWindow ← limit.context · maxOutputTokens ← limit.output
  *    · maxPromptTokens ← limit.input;
- *  - supportsVision ← capabilities.input contains "image".
+ *  - supportsVision ← capabilities.input contains "image";
+ *  - configSchema exposes model variants as reasoning choices, with Default
+ *    selecting the base model without a variant.
  *
  * With opencode agents + a workspace directory, every
  * AgentInfo also carries the same workspace directory container with the
@@ -781,6 +803,22 @@ export function mapCatalog(
       if (model.limit.context !== undefined) info.maxContextWindow = model.limit.context;
       if (model.limit.output !== undefined) info.maxOutputTokens = model.limit.output;
       if (model.limit.input !== undefined) info.maxPromptTokens = model.limit.input;
+      const variants = [...new Set(model.variants)].filter((id) => id !== DEFAULT_VARIANT);
+      if (variants.length > 0) {
+        info.configSchema = {
+          type: "object",
+          properties: {
+            [REASONING_EFFORT]: {
+              type: "string",
+              title: "Reasoning Effort",
+              description: "Select an OpenCode model variant, or use the model's default settings.",
+              default: DEFAULT_VARIANT,
+              enum: [DEFAULT_VARIANT, ...variants],
+              enumLabels: ["Default", ...variants.map((id) => id.charAt(0).toUpperCase() + id.slice(1))],
+            },
+          },
+        };
+      }
       models.push(info);
     }
     out.push({
