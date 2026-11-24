@@ -430,7 +430,9 @@ export class HostRpc extends HostEvents {
       }
       const chat = rec.chats.get(uri);
       if (chat !== undefined) {
-        return { resource: uri, state: chat.chatStore.state, fromSeq: this.seq.seq };
+        const state = chat.chatStore.state;
+        const title = rec.sessionStore.state.chats.find((entry) => entry.resource === uri)?.title ?? state.title;
+        return { resource: uri, state: { ...state, title }, fromSeq: this.seq.seq };
       }
       return null;
     }

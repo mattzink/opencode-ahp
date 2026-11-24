@@ -497,8 +497,8 @@ Registration honors the durable **AHP markers** in opencode session
 metadata ([§15.2](#152-session-metadata-markers)):
 
 - peer-chat marker `{ chat, owner }` → re-attach to the owner's chat
-  catalog at the original chat URI (no standalone session; chat title is
-  re-derived as `Chat <n>`);
+  catalog at the original chat URI (no standalone session; the chat uses
+  its backend's saved title);
 - channel marker `{ channel }` → standalone session resurfacing under the
   original client-chosen session channel;
 - no marker (or an unresolvable one) → standalone session whose channel
@@ -828,7 +828,7 @@ exactly as written:
 | --- | --- |
 | `session.created` | deferred external registration ([§7.2](#72-external-sessions)); a `parentID` in the event (a subagent child) skips it before the deferral. |
 | `session.deleted` | default chat → the record is removed (the same teardown `disposeSession` runs, then the backend removals; peers' backends disposed, terminals torn down, client tools failed); peer chat → `session/chatRemoved` for that chat only. |
-| `session.renamed` | default chat → `session/titleChanged`; peer chat → `session/chatUpdated` (chat summaries carry the title). |
+| `session.renamed` | Updates the affected chat through `session/chatUpdated`, and also the session title through `session/titleChanged` for the default chat. The session catalog supplies the title for list summaries and chat snapshots; turn-state updates do not overwrite it. |
 | `execution.started` | if the turn is not already claimed (client write-ahead), start an **orphan turn** seeded with the last-seen inbox message (external TUI prompts); when that message is a subagent completion report, the seed carries the report text verbatim under a `systemNotification` origin instead of as user input. |
 | `execution.succeeded` | `chat/turnComplete` (duration from the host clock) + `finishTurn`. |
 | `execution.failed` | `chat/error` with the error part + `finishTurn`. |
@@ -940,7 +940,7 @@ identifies a single chat once multi-chat is on).
 | `chat/toolCallResultConfirmed` | Contributor-only; approves or denies a held client result (deny settles the waiter with a `Tool.Error` the model sees). |
 | `chat/turnCancelled` | Must name the active turn; interrupts the opencode session, echoes with a host-normalized `duration` (required on the wire — see below), then runs the queued/steering handoff itself (the `execution.interrupted` event finds no active turn and is skipped). |
 | `chat/truncated` | State-only: the official reducer trims the stored turns (to and including `turnId`, or to none when omitted) and drops the active turn (status → idle). opencode's message history has no counterpart and is untouched, and an in-flight execution is not interrupted — its late events no-op against the post-truncation store (the documented use case: truncate, then `turnStarted` with the edited message). An invalid `turnId` shape (non-string / empty) is rejected; an unknown `turnId` follows the official reducer's no-op (accepted, state unchanged). |
-| `session/titleChanged` | Renames the opencode session, then echoes. |
+| `session/titleChanged` | On a session channel, renames its default OpenCode backend. On a chat channel (as used by VS Code's chat rename), renames that chat's backend. The host echoes on the originating channel and updates the session's chat catalog. |
 | `session/activeClientSet` | `activeClient.clientId` must be the dispatching client. Normalizes the tools, echoes, and re-syncs the location-global opencode tool union ([§10](#10-client-provided-tools)). |
 | `session/activeClientRemoved` | Same clientId check; echo + tool-union re-sync. |
 | `changeset/filesReviewChanged` | The only client-dispatchable changeset action: validates the channel resolves to a live changeset, echoes (the reducer toggles `reviewed` per file). |
@@ -1313,8 +1313,8 @@ After a reload, sessions resurface when a client calls
 catalog at their original URIs; client-chosen session channels
 resurface under their original names; unmarked sessions become
 standalone under their opencode ids. Session titles, messages, and
-model/agent state persist (they live in opencode); re-attached chat
-titles are re-derived (`Chat 2`, …) — a documented divergence.
+model/agent state persist in opencode. The default and re-attached chat
+titles are recovered from their respective OpenCode backends.
 
 ### 13.4 Location teardown
 

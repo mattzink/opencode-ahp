@@ -272,7 +272,7 @@ describe("multi-chat", () => {
     h.stop();
   });
 
-  it("session.renamed on a peer backend publishes session/chatUpdated (the chat store keeps its title)", async () => {
+  it("session.renamed on a peer survives later chat activity and is visible in snapshots", async () => {
     const h = makeHarness();
     h.init(1, "c1");
     await waitInit(h, 1);
@@ -287,12 +287,19 @@ describe("multi-chat", () => {
     expect(updated.action.chat).toBe(peer);
     expect(updated.action.changes.title).toBe("Peer title");
 
-    // The catalog (session state) carries the new title; the chat store
-    // keeps the original (same behavior as the default chat's titleChanged).
-    const sess = await sessionSnapshotState(h, 1, sessionChannelURI("rn-sess"), 482);
+    await subscribe(h, 1, peer, 482);
+    h.send(1, "dispatchAction", {
+      channel: peer,
+      clientSeq: 1,
+      action: { type: "chat/isReadChanged", isRead: false },
+    });
+    await waitForAction(h, peer, "chat/isReadChanged");
+
+    // A later turn-state update must not overwrite the catalog's title.
+    const sess = await sessionSnapshotState(h, 1, sessionChannelURI("rn-sess"), 483);
     expect(sess.chats?.find((c: any) => c.resource === peer)?.title).toBe("Peer title");
-    const chat = await chatSnapshotState(h, 1, peer, 483);
-    expect(chat.title).toBe("Chat 2");
+    const chat = await chatSnapshotState(h, 1, peer, 484);
+    expect(chat.title).toBe("Peer title");
     // No session-level title change.
     expect(h.actionsOn(sessionChannelURI("rn-sess")).some((a: any) => a.action.type === "session/titleChanged")).toBe(false);
     h.stop();

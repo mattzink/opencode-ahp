@@ -192,8 +192,8 @@ try {
   const chatSub = await request("subscribe", { channel: chatChannel });
   if (chatSub.error) fail(1, `subscribe chat: ${JSON.stringify(chatSub.error)}`);
   check(
-    "chat snapshot is the seeded 'Chat 1'",
-    chatSub.result?.snapshot?.state?.title === "Chat 1",
+    "default chat uses the session title",
+    typeof sessState?.title === "string" && chatSub.result?.snapshot?.state?.title === sessState.title,
     `fromSeq ${chatSub.result?.snapshot?.fromSeq}`,
   );
 

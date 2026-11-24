@@ -83,7 +83,7 @@ describe("createSession", () => {
     expect(sess.defaultChat).toBe(chatChannelURI("ses_fake_1"));
     expect(sess.workingDirectories).toEqual(["file:///tmp/opencode/ahp-scratch/project-lan/"]);
     expect(sess.chats).toHaveLength(1);
-    expect(sess.chats[0]!.title).toBe("Chat 1");
+    expect(sess.chats[0]!.title).toBe(sess.title);
     const { container, children } = agentDirectoryOf(sess);
     expect(container.name).toBe("project-lan");
     expect(container.writable).toBe(false);
@@ -93,6 +93,7 @@ describe("createSession", () => {
     // Chat snapshot: the same chat, idle + read.
     const chat = await chatSnapshotState(h, 1, chatChannelURI("ses_fake_1"), 102);
     expect(chat.resource).toBe(chatChannelURI("ses_fake_1"));
+    expect(chat.title).toBe(sess.title);
     expect(chat.status).toBe(SessionStatus.Idle | SessionStatus.IsRead);
     expect(chat.turns).toEqual([]);
 

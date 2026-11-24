@@ -169,7 +169,8 @@ export class HostBase {
     const next = chatSummaryOf(chat);
     const changes: Record<string, unknown> = {};
     let changed = false;
-    for (const key of ["title", "status", "activity", "modifiedAt"] as const) {
+    // Titles change through the session's chat catalog, independently of turn state.
+    for (const key of ["status", "activity", "modifiedAt"] as const) {
       if (entry[key] !== next[key]) {
         changes[key] = next[key];
         changed = true;
@@ -179,6 +180,21 @@ export class HostBase {
       this.publish({
         channel: rec.channel,
         action: { type: ActionType.SessionChatUpdated, chat: chat.resource, changes: changes as Partial<ChatSummary> },
+      });
+    }
+  }
+
+  /** AHP updates chat titles through the session catalog, not the chat reducer. */
+  protected updateBackendTitle(rec: SessionRecord, chatURI: string, title: string): void {
+    const session = rec.sessionStore.state;
+    if (chatURI === rec.defaultChatURI && session.title !== title) {
+      this.publish({ channel: rec.channel, action: { type: ActionType.SessionTitleChanged, title } });
+    }
+    const entry = session.chats.find((chat) => chat.resource === chatURI);
+    if (entry !== undefined && entry.title !== title) {
+      this.publish({
+        channel: rec.channel,
+        action: { type: ActionType.SessionChatUpdated, chat: chatURI, changes: { title } },
       });
     }
   }
@@ -253,9 +269,13 @@ export class HostBase {
   /** The denormalized `SessionSummary` view of a record. */
   protected sessionSummary(rec: SessionRecord): SessionSummary {
     const s = rec.sessionStore.state;
-    // Authoritative chat order: default first, then insertion order
-    // (the default chat is bound first).
-    const chats = [...rec.chats.values()].map((c) => chatSummaryOf(c.chatStore.state));
+    // Runtime order and activity can lead the catalog during publication;
+    // the catalog owns mutable titles.
+    const titles = new Map(s.chats.map((chat) => [chat.resource, chat.title]));
+    const chats = [...rec.chats.values()].map((chat) => {
+      const summary = chatSummaryOf(chat.chatStore.state);
+      return { ...summary, title: titles.get(chat.uri) ?? summary.title };
+    });
     let modifiedAt = rec.modifiedAt;
     for (const c of rec.chats.values()) {
       if (c.chatStore.state.modifiedAt > modifiedAt) modifiedAt = c.chatStore.state.modifiedAt;

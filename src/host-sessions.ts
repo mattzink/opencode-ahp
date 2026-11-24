@@ -312,7 +312,7 @@ export class HostSessions extends HostChats {
     // non-standard (legacy) session channels, which classify "unknown"
     // by prefix and resolve only through this set.
     this.channels.addSessionChannel(channel);
-    const defaultChat = this.newChatRuntime(rec.defaultChatURI, created.sessionID, "Chat 1", now);
+    const defaultChat = this.newChatRuntime(rec.defaultChatURI, created.sessionID, sessionStore.state.title, now);
     this.bindChat(rec, defaultChat);
 
     // A createSession `activeClient` seeds the
@@ -634,14 +634,14 @@ export class HostSessions extends HostChats {
    * after a restart. The owner store is LIVE (unlike a
    * fresh standalone registration), so the catalog change goes through
    * `publish` (store + any existing subscribers + the root diff), not a
-   * direct apply. The chat title is re-derived (`Chat <n>`) — a
-   * documented divergence from the pre-restart title. Returns undefined:
+   * direct apply. The chat title comes from the saved backend title.
+   * Returns undefined:
    * the backend gets no standalone AHP session (its session channel is
    * not registered — `sessions.get(peerID)` misses).
    */
   private reattachPeerChat(rec: SessionRecord, fs: FacadeSession, chatURI: string): undefined {
     const modifiedAt = new Date(fs.time.updated).toISOString();
-    const chat = this.newChatRuntime(chatURI, fs.sessionID, `Chat ${rec.chats.size + 1}`, modifiedAt);
+    const chat = this.newChatRuntime(chatURI, fs.sessionID, fs.title ?? `Chat ${rec.chats.size + 1}`, modifiedAt);
     this.bindChat(rec, chat);
     this.publish({
       channel: rec.channel,
@@ -776,7 +776,7 @@ export class HostSessions extends HostChats {
     // Mirrors `handleCreateSession`: the channel URI stays subscribable
     // (load-bearing for non-standard legacy channels).
     this.channels.addSessionChannel(recChannel);
-    const defaultChat = this.newChatRuntime(rec.defaultChatURI, fs.sessionID, "Chat 1", modifiedAt);
+    const defaultChat = this.newChatRuntime(rec.defaultChatURI, fs.sessionID, sessionStore.state.title, modifiedAt);
     this.bindChat(rec, defaultChat);
     sessionStore.apply({ type: ActionType.SessionReady });
     sessionStore.apply({ type: ActionType.SessionChatAdded, summary: chatSummaryOf(defaultChat.chatStore.state) });

@@ -148,7 +148,7 @@ export class HostDispatch extends HostSessions {
         this.dispatchTruncated(chat, stateAction, origin);
         return;
       case ActionType.SessionTitleChanged:
-        await this.dispatchTitleChanged(rec, stateAction, origin);
+        await this.dispatchTitleChanged(rec, channel, stateAction, origin);
         return;
       case ActionType.SessionActiveClientSet:
         this.dispatchActiveClientSet(rec, stateAction, origin, clientId);
@@ -621,20 +621,22 @@ export class HostDispatch extends HostSessions {
     this.echo(channel, action, origin);
   }
 
-  private async dispatchTitleChanged(rec: SessionRecord, action: StateAction, origin: ActionOrigin | undefined): Promise<void> {
+  private async dispatchTitleChanged(rec: SessionRecord, channel: string, action: StateAction, origin: ActionOrigin | undefined): Promise<void> {
     const a = action as { title?: unknown };
     const title = typeof a.title === "string" && a.title.length > 0 ? a.title : null;
     if (title === null) {
-      this.echo(rec.channel, action, origin, "invalid session/titleChanged params");
+      this.echo(channel, action, origin, "invalid session/titleChanged params");
       return;
     }
+    const chat = rec.chats.get(channel);
     try {
-      await this.opts.facade.rename({ sessionID: rec.sessionID, title });
+      await this.opts.facade.rename({ sessionID: chat?.sessionID ?? rec.sessionID, title });
     } catch (err) {
-      this.echo(rec.channel, action, origin, `rename failed: ${errorMessage(err)}`);
+      this.echo(channel, action, origin, `rename failed: ${errorMessage(err)}`);
       return;
     }
-    this.echo(rec.channel, action, origin);
+    this.echo(channel, action, origin);
+    this.updateBackendTitle(rec, chat?.uri ?? rec.defaultChatURI, title);
   }
 
   private dispatchActiveClientSet(

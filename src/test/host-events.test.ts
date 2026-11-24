@@ -5,7 +5,7 @@
  */
 import { describe, expect, it } from "vitest";
 import { directoryUri } from "../bridge.js";
-import { ROOT_CHANNEL, sessionChannelURI } from "../channels.js";
+import { ROOT_CHANNEL, chatChannelURI, sessionChannelURI } from "../channels.js";
 import {
   waitFor,
   makeHarness,
@@ -13,6 +13,7 @@ import {
   createSession,
   subscribe,
   sessionSnapshotState,
+  chatSnapshotState,
   DIR,
   OTHER,
   waitForAction,
@@ -42,15 +43,37 @@ describe("external sessions", () => {
     const added = h.notification("root/sessionAdded", 1)!;
     expect(added.params.summary.resource).toBe(sessionChannelURI("ses_tui_1"));
     expect(added.params.summary.title).toBe("TUI session");
+    expect(added.params.summary.chats[0].title).toBe("TUI session");
     expect(added.params.summary.workingDirectories).toEqual(["file:///tmp/opencode/ahp-scratch/project-lan/"]);
     const counts = h.actionsOn(ROOT_CHANNEL).filter((a) => a.action.type === "root/activeSessionsChanged");
     expect(counts[counts.length - 1]!.action.activeSessions).toBe(1);
 
     const sess = await sessionSnapshotState(h, 1, sessionChannelURI("ses_tui_1"), 161);
     expect(sess.title).toBe("TUI session");
+    expect(sess.chats[0]?.title).toBe("TUI session");
     expect(sess.workingDirectories).toEqual(["file:///tmp/opencode/ahp-scratch/project-lan/"]);
     h.stop();
   }, 10000);
+
+  it("updates the default chat's visible title when OpenCode names the session", async () => {
+    const h = makeHarness();
+    h.init(1, "c1");
+    await waitInit(h, 1);
+    const id = "ses_autotitle";
+    const session = sessionChannelURI(id);
+    const chat = chatChannelURI(id);
+    await createSession(h, 1, session, { provider: "gpuz" });
+    await subscribe(h, 1, session, 160);
+    h.facade.push({ type: "session.renamed", sessionID: id, title: "Fix workspace selection" });
+    await waitForAction(h, session, "session/chatUpdated", (a) => a.action.changes.title === "Fix workspace selection");
+    const state = await sessionSnapshotState(h, 1, session, 161);
+    expect(state.title).toBe("Fix workspace selection");
+    expect(state.chats[0]?.title).toBe("Fix workspace selection");
+    expect((await chatSnapshotState(h, 1, chat, 162)).title).toBe("Fix workspace selection");
+    expect(h.frames.some(({ message }) => message.method === "root/sessionSummaryChanged"
+      && message.params.changes.chats?.[0]?.title === "Fix workspace selection")).toBe(true);
+    h.stop();
+  });
 
   it("skips registration when the session is already gone by the grace deadline", async () => {
     const h = makeHarness();

@@ -84,17 +84,7 @@ export class HostEvents extends HostDispatch {
         }
         return;
       case "session.renamed":
-        if (chat.uri === rec.defaultChatURI) {
-          this.publish({ channel: rec.channel, action: { type: ActionType.SessionTitleChanged, title: ev.title } });
-        } else {
-          // No chat-title session action exists; the chat summary carries
-          // the title (the chat store's own title stays original — same
-          // pre-existing behavior as the default chat's titleChanged).
-          this.publish({
-            channel: rec.channel,
-            action: { type: ActionType.SessionChatUpdated, chat: chat.uri, changes: { title: ev.title } },
-          });
-        }
+        this.updateBackendTitle(rec, chatURI, ev.title);
         return;
       case "inbox.enqueued":
         chat.lastInbox = {

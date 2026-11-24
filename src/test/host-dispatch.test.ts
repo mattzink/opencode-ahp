@@ -18,6 +18,7 @@ import {
   chatSnapshotState,
   DIR,
   waitForAction,
+  createChat,
 } from "./host-fakes.js";
 
 // ── session-level actions ─────────────────────────────────────────────────
@@ -52,7 +53,32 @@ describe("session-level actions", () => {
     );
     const sess = await sessionSnapshotState(h, 1, sessionChannelURI(SES), 150);
     expect(sess.title).toBe("My renamed session");
+    expect(sess.chats[0]?.title).toBe("My renamed session");
     void changed;
+    h.stop();
+  });
+
+  it("renames the peer backend when VS Code dispatches titleChanged on a chat channel", async () => {
+    const h = makeHarness();
+    h.init(1, "c1");
+    await waitInit(h, 1);
+    const session = sessionChannelURI(SES);
+    const chat = "ahp-chat:/peer-rename";
+    await createSession(h, 1, session, { provider: "gpuz" });
+    await createChat(h, 1, { channel: session, chat }, 151);
+    await subscribe(h, 1, chat, 152);
+    h.send(1, "dispatchAction", {
+      channel: chat,
+      clientSeq: 1,
+      action: { type: "session/titleChanged", title: "Follow-up" },
+    });
+    const echo = await waitForAction(h, chat, "session/titleChanged");
+    expect(echo.rejectionReason).toBeUndefined();
+    expect(echo.origin).toEqual({ clientId: "c1", clientSeq: 1 });
+    expect(h.facade.renameCalls).toEqual([{ sessionID: h.facade.createdIds[1], title: "Follow-up" }]);
+    const state = await sessionSnapshotState(h, 1, session, 153);
+    expect(state.title).toBe("New Session");
+    expect(state.chats.find((entry) => entry.resource === chat)?.title).toBe("Follow-up");
     h.stop();
   });
 
