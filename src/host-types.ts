@@ -212,7 +212,7 @@ export interface HostOptions {
   serverInfo: Implementation;
   facade: OpencodeFacade;
   replayWindow: number;
-  /** The opencode instance's working directory (InitializeResult.defaultDirectory). */
+  /** The opencode instance's working directory as an absolute filesystem path. */
   defaultDirectory?: string;
   /** Advertise + serve the changeset channels (catalogues, snapshots, discard). */
   changesets: boolean;

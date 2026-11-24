@@ -34,7 +34,7 @@ export interface InitializeRequest {
   serverInfo: Implementation;
   /** Current global serverSeq (stamped onto the result). */
   serverSeq: number;
-  /** The opencode instance's working directory, when known. */
+  /** The file URI of the opencode instance's working directory, when known. */
   defaultDirectory?: string;
   /**
    * Resolve a snapshot for an `initialSubscriptions` entry; null when the

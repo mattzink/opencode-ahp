@@ -17,7 +17,7 @@ describe("initialize", () => {
     const result = await waitInit(h, 1);
     expect(result.protocolVersion).toBe("1.0.0");
     expect(result.serverInfo).toEqual({ name: "opencode-ahp-test", version: "0.1.0" });
-    expect(result.defaultDirectory).toBe("/tmp/opencode/ahp-scratch/project-lan");
+    expect(result.defaultDirectory).toBe("file:///tmp/opencode/ahp-scratch/project-lan/");
     const root = result.snapshots.find((s: Record<string, any>) => s.resource === ROOT_CHANNEL);
     expect(root).toBeDefined();
     const gpuz = root.state.agents.find((a: Record<string, any>) => a.provider === "gpuz");

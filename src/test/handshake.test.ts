@@ -110,13 +110,13 @@ describe("handleInitialize: version negotiation", () => {
 
 describe("handleInitialize: result shape", () => {
   it("stamps serverSeq and serverInfo, carries defaultDirectory", async () => {
-    const out = await handleInitialize(req(okParams(), { serverSeq: 7, defaultDirectory: "/home/x/proj" }));
+    const out = await handleInitialize(req(okParams(), { serverSeq: 7, defaultDirectory: "file:///home/x/proj/" }));
     expect(out).toMatchObject({
       ok: true,
       result: {
         serverSeq: 7,
         serverInfo,
-        defaultDirectory: "/home/x/proj",
+        defaultDirectory: "file:///home/x/proj/",
         snapshots: [],
       },
     });

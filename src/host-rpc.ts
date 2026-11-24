@@ -4,7 +4,7 @@
 
 import { HostEvents } from "./host-events.js";
 import { ActionType, ChangesetStatus, ReconnectResultType, ReconnectResult, Snapshot } from "@microsoft/agent-host-protocol";
-import { mapCatalog } from "./bridge.js";
+import { directoryUri, mapCatalog } from "./bridge.js";
 import { ROOT_CHANNEL, parseChangesetChannel } from "./channels.js";
 import { ERROR_INVALID_PARAMS, handleInitialize } from "./handshake.js";
 import { isRecord } from "./options.js";
@@ -241,7 +241,7 @@ export class HostRpc extends HostEvents {
       params: msg.params,
       serverInfo: this.opts.serverInfo,
       serverSeq: this.seq.seq,
-      defaultDirectory: this.opts.defaultDirectory,
+      defaultDirectory: this.opts.defaultDirectory !== undefined ? directoryUri(this.opts.defaultDirectory) : undefined,
       snapshotFor: (uri) => this.snapshotFor(uri),
     });
     if (!outcome.ok) {

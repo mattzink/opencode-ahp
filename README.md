@@ -19,6 +19,8 @@ In the Agents window, an `opencode` host with:
   filesystem, and a session started in a picked folder runs *there*: its
   agent, changesets, terminal, and file reads are scoped to that
   directory (sessions without one use the plugin's own location).
+  The host advertises its default directory as a `file://` URI so VS Code
+  can pass the selected workspace folder when creating a session.
 - **Model picker** — the real opencode catalog: every provider and model
   your server exposes.
 - **Agent picker** — opencode's user-invocable agents (Build, Plan, and

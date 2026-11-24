@@ -286,7 +286,9 @@ The connection contract (AHP 1.0.0 lifecycle):
   `serverSeq`, `serverInfo` (`name: "opencode-ahp"`, `version` read from
   `package.json` at runtime, `title: "OpenCode"`), snapshots for
   `initialSubscriptions` (unresolvable channels are simply omitted), and
-  `defaultDirectory` (the location directory).
+  `defaultDirectory` (the location directory as a `file://` URI). VS Code
+  uses its scheme to decide which workspace folders the host can address;
+  a raw filesystem path can cause the editor to drop the selected folder.
 - The host keeps a **per-`clientId` registry across sockets**, so a
   dropped client can `reconnect` on a new socket.
 - **Supersession**: a new `initialize` from a clientId whose old socket is
