@@ -26,7 +26,7 @@ In the Agents window, an `opencode` host with:
   are hidden.
 - **Chat** — streaming text and reasoning, the full tool-call lifecycle
   (a call appears, gets approved, and shows its result as it runs), and
-  usage totals.
+  context usage from the latest model call.
 - **Permissions** — when opencode asks for permission to run a tool, the
   Agents window shows an approval prompt: approve runs the tool, deny
   blocks it.

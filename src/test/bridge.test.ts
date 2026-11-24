@@ -1027,15 +1027,15 @@ describe("mapV2Event", () => {
   });
 
   describe("usage", () => {
-    it("maps usage.updated with the full token breakdown", () => {
+    it("maps step.ended with the model call's token breakdown", () => {
       expect(
         mapV2Event(
-          v2("session.usage.updated", {
+          v2("session.step.ended", {
             tokens: { input: 6463, output: 53, reasoning: 7, cache: { read: 6516, write: 2 } },
           }),
         ),
       ).toEqual({
-        type: "usage.updated",
+        type: "step.ended",
         sessionID: "ses_test",
         tokens: { input: 6463, output: 53, reasoning: 7, cache: { read: 6516, write: 2 } },
       });
@@ -1043,17 +1043,18 @@ describe("mapV2Event", () => {
 
     it("defaults missing token fields (and a missing cache object) to zero", () => {
       expect(
-        mapV2Event(v2("session.usage.updated", { tokens: { input: 10 } })),
+        mapV2Event(v2("session.step.ended", { tokens: { input: 10 } })),
       ).toEqual({
-        type: "usage.updated",
+        type: "step.ended",
         sessionID: "ses_test",
         tokens: { input: 10, output: 0, reasoning: 0, cache: { read: 0, write: 0 } },
       });
     });
 
-    it("drops usage.updated without a tokens object", () => {
-      expect(mapV2Event(v2("session.usage.updated"))).toBeNull();
-      expect(mapV2Event(v2("session.usage.updated", { tokens: "nonsense" }))).toBeNull();
+    it("ignores session totals and drops model calls without a tokens object", () => {
+      expect(mapV2Event(v2("session.usage.updated", { tokens: { input: 100_000 } }))).toBeNull();
+      expect(mapV2Event(v2("session.step.ended"))).toBeNull();
+      expect(mapV2Event(v2("session.step.ended", { tokens: "nonsense" }))).toBeNull();
     });
   });
 
@@ -1199,9 +1200,9 @@ describe("mapV2EventRaw", () => {
       type: "session.inbox.enqueued",
       reason: "missing: inboxID, text",
     });
-    expect(mapV2EventRaw(v2("session.usage.updated", { tokens: "nonsense" }))).toEqual({
+    expect(mapV2EventRaw(v2("session.step.ended", { tokens: "nonsense" }))).toEqual({
       status: "dropped",
-      type: "session.usage.updated",
+      type: "session.step.ended",
       reason: "missing: tokens",
     });
   });

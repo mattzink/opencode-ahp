@@ -340,9 +340,10 @@ export class HostEvents extends HostDispatch {
         this.clearToolTracking(chat, ev.id);
         return;
       }
-      case "usage.updated":
-        // Session-cumulative tokens; the chat reducer replaces the turn's
-        // usage, so the latest cumulative values are the turn's view.
+      case "step.ended":
+        // VS Code uses the current usage as context occupancy. A later
+        // model call replaces this one; session totals count the same
+        // prefix again for every call.
         if (chat.currentTurnId === null) return;
         this.publish({
           channel: chatURI,
@@ -350,8 +351,8 @@ export class HostEvents extends HostDispatch {
             type: ActionType.ChatUsage,
             turnId: chat.currentTurnId,
             usage: {
-              inputTokens: ev.tokens.input,
-              outputTokens: ev.tokens.output,
+              inputTokens: ev.tokens.input + ev.tokens.cache.read + ev.tokens.cache.write,
+              outputTokens: ev.tokens.output + ev.tokens.reasoning,
               cacheReadTokens: ev.tokens.cache.read,
               ...(chat.turnModelRef !== null ? { model: chat.turnModelRef } : {}),
             },

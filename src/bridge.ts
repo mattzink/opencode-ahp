@@ -214,7 +214,7 @@ export type FacadeEvent =
   | { type: "tool.progress"; sessionID: string; id: string }
   | { type: "tool.success"; sessionID: string; id: string; content: FacadeToolContent[]; executed?: boolean }
   | { type: "tool.failed"; sessionID: string; id: string; error: { type: string; message: string }; executed?: boolean }
-  | { type: "usage.updated"; sessionID: string; tokens: FacadeTokens }
+  | { type: "step.ended"; sessionID: string; tokens: FacadeTokens }
   | {
       type: "permission.asked";
       sessionID: string;
@@ -999,14 +999,14 @@ export function mapV2EventRaw(raw: unknown): V2EventOutcome {
         },
       };
     }
-    case "session.usage.updated": {
+    case "session.step.ended": {
       const tokens = isObj(data["tokens"]) ? data["tokens"] : undefined;
       if (tokens === undefined) return drop("tokens");
       const cache = isObj(tokens["cache"]) ? tokens["cache"] : undefined;
       return {
         status: "ok",
         event: {
-          type: "usage.updated",
+          type: "step.ended",
           sessionID,
           tokens: {
             input: num(tokens["input"]) ?? 0,

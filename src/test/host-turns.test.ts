@@ -78,8 +78,8 @@ describe("turn lifecycle", () => {
     expect(turn.state).toBe(TurnState.Complete);
     expect(turn.message.text).toBe(FIX_PROMPT);
     expect(turn.usage).toMatchObject({
-      inputTokens: 6482,
-      outputTokens: 83,
+      inputTokens: 6535,
+      outputTokens: 30,
       cacheReadTokens: 6516,
       model: "gpuz/qwen3.8-27b-q5xl",
     });

@@ -224,7 +224,7 @@ describe("turn changesets (before-capture)", () => {
     // here would already be visible to the capture. The usage event's
     // chat/usage action is emitted only after the capture completes.
     h.facade.push({
-      type: "usage.updated",
+      type: "step.ended",
       sessionID: SES,
       tokens: { input: 1, output: 1, reasoning: 0, cache: { read: 0, write: 0 } },
     });
@@ -339,7 +339,7 @@ describe("turn changesets (before-capture)", () => {
     // including the awaited before-capture of the preceding tool.input.ended.
     const usage = () =>
       h.facade.push({
-        type: "usage.updated",
+        type: "step.ended",
         sessionID: SES,
         tokens: { input: 1, output: 1, reasoning: 0, cache: { read: 0, write: 0 } },
       });
@@ -430,7 +430,7 @@ describe("turn changesets (before-capture)", () => {
       text: JSON.stringify({ path: "target.txt", content: AFTER }),
     });
     h.facade.push({
-      type: "usage.updated",
+      type: "step.ended",
       sessionID: WD_SES,
       tokens: { input: 1, output: 1, reasoning: 0, cache: { read: 0, write: 0 } },
     });
