@@ -2,15 +2,16 @@
  * Record types shared by the host section classes: the per-socket, per-client, per-session, per-chat and per-terminal state shapes, and the HostOptions the Host is constructed with.
  */
 
-import { Implementation } from "@microsoft/agent-host-protocol";
+import { Implementation, PathStyle } from "@microsoft/agent-host-protocol";
 import { OpencodeFacade } from "./bridge.js";
 import { ClientToolInvocation } from "./client-tools.js";
 import { ChatStateStore, ChangesetStateStore, SessionStateStore, TerminalStateStore } from "./state.js";
 import type { PathPolicy } from "./path-policy.js";
 
-// ActionType / ReconnectResultType are `declare const enum` in the package
-// but are also real runtime objects (verified against the published dist),
-// so the value imports are safe under both tsc (inlined) and Bun.
+// ActionType / ReconnectResultType / PathStyle are `declare const enum` in
+// the package but are also real runtime objects (verified against the
+// published dist), so the value imports are safe under both tsc (inlined)
+// and Bun.
 export interface RpcMessage {
   jsonrpc?: unknown;
   id?: unknown;
@@ -214,13 +215,20 @@ export interface HostOptions {
   replayWindow: number;
   /** The opencode instance's working directory as an absolute filesystem path. */
   defaultDirectory?: string;
+  /**
+   * The host environment's native path grammar, stamped onto
+   * `InitializeResult.environment.pathStyle` (AHP 1.1.0): clients format
+   * and parse native paths with it instead of inferring from their own
+   * environment. The plugin entry detects the platform once at setup.
+   */
+  pathStyle: PathStyle;
   /** Advertise + serve the changeset channels (catalogues, snapshots, discard). */
   changesets: boolean;
   /**
    * Serve the terminal channels — the synthetic shell-command renderings
    * (one read-only `ahp-terminal:` channel per foreground `shell`-tool
    * call) and the interactive pty shells behind `createTerminal`. Off the
-   * wire in 1.0.0 (no capability field) — the switch gates the
+   * wire (no capability field) — the switch gates the
    * host-side behavior (off: the synthetic channels never open and the
    * terminal commands answer -32601).
    */

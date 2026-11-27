@@ -89,16 +89,17 @@ export class HostChats extends HostClientTools {
   }
 
   /**
-   * `createChat` (AHP 1.0.0 chat command): create a new chat in an
-   * existing session. The 1:1 mapping: mint a fresh
-   * opencode session (same provider/model resolution as `createSession`)
-   * and bind it to the client-chosen chat URI. Result: `null` (the
-   * client waits for `session/chatAdded` on the session channel, and
-   * rolls back with `disposeChat` when the chat never surfaces — so
-   * everything below is published before the response). `source` and
-   * `workingDirectories` are rejected with INVALID_PARAMS: the
-   * capability is advertised without fork/sideChat/
-   * multipleWorkingDirectories, so conformant clients never send them.
+   * `createChat` (AHP chat command): create a new chat in an existing
+   * session. The 1:1 mapping: mint a fresh opencode session (same
+   * provider/model resolution as `createSession`) and bind it to the
+   * client-chosen chat URI. `title` (AHP 1.1.0) seeds the chat's display
+   * title when present. Result: `null` (the client waits for
+   * `session/chatAdded` on the session channel, and rolls back with
+   * `disposeChat` when the chat never surfaces — so everything below is
+   * published before the response). `source` and `workingDirectories`
+   * are rejected with INVALID_PARAMS: the capability is advertised
+   * without fork/sideChat/multipleWorkingDirectories, so conformant
+   * clients never send them.
    *
    * Error codes: -32602 (invalid params, including `source`/
    * `workingDirectories`), -32001 (no such session), -32003 (chat URI
@@ -152,6 +153,13 @@ export class HostChats extends HostClientTools {
     const providers = await this.opts.facade.listCatalog();
     const provider = providers.find((p) => p.activation !== "disabled");
     const model = provider !== undefined ? firstEnabledModelRef(provider.models) : undefined;
+    // `title` (AHP 1.1.0 `CreateChatParams.title`): the client-selected
+    // initial display title; falls back to the host-minted `Chat N` when
+    // absent or empty.
+    const title =
+      typeof params["title"] === "string" && (params["title"] as string).length > 0
+        ? params["title"]
+        : `Chat ${rec.chats.size + 1}`;
     const now = new Date().toISOString();
     let created;
     try {
@@ -171,7 +179,7 @@ export class HostChats extends HostClientTools {
       this.sendError(socketId, msg.id, ERROR_INTERNAL, `failed to create the chat's backend session: ${errorMessage(err)}`);
       return;
     }
-    const chat = this.newChatRuntime(chatURI, created.sessionID, `Chat ${rec.chats.size + 1}`, now);
+    const chat = this.newChatRuntime(chatURI, created.sessionID, title, now);
     this.bindChat(rec, chat);
     // Session-channel lifecycle (server-side, no origin): the catalog
     // mutation the client is waiting for, plus the changeset catalogue
@@ -232,7 +240,7 @@ export class HostChats extends HostClientTools {
   }
 
   /**
-   * `disposeChat` (AHP 1.0.0 chat command): remove a chat and its
+   * `disposeChat` (AHP chat command): remove a chat and its
    * opencode session from the session catalog. Result: `null`. The
    * default chat cannot be disposed — a session keeps its default chat
    * (there is no re-home mechanism; disposing it would leave the

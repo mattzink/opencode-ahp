@@ -7,7 +7,7 @@
  * (a `Host` class) so the whole protocol layer is unit-testable and
  * exercisable by the spike client without a WebSocket runtime.
  *
- * Connection model (AHP 1.0.0 lifecycle spec):
+ * Connection model (AHP lifecycle spec):
  *  - the first request on a socket is `initialize` (new client) or
  *    `reconnect` (known clientId — the host keeps a per-clientId registry
  *    across sockets);
@@ -34,7 +34,7 @@
  *
  * Root session lifecycle events (`root/sessionAdded`,
  * `root/sessionRemoved`, `root/sessionSummaryChanged`) are JSON-RPC
- * *notifications* in AHP 1.0.0 (ephemeral, not replayed) — only
+ * *notifications* in AHP (ephemeral, not replayed) — only
  * `root/activeSessionsChanged` is a sequencer action.
  *
  * Module layout: this file only composes the host — the section classes

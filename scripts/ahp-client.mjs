@@ -15,7 +15,7 @@
  * Usage:
  *   node scripts/ahp-client.mjs --token <token> \
  *     [--base http://127.0.0.1:8765] [--path /ahp] [--health-path /healthz] \
- *     [--versions 1.0.0] [--subscribe ahp-root://]... [--initial ahp-root://]... \
+ *     [--versions 1.1.0,1.0.0] [--subscribe ahp-root://]... [--initial ahp-root://]... \
  *     [--origin <origin>] [--expect-error -32005] [--probe] [--timeout-ms 5000]
  *
  * Exit codes: 0 success · 1 protocol failure · 2 connection failure
@@ -48,7 +48,7 @@ const opts = {
   path: arg("--path", "/ahp"),
   healthPath: arg("--health-path", "/healthz"),
   token: arg("--token", null),
-  versions: (arg("--versions", "1.0.0") ?? "").split(",").map((s) => s.trim()).filter(Boolean),
+  versions: (arg("--versions", "1.1.0,1.0.0") ?? "").split(",").map((s) => s.trim()).filter(Boolean),
   subscribe: all("--subscribe"),
   initial: all("--initial"),
   origin: arg("--origin", null),

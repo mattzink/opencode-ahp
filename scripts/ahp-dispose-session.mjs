@@ -1,13 +1,13 @@
 #!/usr/bin/env node
 /**
- * opencode-ahp live verification: `disposeSession` (AHP 1.0.0
+ * opencode-ahp live verification: `disposeSession` (AHP
  * session-channel command — design.md §6/§7).
  *
  * The probe disposes AHP sessions through the real server and checks the
  * full teardown, differential (the server may carry sessions from
  * earlier probes):
  *
- *   1. `initialize` (root subscription) against v1.0.0.
+ *   1. `initialize` (root subscription) against v1.1.0.
  *   2. Baselines: `listSessions` (AHP channels) and `GET /api/session`
  *      (opencode session ids — the cross-check ground truth for the
  *      backend removals).
@@ -239,11 +239,11 @@ try {
   const init = await request("initialize", {
     channel: "ahp-root://",
     clientId,
-    protocolVersions: ["1.0.0"],
+    protocolVersions: ["1.1.0", "1.0.0"],
     initialSubscriptions: ["ahp-root://"],
   });
   if (init.error) fail(1, `initialize: ${JSON.stringify(init.error)}`);
-  check("initialize", init.result?.protocolVersion === "1.0.0", `v${init.result?.protocolVersion}`);
+  check("initialize", init.result?.protocolVersion === "1.1.0", `v${init.result?.protocolVersion}`);
 
   const deadline = Date.now() + opts.timeoutMs;
 

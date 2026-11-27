@@ -12,7 +12,7 @@ static, live verification, two-machine, and conformance), see
 
 `opencode-ahp` is an **OpenCode v2 plugin** that hosts the
 [Agent Host Protocol](https://github.com/microsoft/agent-host-protocol)
-(**AHP 1.0.0**, strict-pinned to `@microsoft/agent-host-protocol@1.0.0`)
+(**AHP 1.1.0**, strict-pinned to `@microsoft/agent-host-protocol@1.1.0`)
 *in-process*, so that opencode appears as a **native agent** in the
 **VS Code Agents window**.
 
@@ -137,7 +137,7 @@ flowchart TB
 | `src/handshake.ts` | The `initialize` command: validation and semver capability negotiation via the official package's `negotiateProtocolVersion`. |
 | `src/host.ts` | The `Host` class — the JSON-RPC 2.0 router that ties transport, handshake, channels, sequencer, state stores, and the facade together: command handling, client-action dispatch, session/chat records, the opencode event pump, changesets, synthetic terminals, and client-tool routing. |
 | `src/channels.ts` | Channel URI parsing/formatting (`ahp-root://`, `ahp-session:/`, `ahp-chat:/`, `ahp-terminal:/`, `…/changeset/…`, plus the non-standard legacy session form `<scheme>:/<suffix>` — `isSessionChannel`) and the `ChannelRegistry` (per-socket subscriptions, live session ids, live session-channel URIs, live terminal URIs). |
-| `src/seq.ts` | The `Sequencer`: a single **host-wide** monotonic `serverSeq` (AHP 1.0.0 numbers all channels on one sequence) with a bounded replay window. |
+| `src/seq.ts` | The `Sequencer`: a single **host-wide** monotonic `serverSeq` (AHP numbers all channels on one sequence) with a bounded replay window. |
 | `src/state.ts` | Channel state stores. Every store simply applies the **official reducers** from `@microsoft/agent-host-protocol` (`rootReducer`, `sessionReducer`, `chatReducer`, `changesetReducer`, `terminalReducer`) — the host never hand-rolls a state transition. |
 | `src/bridge.ts` | The opencode-aware mapping layer: the `OpencodeFacade` contract, `mapV2Event` (raw v2 event → narrow `FacadeEvent` union), catalog/summary/changeset builders, the session customization catalog mappers ([§7.5](#75-session-customization-catalog): the skill-directory container, MCP server state, and `serverTools`), and the content-ref URI helpers (`file://`, `ahp-content://head/…`, `ahp-content://snap/…`). |
 | `src/client-tools.ts` | Pure helpers for client-provided tools: wire validation of `ToolDefinition`s, the cross-session tool union, and per-session provider lookup. |
@@ -270,7 +270,7 @@ the full detail goes to the server log.
 
 ## 4. Connection model & handshake
 
-The connection contract (AHP 1.0.0 lifecycle):
+The connection contract (AHP lifecycle):
 
 - The **first request** on a socket is `initialize` (new client) or
   `reconnect` (known client). `ping` is answered even before
@@ -278,17 +278,40 @@ The connection contract (AHP 1.0.0 lifecycle):
   (notifications are logged and dropped).
 - `initialize` targets `ahp-root://`, carries `clientId` and
   `protocolVersions` (a non-empty semver array). The server picks the
-  highest offered version inside its supported baselines (the pinned
-  1.0.0 package supports the 1.0.0 and 0.9.0 baselines, so any 1.x or
-  0.9.x offer negotiates the 1.0 wire protocol). Anything else is
-  rejected with `-32005` and `data.supportedVersions`.
+  highest offered version inside its supported baselines and echoes that
+  exact string back (the pinned 1.1.0 package supports the 1.0.0 and
+  0.9.0 baselines, so any 1.x or 0.9.x offer is accepted). 1.x is
+  additive-optional over the 1.0 wire, so an offer newer than the 1.1.0
+  the host implements still negotiates — and its new surface is answered
+  permissively (unknown params ignored, unsupported actions echoed).
+  Anything outside the baselines is rejected with `-32005` and
+  `data.supportedVersions`.
 - The `initialize` result carries `protocolVersion`, the current global
   `serverSeq`, `serverInfo` (`name: "opencode-ahp"`, `version` read from
-  `package.json` at runtime, `title: "OpenCode"`), snapshots for
+  `package.json` at runtime, `title: "OpenCode"`), `environment`
+  (`pathStyle` — the host's native path grammar, platform-detected at
+  setup; clients format and parse native paths with it instead of
+  inferring from their own environment), snapshots for
   `initialSubscriptions` (unresolvable channels are simply omitted), and
   `defaultDirectory` (the location directory as a `file://` URI). VS Code
   uses its scheme to decide which workspace folders the host can address;
   a raw filesystem path can cause the editor to drop the selected folder.
+- The host's `subscribe` and `reconnect` handlers read only the fields
+  they use and ignore the rest — VS Code 1.148.0 adds optional
+  `flowControl.receive` to non-root `subscribe` and `windows` to
+  `reconnect`, and the host never returns a `flowControl` result, so
+  such clients fall back to ordinary delivery.
+- A 1.148.0 client with the non-default
+  `chat.agentHost.multipleChatProviders.enabled` setting offers its
+  vendored dev protocol version first (`1.2.0` in 1.148.0 — echoed, 1.x
+  being caret-compatible with the 1.0.0 baseline) and signals the
+  setting in `initialize`'s `_meta['vscode.multipleChatProviders']`.
+  The host ignores unknown `_meta` keys and never advertises the
+  `multipleChatProviders` capability; the client's re-initialize gate
+  engages only when the host's own root config mirrors
+  `multipleChatProviders.enabled: true` without the capability (the
+  client never dispatches that key itself, and the host's root state
+  never does), so nothing re-initializes and the connection stays up.
 - The host keeps a **per-`clientId` registry across sockets**, so a
   dropped client can `reconnect` on a new socket.
 - **Supersession**: a new `initialize` from a clientId whose old socket is
@@ -316,7 +339,7 @@ sequenceDiagram
     H->>S: resolve a root snapshot for ahp-root://
     S->>O: read provider/model catalog + agents (lazily, from the registry)
     S-->>H: root state (agents, terminal catalog)
-    H-->>C: InitializeResult (version 1.0.0, serverSeq, serverInfo, snapshots, defaultDirectory)
+    H-->>C: InitializeResult (protocolVersion, serverSeq, serverInfo, environment, snapshots, defaultDirectory)
     C->>H: subscribe ahp-session:/… (or wait for root/sessionAdded)
     H-->>C: snapshot (session + default chat state)
 ```
@@ -419,8 +442,8 @@ Requests (methods with an `id`) routed by the host:
 | `listSessions` | All opencode sessions, most-recently-modified first, in-memory cursor pagination (`limit` default 100, `cursor` = offset). Unknown sessions are **lazily registered** (idempotent per opencode id) so their channels become subscribable. |
 | `resolveSessionConfig` | An honest empty schema (`{ type: "object", properties: {} }`, `values: {}`) — opencode collects no session-creation configuration; agent/model choice rides session customizations and the per-turn message. `provider`/`workingDirectory`/`config` params are accepted and ignored. VS Code calls this strictly before the first send of a new session, so an unimplemented host makes every fresh session unstartable. |
 | `createSession` | `null`. Creates a real opencode session (provider/model resolved from the catalog; `activeClient` eagerly claims an active-client role and must match the creating client). The client-chosen `channel` is accepted in the standard `ahp-session:/<suffix>` form or the non-standard `<scheme>:/<suffix>` form — client legacy addressing: VS Code mints `<provider>:/<uuid>` when its `initialize` result is not yet available at draft-creation time (its `isNativeAgentHost`/`vscode.ahpSessionUris` capability checks never fire without one, and we send no `_meta` to influence them), and the AHP reference client creates sessions the same way — and is echoed back verbatim; the channel stays subscribable through the registry's live session-channel set. A channel that is a live pty terminal channel is refused (the two resource sets must stay disjoint). The first `workingDirectories` entry (an absolute `file://` URI; a trailing slash is stripped) targets that directory's location — the session's working directory, see [§7.3](#73-workspace-workingdirectories); absent, the session runs in the plugin's own location. Extras are ignored (no `multipleWorkingDirectories` capability). Publishes the session-channel lifecycle (`session/ready`, `session/chatAdded`, `session/defaultChatChanged`, changeset catalogues), the root count action, and the `root/sessionAdded` notification. Errors: `-32602` (a channel that is not a session URI — rejected channels are logged with the offending value — or a live terminal channel; malformed `workingDirectories` or `activeClient`), `-32009` (`workingDirectories` target outside the [`allowedWorkingDirectories` allowlist](#33-directory-allowlist-allowedworkingdirectories), before any backend work), `-32002` (no enabled provider for the requested provider), `-32003` (channel exists), `-32603` (backend session creation failed, e.g. the target location cannot be booted). |
-| `disposeSession` | `null`. Disposes an AHP session **and every opencode backend behind it** — the default backend and each peer chat's backend (the spec's cascade "to every chat in the session's catalog"). The channel is accepted in the same standard/legacy forms `createSession` echoes back. The AHP-side unbind runs **first** (the same race guard as `disposeChat`): the racing `session.deleted` events from each backend removal must find the bindings already dropped. `root/sessionRemoved` (with the `root/activeSessionsChanged` count update) is published **before** the response, and the default backend removal is awaited, so a `listSessions` after it does not resurface anything. Errors: `-32602` (a channel that is not a session URI), `-32001` (an unknown channel — already disposed, or deleted in the TUI first). A failed default-backend removal still drops the AHP session (R2 — the lingering opencode session shows up in the TUI, and lazily in `listSessions`, until deleted there). VS Code 1.145.2 drives this: the Agents window's **Delete…** session action (chat-fragment resources route to `disposeChat` instead) and the untitled-draft disposal (a disposed chat model, a replaced provisional generation, or workbench shutdown — the draft's own chosen channel URI, which this host echoes back verbatim); the client sends a bare `{ channel }`, ignores the `null` result, updates the session list from `root/sessionRemoved`, and surfaces a failed delete as an error dialog that leaves the chat widget on the still-existing session. |
-| `createChat` | `null`. Mints a fresh opencode session (same provider/model resolution) and binds it to the client-chosen chat URI (the owner must be a session channel under the `createSession` rule — standard or legacy form); publishes `session/chatAdded` (+ changeset catalogue) **before** responding — the client waits for that action and rolls back with `disposeChat`. An `initialMessage` starts the chat's first turn; any failure in that path rolls the whole chat back. `source` and `workingDirectories` are rejected (`-32602`) — fork/side-chat and multiple-working-directories capabilities are deliberately not advertised. |
+| `disposeSession` | `null`. Disposes an AHP session **and every opencode backend behind it** — the default backend and each peer chat's backend (the spec's cascade "to every chat in the session's catalog"). The channel is accepted in the same standard/legacy forms `createSession` echoes back. The AHP-side unbind runs **first** (the same race guard as `disposeChat`): the racing `session.deleted` events from each backend removal must find the bindings already dropped. `root/sessionRemoved` (with the `root/activeSessionsChanged` count update) is published **before** the response, and the default backend removal is awaited, so a `listSessions` after it does not resurface anything. Errors: `-32602` (a channel that is not a session URI), `-32001` (an unknown channel — already disposed, or deleted in the TUI first). A failed default-backend removal still drops the AHP session (R2 — the lingering opencode session shows up in the TUI, and lazily in `listSessions`, until deleted there). VS Code 1.148.0 drives this: the Agents window's **Delete…** session action (chat-fragment resources route to `disposeChat` instead) and the untitled-draft disposal (a disposed chat model, a replaced provisional generation, or workbench shutdown — the draft's own chosen channel URI, which this host echoes back verbatim); the client sends a bare `{ channel }`, ignores the `null` result, updates the session list from `root/sessionRemoved`, and surfaces a failed delete as an error dialog that leaves the chat widget on the still-existing session. |
+| `createChat` | `null`. Mints a fresh opencode session (same provider/model resolution) and binds it to the client-chosen chat URI (the owner must be a session channel under the `createSession` rule — standard or legacy form); publishes `session/chatAdded` (+ changeset catalogue) **before** responding — the client waits for that action and rolls back with `disposeChat`. `title` (AHP 1.1.0) seeds the chat's display title when present and non-empty; absent or empty falls back to the host-minted `Chat N`. An `initialMessage` starts the chat's first turn; any failure in that path rolls the whole chat back. `source` and `workingDirectories` are rejected (`-32602`) — fork/side-chat and multiple-working-directories capabilities are deliberately not advertised. |
 | `disposeChat` | `null`. Removes a peer chat (never the default chat) and its opencode backend session; publishes `session/chatRemoved`. AHP-side unbind happens *before* the backend removal so the racing `session.deleted` event doesn't double-publish. |
 | `resourceRead` | File content for the URIs this host advertises in changesets: `file://` (live disk, confined to the location directory or one of the live sessions' own working directories), `ahp-content://head/…` (content at git HEAD), `ahp-content://snap/…` (a turn's captured before/after). `encoding` is `base64` (default) or `utf-8`. Errors: `-32008` not found, `-32009` outside every session's working directory. |
 | `resourceResolve` | Metadata for one filesystem `file://` URI: canonical URI (directories end in `/`), `type` (`file` / `directory` / `symlink`), `size`, ISO `mtime`/`ctime`, and a weak etag `W/"<size>-<mtimeMs>"`. `followSymlinks` defaults to true (realpath + stat); `false` lstats the path itself (a link reports as `symlink`). This is the existence check VS Code's remote folder picker runs before accepting a path. Errors: `-32008` not found, `-32009` permission denied, `-32602` not a file URI, `-32603` other. |
@@ -429,7 +452,7 @@ Requests (methods with an `id`) routed by the host:
 | `invokeChangesetOperation` | The only operation the host offers is `discard-changes` (resource-scoped), on a live changeset; it targets the changeset's owning session's directory. See [§11.4](#114-discard-changes). |
 | `createTerminal` | `null`. Spawns an interactive pty shell (`spawnPty` seam — Bun in production) in the resolved working directory and registers the client-chosen channel. Params: `channel` (client-chosen; the host namespace — including the reserved `ahp-terminal:` prefix — and live session channels are refused, keeping the session and terminal resource sets disjoint), `claim` (a client claim for the dispatching client, or a session claim), `name?`, `cwd?`, `cols?`/`rows?` (defaults 80×24). The `cwd` accepts plain `file://` (what VS Code sends), the client's `vscode-agent-host:`/`agent-host:` wrapper, or a bare absolute path; anything malformed, and anything outside the confinement boundary (the claimed session's working directory, else — for a client-claimed terminal — the location directory or a live session's own directory containing the cwd; [§12.2](#122-pty-terminals-interactive-shells)), clamps to it. Errors: `-32601` (capability off, or the runtime cannot spawn ptys), `-32600` (host-namespace or live session-channel URI), `-32010` (AHP AlreadyExists — duplicate channel), `-32602` (malformed params), `-32603` (the spawn threw — logged, R2: the host survives). |
 | `disposeTerminal` | `null`. Kills the pty (a still-running process gets a final `terminal/exited`), drops the record, and refreshes the catalog. Idempotent: an unknown channel answers `null` (VS Code's shutdown path disposes terminals that may already be gone). Synthetic (session-owned) terminals are host-managed: `-32009` (AHP PermissionDenied). Capability off: `-32601`; missing channel: `-32602`. |
-| `setClientManagedSettingsPermissions` | Accepted and logged as a no-op — a VS Code-specific post-init notification with no AHP 1.0.0 counterpart; the connection must stay up. |
+| `setClientManagedSettingsPermissions` | Accepted and logged as a no-op — a VS Code-specific post-init notification with no AHP counterpart; the connection must stay up. |
 | anything else | `-32601` for requests; unknown notifications are logged and dropped. |
 
 The filesystem `resource*` commands (`resourceRead`, `resourceResolve`,
@@ -539,7 +562,7 @@ registered sessions, and the location directory for sessions without
 either (records keep it as `SessionRecord.directory`; `undefined` = the
 location).
 
-`createSession` accepts the AHP `workingDirectories` param (AHP 1.0.0:
+`createSession` accepts the AHP `workingDirectories` param (AHP:
 a client MUST NOT supply more than one entry unless the agent
 advertises `multipleWorkingDirectories`, which this host does not): the
 first entry must be a non-empty absolute `file://` URI — a trailing
@@ -570,7 +593,7 @@ against the test server: opencode boots the target location
 on the first `createSession`, the plugin's event pump sees its session
 events, and `session.list`/`get` are app-level.
 
-**Why the field is required for a usable session list (VS Code 1.145):**
+**Why the field is required for a usable session list (VS Code 1.148):**
 the Sessions view groups sessions into workspace sections; a
 session's workspace label comes from its AHP metadata —
 `buildAgentHostSessionWorkspace` (vscode
@@ -877,7 +900,12 @@ from the queue (the queued prompt was already sent to opencode with
 `delivery: "queue"` — opencode starts it itself; this only updates AHP
 state), drops the ended turn's terminal rows from the root catalog, and
 refreshes the chat's subscribed changesets (the "after" content is read
-from disk here).
+from disk here). The official reducer tracks both pending kinds in the
+unified `queuedMessages` list (a steering entry is mirrored in the
+deprecated `steeringMessage` slot), so the queue read happens after the
+removal is applied — a snapshot taken mid-steering carries the steering
+entry in both slots, and a 1.0.0-negotiating client that reads only the
+mirror is unaffected.
 
 If the pump itself fails (a bridge error), the error is logged and the
 pump stops — the host keeps serving; streaming for new turns is gone
@@ -936,7 +964,7 @@ socket** even when it isn't subscribed to the channel — a write-ahead
 client that didn't subscribe yet must still get its rollback.
 
 Shared pre-checks: the channel must be known; the action must be
-client-dispatchable per the AHP 1.0.0 catalog; the socket must be
+client-dispatchable per the AHP catalog; the socket must be
 initialized. Chat-channel actions run against the owning chat runtime; a
 chat action on a session channel is rejected (a session no longer
 identifies a single chat once multi-chat is on).
@@ -960,9 +988,9 @@ identifies a single chat once multi-chat is on).
 | `session/customizationToggled` | Honored for the host's `opencode:mcp/<name>` ids — the effective decision is `enablement[0].enabled ?? true`, and the toggle maps to opencode's `disabled` flag plus the awaited MCP re-reconcile ([§7.5](#75-session-customization-catalog)): accepted echo, then the catalog is re-snapshotted and re-pushed to every live session. A facade failure rejects with "mcp toggle failed: …". Every other customization is rejected: "cannot toggle: only MCP servers are togglable on this host — agents and skills are static file/config definitions". |
 | `session/mcpServerStartRequested`, `session/mcpServerStopRequested` | The same path as the toggle (start = enable, stop = disable) for MCP ids; non-MCP ids rejected ("cannot start or stop: only MCP servers accept start/stop on this host"). `session/mcpServerBackgroundRequested` is not in the dispatch table and falls to the default "unsupported action" rejection (no blocking-start concept on the plugin side). |
 | `terminal/input`, `terminal/resized`, `terminal/claimed`, `terminal/titleChanged`, `terminal/cleared` | On a **pty** terminal: input/resize drive the process, claim/title/clear apply through the official reducer (rejections for the invalid shapes and the non-holder claim — [§12.2](#122-pty-terminals-interactive-shells)). On a **synthetic** terminal: every one is rejected ("read-only terminal …"). |
-| any other client-dispatchable action | Echoed with a `rejectionReason` ("unsupported action …"). |
+| any other client-dispatchable action | Echoed with a `rejectionReason` ("unsupported action …"). This includes `chat/configChanged` (new in AHP 1.1.0): per-chat configuration is not supported — see [futures.md](futures.md). |
 
-**Reducer traps (AHP 1.0.0 `chatReducer`).** Two echo fields are
+**Reducer traps (the official `chatReducer`).** Two echo fields are
 *required on the wire*: `chat/turnStarted.startedAt` and
 `chat/turnCancelled.duration`. The official reducer derives `modifiedAt`
 from them and throws `RangeError: Invalid time value` on a missing or
@@ -973,7 +1001,7 @@ normalization.
 
 Clients register tools per session via `createSession.activeClient` or
 `session/activeClientSet` (an `activeClient` is `{ clientId, tools,
-displayName? }`). AHP 1.0.0's `SessionActiveClient` also carries a
+displayName? }`). AHP's `SessionActiveClient` also carries a
 `customizations` field (client-published plugins — the protocol's door
 for client-side MCP servers / skills to reach a session), but the host
 **drops it** in normalization: only `tools` cross the wire, so a
@@ -1171,7 +1199,7 @@ ptys.
   roll back cleanly. `disposeTerminal` on a synthetic channel gets
   `-32009` (AHP PermissionDenied — the client is not permitted to dispose
   host-managed terminals).
-- **Client visibility: the reference client (VS Code 1.145) renders none
+- **Client visibility: the reference client (VS Code 1.148) renders none
   of these.** The Agents window discovers an output terminal only via the
   tool result's terminal content block — which this host never emits; it
   publishes standalone `ahp-terminal:` channels instead — and the remote
@@ -1398,7 +1426,7 @@ The JSON-RPC error code table used by the host:
 | `-32005` | Unsupported protocol version (with `data.supportedVersions`). |
 | `-32008` | Not found (channel/terminal/content ref; a synthetic terminal whose record is gone). |
 | `-32009` | Permission denied (path outside the location directory, a `file://` read failure, or `disposeTerminal` on a host-managed synthetic terminal). |
-| `-32010` | Already exists (`createTerminal` for a channel that is already open). AHP 1.0.0 defines no "not supported" code — the standard `-32600…-32603` range covers those shapes. |
+| `-32010` | Already exists (`createTerminal` for a channel that is already open). AHP defines no "not supported" code — the standard `-32600…-32603` range covers those shapes. |
 
 ## 15. Persistence & durability
 
@@ -1503,7 +1531,7 @@ documented in [`options.example.jsonc`](../options.example.jsonc).
 
 - AHP docs (guide, spec, implementations, "AHP and ACP"):
   [microsoft.github.io/agent-host-protocol](https://microsoft.github.io/agent-host-protocol/)
-- Spec 1.0.0:
+- Spec 1.1.0 (the site's default; 1.0.0 lives under `/v1.0.0`):
   [specification overview](https://microsoft.github.io/agent-host-protocol/specification/overview)
 - Official repo (types, official clients, conformance fixtures incl.
   `types/test-cases`):
@@ -1525,3 +1553,6 @@ documented in [`options.example.jsonc`](../options.example.jsonc).
   [code.visualstudio.com/updates/v1_144](https://code.visualstudio.com/updates/v1_144)
 - 1.145 release notes:
   [code.visualstudio.com/updates/v1_145](https://code.visualstudio.com/updates/v1_145)
+- 1.148 release notes (AHP 1.1.0 in the client; sandbox profiles,
+  worktree cleanup, Agent chat performance):
+  [code.visualstudio.com/updates/v1_148](https://code.visualstudio.com/updates/v1_148)

@@ -203,7 +203,7 @@ export class HostRpc extends HostEvents {
         break;
       case "setClientManagedSettingsPermissions":
         // VS Code-specific post-init notification: the
-        // permissions VS Code manages in its own settings UI. AHP 1.0.0
+        // permissions VS Code manages in its own settings UI. AHP
         // has no counterpart — accept deliberately (parse + log), never
         // error; the connection stays up.
         this.log(
@@ -242,6 +242,7 @@ export class HostRpc extends HostEvents {
       serverInfo: this.opts.serverInfo,
       serverSeq: this.seq.seq,
       defaultDirectory: this.opts.defaultDirectory !== undefined ? directoryUri(this.opts.defaultDirectory) : undefined,
+      pathStyle: this.opts.pathStyle,
       snapshotFor: (uri) => this.snapshotFor(uri),
     });
     if (!outcome.ok) {

@@ -9,6 +9,7 @@ import { readFileSync } from "node:fs";
 import { fileURLToPath } from "node:url";
 import {
   CustomizationType,
+  PathStyle,
   type AgentCustomization,
   type ChatState,
   type DirectoryCustomization,
@@ -524,6 +525,7 @@ export function makeHarness(opts?: {
     facade,
     replayWindow: 100,
     defaultDirectory: "/tmp/opencode/ahp-scratch/project-lan",
+    pathStyle: PathStyle.Posix,
     changesets: opts?.changesets ?? true,
     terminals: opts?.terminals ?? true,
     ...(opts?.pathPolicy !== undefined ? { pathPolicy: opts.pathPolicy } : {}),
@@ -562,7 +564,7 @@ export function makeHarness(opts?: {
           params: {
             channel: ROOT_CHANNEL,
             clientId,
-            protocolVersions: ["1.0.0"],
+            protocolVersions: ["1.1.0", "1.0.0"],
             initialSubscriptions: subs,
           },
         }),

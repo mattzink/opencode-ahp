@@ -2,7 +2,7 @@
 /**
  * opencode-ahp live verification: full session + turn lifecycle.
  *
- * Drives the full AHP 1.0.0 surface that the VS Code Agents window needs:
+ * Drives the full AHP surface that the VS Code Agents window needs:
  *   1. initialize (root subscription)
  *   2. createSession (session-channel command; provider selection)
  *   3. subscribe the session channel → assert the agent picker is present
@@ -148,11 +148,11 @@ try {
   const init = await request("initialize", {
     channel: "ahp-root://",
     clientId,
-    protocolVersions: ["1.0.0"],
+    protocolVersions: ["1.1.0", "1.0.0"],
     initialSubscriptions: ["ahp-root://"],
   });
   if (init.error) fail(1, `initialize: ${JSON.stringify(init.error)}`);
-  check("initialize", init.result?.protocolVersion === "1.0.0", `v${init.result?.protocolVersion}`);
+  check("initialize", init.result?.protocolVersion === "1.1.0", `v${init.result?.protocolVersion}`);
 
   // 2. createSession
   const create = await request("createSession", {

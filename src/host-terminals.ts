@@ -141,7 +141,7 @@ export class HostTerminals extends HostResources {
   // ── pty terminals (createTerminal / disposeTerminal) ─────────────────
 
   /**
-   * `createTerminal` (AHP 1.0.0): spawn an interactive pty shell in the
+   * `createTerminal` (AHP): spawn an interactive pty shell in the
    * resolved working directory and register the client-chosen channel.
    * The result is `null` per the AHP message contract — the client then
    * subscribes to the channel for the state snapshot. Errors: -32601 when
@@ -265,7 +265,7 @@ export class HostTerminals extends HostResources {
   }
 
   /**
-   * `disposeTerminal` (AHP 1.0.0): kill the pty and drop its record.
+   * `disposeTerminal` (AHP): kill the pty and drop its record.
    * Idempotent success (`null`) for unknown channels — the VS Code
    * client's shutdown path disposes terminals that may already be gone
    * (its reference manager no-ops unknown URIs). Synthetic

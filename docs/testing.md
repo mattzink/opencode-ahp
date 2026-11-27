@@ -28,7 +28,7 @@ options.
 ## 1. Unit tests (Vitest)
 
 `pnpm test` runs `vitest run` over `src/test/**/*.test.ts`
-(`vitest.config.ts`). Eighteen suites, 386 tests, a few
+(`vitest.config.ts`). Eighteen suites, 405 tests, a few
 seconds wall time:
 
 ```sh
@@ -54,7 +54,7 @@ so assertions observe exactly what the unit under test used.
 | `client-tools.test.ts` | client-provided tool definition normalization, the cross-session union, provider lookup, schema/description extraction. |
 | `path-policy.test.ts` | the directory allowlist (the `allowedWorkingDirectories` option, design.md §3.3): `PathPolicy` prefix/inside decisions over the symlink-resolved form (prefix match, inside, sibling/prefix-overlap denial, the root prefix), symlink escape vs staying inside, the undecidable-resolution deferral (the underlying operation runs), and `normalizeDirPrefix` (dot segments, trailing slash, leading `//` collapse, the relative-path configuration error). |
 | `host-base.test.ts` | the host's base surface: `initialize` through the router (version negotiation, `defaultDirectory`, the root catalog snapshot in the result, ping-before-initialize). |
-| `host-sessions.test.ts` | `createSession` (including `workingDirectories` — first-entry honoring, the trailing-slash strip, malformed-URI rejection — and the session customization catalog: the snapshot is seeded with the agent/skills directory containers, the top-level MCP entries with their mapped state, and `serverTools` with the client tools excluded — the creating session's own `activeClient` tools through the pre-seed and other sessions' through the cross-session union), `listSessions`, the non-standard (legacy) session channels (`createSession` acceptance of the `<provider>:/<uuid>` form with verbatim echo, snapshot/subscribe, `createChat` ownership, the -32602 rejection with log capture, and the session/terminal channel-set disjointness), `disposeSession` (the record + every peer backend removed with a single `root/sessionRemoved` and the count update, the legacy channel form, the channel no longer subscribable, no resurfacing past the grace window, double-dispose -32001, and the non-session/unknown rejections with no side effects), and `resolveSessionConfig` (the AHP 1.0.0 root command). |
+| `host-sessions.test.ts` | `createSession` (including `workingDirectories` — first-entry honoring, the trailing-slash strip, malformed-URI rejection — and the session customization catalog: the snapshot is seeded with the agent/skills directory containers, the top-level MCP entries with their mapped state, and `serverTools` with the client tools excluded — the creating session's own `activeClient` tools through the pre-seed and other sessions' through the cross-session union), `listSessions`, the non-standard (legacy) session channels (`createSession` acceptance of the `<provider>:/<uuid>` form with verbatim echo, snapshot/subscribe, `createChat` ownership, the -32602 rejection with log capture, and the session/terminal channel-set disjointness), `disposeSession` (the record + every peer backend removed with a single `root/sessionRemoved` and the count update, the legacy channel form, the channel no longer subscribable, no resurfacing past the grace window, double-dispose -32001, and the non-session/unknown rejections with no side effects), and `resolveSessionConfig` (the AHP root command). |
 | `host-turns.test.ts` | the turn lifecycle (fixture replay: streaming text/reasoning, tool-call events, usage, turn terminals), permission round trips, steering/queue delivery, and cancel + terminal events. |
 | `host-dispatch.test.ts` | the client-dispatchable session-level actions (`titleChanged` rename + root notification, draft/read/archive echoes, `activeClient` identity validation, the not-dispatchable and unknown-channel/session rejections, the settings-permissions no-op) and the MCP toggle (`session/customizationToggled` / `mcpServerStartRequested` / `mcpServerStopRequested` → the `disabled`-flag dispatch: the accepted echo, the catalog re-push to every live session with the re-settled state and the workspace disable `enablement` (dropped on re-enable), and the non-MCP-id and facade-failure rejections). |
 | `host-events.test.ts` | the opencode event pump's registration surface: external sessions (including the catalog converging on the registered session via the fire-and-forget `session/customizationsChanged` + `session/serverToolsChanged` pair), removal, subagent-child exclusion, and the `createSession` race (the pump's `session.created` does not double-register). |
@@ -110,7 +110,7 @@ server. Recapture it whenever opencode's event catalog changes shape.
 The unit suites deliberately do not exercise the transport, the live
 plugin lifecycle, or real opencode. The scripts in `scripts/` fill that
 gap: each is a dependency-free Node ≥ 22 program (global `WebSocket` +
-`fetch`) that speaks **real AHP 1.0.0 over WebSocket** against a real
+`fetch`) that speaks **real AHP over WebSocket** against a real
 `opencode serve` with the plugin loaded, and exits non-zero on any
 protocol or verification failure.
 
@@ -252,7 +252,7 @@ host`.
 | Script | What it verifies |
 | --- | --- |
 | `scripts/ahp-client.mjs` | The hello-world lifecycle: `initialize` (root subscription) → subscribe → ping, printing every response. `--probe` mode instead exercises the transport's HTTP matrix without a WebSocket handshake: healthz, token auth (401), Origin policy (403), routing (404), and the 101 upgrade. |
-| `scripts/ahp-turn-lifecycle.mjs` | The full AHP 1.0.0 surface the Agents window needs: `initialize` → `createSession` (provider selection) → session subscribe (asserts the agent picker is present in the snapshot) → chat subscribe → `dispatchAction chat/turnStarted` → the observed turn lifecycle (echo → `responsePart`/deltas → `turnComplete`). The session channel is configurable (`--channel`), so the non-standard legacy form (`<provider>:/<uuid>`) is verifiable too. |
+| `scripts/ahp-turn-lifecycle.mjs` | The full AHP surface the Agents window needs: `initialize` → `createSession` (provider selection) → session subscribe (asserts the agent picker is present in the snapshot) → chat subscribe → `dispatchAction chat/turnStarted` → the observed turn lifecycle (echo → `responsePart`/deltas → `turnComplete`). The session channel is configurable (`--channel`), so the non-standard legacy form (`<provider>:/<uuid>`) is verifiable too. |
 | `scripts/ahp-changesets.mjs` | Changesets end to end: catalogues (session + chat), a file-editing turn surfacing the file in the uncommitted changeset, the turn changeset with snap content refs, `resourceRead` (`file://`, `ahp-content://head`, snap before/after, plus the -32009/-32008 error cases), `filesReviewChanged`, and `discard-changes` through `invokeChangesetOperation`. |
 | `scripts/ahp-client-tools.mjs` | Client-provided tools through the real opencode tool registry: a `ping` tool registered via `createSession.activeClient.tools`, then three turns — happy path (client-executed contributor, single `toolCallComplete`, result in the snapshot), failed result (the model sees the error; the turn still completes), and `requiresResultConfirmation` (the call parks in `pending-result-confirmation`; approving via `chat/toolCallResultConfirmed` releases the held result). |
 | `scripts/ahp-customizations.mjs` | The session customization catalog (design.md §7.5) — machine-independent: every expectation is cross-checked against the test server's own HTTP surface at run time (`/api/agent`, `/api/skill`, `/api/mcp`), so nothing is hardcoded to a machine's agents/skills/MCP. The `createSession` snapshot carries the agent + skills directory containers (names matching the API), the top-level MCP entries (names + status → AHP state mapping), and non-empty, shaped `serverTools` without the client-tool echo; then an externally-created session (`POST /api/session` — the TUI/resurfacing path) is announced on root, converges on the catalog via the change-action pair, and is removed (`DELETE /api/session` → `root/sessionRemoved`); then the MCP toggle (design.md §7.5, **Toggling**): disabling a connected server via `session/customizationToggled` (accepted echo; the re-pushed entry `stopped` with the workspace disable `enablement`; `/api/mcp` reporting `disabled`), toggling the agent directory rejected with the static-definition reason, and re-enabling via `session/mcpServerStartRequested` (the entry `ready` without enablement; `/api/mcp` `connected` again) — the re-enable always runs so the server is left connected, and the section skips entirely when no server is connected. Requires the server Basic-auth password (`--pw`). |
@@ -380,8 +380,8 @@ Three fixture families (verified against the repo):
 
 | Family | Contents | Fixture shape |
 | --- | --- | --- |
-| `types/test-cases/reducers/` | 308 reducer fixtures at `spec/v1.0.0` — state-transition behavior of every channel reducer, including no-op and wrong-id guard cases. | `{ description, reducer, initial, actions, expected }` — feed `actions` through the named reducer starting from `initial`; the result must deep-equal `expected`. |
-| `types/test-cases/round-trips/` | 67 wire round-trip fixtures — decode/re-encode parity for every wire type (envelopes, JSON-RPC frames, state snapshots, unknown-variant preservation). | `{ group?, type, input, acceptableOutputs [exactly 1], preservedOutput? }` — decode `input`, re-encode, and require the single canonical form; group **B** fixtures assert the key-preserving form (`preservedOutput`) for runtimes without a decoder (TypeScript). `KNOWN-FIDELITY-GAPS.md` in the directory documents what the corpus does *not* verify. |
+| `types/test-cases/reducers/` | 351 reducer fixtures at `spec/v1.1.0` — state-transition behavior of every channel reducer, including no-op and wrong-id guard cases. | `{ description, reducer, initial, actions, expected }` — feed `actions` through the named reducer starting from `initial`; the result must deep-equal `expected`. |
+| `types/test-cases/round-trips/` | 113 wire round-trip fixtures — decode/re-encode parity for every wire type (envelopes, JSON-RPC frames, state snapshots, unknown-variant preservation). | `{ group?, type, input, acceptableOutputs [exactly 1], preservedOutput? }` — decode `input`, re-encode, and require the single canonical form; group **B** fixtures assert the key-preserving form (`preservedOutput`) for runtimes without a decoder (TypeScript). `KNOWN-FIDELITY-GAPS.md` in the directory documents what the corpus does *not* verify. |
 | `types/test-cases/version-negotiation.json` | 22 negotiation cases — highest-offered-in-range selection, `null` for no overlap, and invalid-version rejection. | `{ offered, expected }` / `{ offered, invalid: true }` against `negotiateProtocolVersion`. |
 
 The official gate for the reducer family is the repo's root `npm test`,
@@ -390,13 +390,13 @@ with **100 % branch coverage required on `types/reducers.ts`** — the
 fixtures are designed to cover the reducer exhaustively. The round-trip
 family runs inside the TypeScript client's own suite.
 
-### 5.2 Pin to `spec/v1.0.0`, not `main`
+### 5.2 Pin to `spec/v1.1.0`, not `main`
 
-The protocol is strict-pinned at 1.0.0, and the corpus on `main` has
-already drifted to 1.1.0-dev: it grew (351 reducer fixtures vs 308, 109
-round-trips vs 68), fixtures 040/052 were renamed with **changed
-semantics**, and new fixtures target 1.1.0 actions. Always check out the
-`spec/v1.0.0` tag for the fixtures that match the pinned package.
+The protocol is strict-pinned at 1.1.0, and the corpus on `main` has
+already drifted to 1.2.0-dev: it grew (361 reducer fixtures vs 351, 132
+round-trips vs 113), with the growth purely additive (new fixtures plus
+two extended automation round-trips). Always check out the
+`spec/v1.1.0` tag for the fixtures that match the pinned package.
 
 ### 5.3 What it covers for this host
 
@@ -413,10 +413,11 @@ covers:
 | wire encoding/decoding | the package's generated types + `JSON.parse`/`stringify` | the `round-trips/` corpus |
 
 Verified: the installed
-`@microsoft/agent-host-protocol@1.0.0` package's `src/` is byte-identical
-to the `spec/v1.0.0` tag (`clients/typescript/src` verbatim; the canonical
-`types/` modulo a 3-line "Generated" header). So a green suite at the
-tag **is** conformance of the pinned dependency — and gate 4
+`@microsoft/agent-host-protocol@1.1.0` package's `src/` is the
+`spec/v1.1.0` tag's `clients/typescript/src` verbatim, plus a generated
+`src/types/` that is the canonical `types/` (63 files, tests excluded)
+byte-identical modulo a 3-line "Generated" header. So a green suite at
+the tag **is** conformance of the pinned dependency — and gate 4
 ([§5.4](#54-how-to-run-it)) re-runs the reducer + version-negotiation
 corpora against the installed dist on every pass, so the delegation does
 not rest on that one-time check alone. The unit + live layers
@@ -431,7 +432,7 @@ layers, not by the corpus.
 ### 5.4 How to run it
 
 `node scripts/ahp-conformance.mjs` runs the whole pass. It shallow-clones
-the AHP repo at the `spec/v1.0.0` tag into a throwaway scratch copy under
+the AHP repo at the `spec/v1.1.0` tag into a throwaway scratch copy under
 `/tmp/opencode/ahp-conformance/` (any local reference checkout is never
 touched), installs the repo's dependencies, runs the four gates, and
 removes the scratch on exit:
@@ -468,7 +469,7 @@ removes the scratch on exit:
    `negotiateProtocolVersion`): the pin-drift guard, so the pass covers
    what we ship, not only the tag.
 
-Options: `--tag <tag>` (default `spec/v1.0.0`), `--repo-url <url>`,
+Options: `--tag <tag>` (default `spec/v1.1.0`), `--repo-url <url>`,
 `--dir <scratch root>`, `--keep` (retain the scratch checkout). Exit
 codes (house convention): `0` all gates green · `1` fixture or coverage
 failure · `2` setup failure (clone / `npm ci` / generate).
@@ -480,27 +481,26 @@ of this host's conformance pass.
 
 ### 5.5 Status
 
-Run and green as of the first pass
-([§5.6](#56-results-first-run)). The pass was deliberately
+Run and green ([§5.6](#56-results)). The pass was deliberately
 scheduled last — after the other [`futures.md`](futures.md) candidates
 land or are set aside — so it validates the full advertised surface.
 Re-run `scripts/ahp-conformance.mjs` whenever new capabilities are turned
-on, the pinned AHP package changes, or the `spec/v1.0.0` corpus moves.
+on, the pinned AHP package changes, or the `spec/v1.1.0` corpus moves.
 
-### 5.6 Results (first run)
+### 5.6 Results
 
-First pass via `scripts/ahp-conformance.mjs`, `spec/v1.0.0`
-tag at `5f16d81b` ("release: AHP 1.0.0"):
+Latest pass via `scripts/ahp-conformance.mjs`, `spec/v1.1.0`
+tag at `a501ea48` ("release: AHP 1.1.0"):
 
 | Gate | Result |
 | --- | --- |
-| 1 — fixtures (`types/*.test.ts` + `types/version/*.test.ts`) | 400/400 pass |
-| 2 — TS client (`npm test`: round-trip corpus + client units) | 77/77 pass |
-| 3 — coverage gate (official root-gate files under c8) | 516/516 pass; `types/reducers.ts` 100 % stmts / branches / funcs / lines — 100 % branch threshold met |
-| 4 — installed dist vs corpus (reducer + version-negotiation) | 330/330 fixtures pass against the `@microsoft/agent-host-protocol@1.0.0` installed in this repo |
+| 1 — fixtures (`types/*.test.ts` + `types/version/*.test.ts`) | 461/461 pass |
+| 2 — TS client (`npm test`: round-trip corpus + client units) | 79/79 pass |
+| 3 — coverage gate (official root-gate files under c8) | 664/664 pass; `types/reducers.ts` 100 % stmts / branches / funcs / lines — 100 % branch threshold met |
+| 4 — installed dist vs corpus (reducer + version-negotiation) | 373/373 fixtures pass against the `@microsoft/agent-host-protocol@1.1.0` installed in this repo |
 
-Fixture counts at the tag match [§5.1](#51-the-corpus): 308 reducer
-files, 67 round-trip fixtures (the 68th directory entry is
+Fixture counts at the tag match [§5.1](#51-the-corpus): 351 reducer
+files, 113 round-trip fixtures (the 114th directory entry is
 `KNOWN-FIDELITY-GAPS.md`), 22 version-negotiation cases.
 
 **Exit criterion met: green for every capability the host advertises.**

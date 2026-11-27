@@ -101,7 +101,7 @@ describe("turn lifecycle", () => {
     expect(tool.invocationMessage).toBe("Run `echo hello-ahp`");
     expect(tool.toolInput).toBe('{"command":"echo hello-ahp"}');
     expect(tool.confirmed).toBe("not-needed");
-    // The completed tool call inlines the result fields (AHP 1.0.0 state).
+    // The completed tool call inlines the result fields (AHP state).
     expect(tool.success).toBe(true);
     expect(tool.pastTenseMessage).toBe("Ran `echo hello-ahp`");
     expect(tool.content).toEqual([{ type: "text", text: "hello-ahp\n" }]);

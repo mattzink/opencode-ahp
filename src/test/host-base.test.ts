@@ -11,12 +11,13 @@ import { waitFor, makeHarness, waitInit } from "./host-fakes.js";
 // ── handshake / catalog (regression through the host) ─────────────
 
 describe("initialize", () => {
-  it("negotiates 1.0.0, reports defaultDirectory, and snapshots the root catalog", async () => {
+  it("negotiates 1.1.0, reports defaultDirectory, and snapshots the root catalog", async () => {
     const h = makeHarness();
     h.init(1, "c1");
     const result = await waitInit(h, 1);
-    expect(result.protocolVersion).toBe("1.0.0");
+    expect(result.protocolVersion).toBe("1.1.0");
     expect(result.serverInfo).toEqual({ name: "opencode-ahp-test", version: "0.1.0" });
+    expect(result.environment).toEqual({ pathStyle: "posix" });
     expect(result.defaultDirectory).toBe("file:///tmp/opencode/ahp-scratch/project-lan/");
     const root = result.snapshots.find((s: Record<string, any>) => s.resource === ROOT_CHANNEL);
     expect(root).toBeDefined();

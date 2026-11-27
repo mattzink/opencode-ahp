@@ -80,7 +80,7 @@ export const BUILTIN_OPTIONS: Options = {
   // Changesets and the synthetic shell-command terminals are both on by
   // default; opt out with `capabilities.changesets: false` and
   // `capabilities.terminals: false` respectively.
-  // Off the wire in 1.0.0 (no capability field) — the flag gates the
+  // Off the wire (no capability field) — the flag gates the
   // host-side behavior only.
   capabilities: { changesets: true, terminals: true, automations: false },
 };

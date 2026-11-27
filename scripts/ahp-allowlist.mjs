@@ -187,10 +187,10 @@ try {
   const init = await request("initialize", {
     channel: "ahp-root://",
     clientId,
-    protocolVersions: ["1.0.0"],
+    protocolVersions: ["1.1.0", "1.0.0"],
     initialSubscriptions: ["ahp-root://"],
   });
-  check("initialize", init.result !== undefined && init.result.protocolVersion === "1.0.0");
+  check("initialize", init.result !== undefined && init.result.protocolVersion === "1.1.0");
 
   const POLICY_MSG = "path is not permitted by host policy";
   const SESSION_POLICY_MSG = "working directory is not permitted by host policy";

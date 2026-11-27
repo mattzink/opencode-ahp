@@ -1,7 +1,7 @@
 /**
  * Global action sequencer + replay window.
  *
- * AHP 1.0.0's `serverSeq` is a single host-wide sequence across all
+ * AHP's `serverSeq` is a single host-wide sequence across all
  * channels (not per-channel) — the spec's lifecycle example numbers a
  * chat action 43 while a root snapshot is taken at 42. Consequences:
  *  - snapshots carry `fromSeq` = the current global seq;

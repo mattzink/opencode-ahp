@@ -4,7 +4,7 @@
  * customizations carry the agent directory), the non-standard (legacy)
  * session channel form, `listSessions`, `disposeSession` (record + peer
  * backends, the removal announcement, rejections), and
- * `resolveSessionConfig` (the AHP 1.0.0 root command).
+ * `resolveSessionConfig` (the AHP root command).
  */
 import { describe, expect, it } from "vitest";
 import {
@@ -588,7 +588,7 @@ describe("disposeSession", () => {
   });
 });
 
-describe("resolveSessionConfig (AHP 1.0.0 root command)", () => {
+describe("resolveSessionConfig (AHP root command)", () => {
   const SES = "ses_cfg";
 
   it("answers the empty schema with empty values — the client's strict pre-send resolve succeeds", async () => {

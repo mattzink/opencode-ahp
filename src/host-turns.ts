@@ -49,18 +49,23 @@ export class HostTurns extends HostTerminals {
     const endedTurnId = chat.currentTurnId;
     chat.currentTurnId = null;
     chat.turnStartedAt = null;
-    const state = chat.chatStore.state;
-    if (state.steeringMessage !== undefined) {
+    const steering = chat.chatStore.state.steeringMessage;
+    if (steering !== undefined) {
       this.publish({
         channel: chat.uri,
         action: {
           type: ActionType.ChatPendingMessageRemoved,
           kind: PendingMessageKind.Steering,
-          id: state.steeringMessage.id,
+          id: steering.id,
         },
       });
     }
-    const queued = state.queuedMessages;
+    // Re-read from the store, not the reference captured above: the
+    // official reducer upserts steering entries into the unified
+    // `queuedMessages`, so the removal publish just replaced the state
+    // object — a stale reference would still hold the consumed steering
+    // entry and auto-start a phantom turn from it.
+    const queued = chat.chatStore.state.queuedMessages;
     if (queued !== undefined && queued.length > 0) {
       const next = queued[0]!;
       this.startTurn(chat, next.message, next.id);

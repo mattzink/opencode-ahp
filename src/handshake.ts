@@ -1,19 +1,22 @@
 /**
- * AHP 1.0.0 handshake: the `initialize` command — semver capability
- * negotiation via the official package's `negotiateProtocolVersion`.
+ * AHP handshake: the `initialize` command — semver capability negotiation
+ * via the official package's `negotiateProtocolVersion`.
  *
  * Version semantics (AHP versioning spec): the server picks the highest
  * client-offered version inside its supported caret baselines and echoes
- * that exact string back. The package we pin (1.0.0) supports the 1.0.0
- * and 0.9.0 baselines, so a client offering any 1.x (or 0.9.x) version
- * negotiates the 1.0 wire protocol; anything else gets -32005 with the
- * `supportedVersions` data.
+ * that exact string back. The package we pin (1.1.0) supports the 1.0.0
+ * and 0.9.0 baselines, so a client offering any 1.x or 0.9.x version
+ * negotiates the highest string it offered — possibly above the pin
+ * itself (1.x is additive-optional over the 1.0 wire: surface newer
+ * than the host implements is answered permissively); anything else
+ * gets -32005 with the `supportedVersions` data.
  */
 import {
   negotiateProtocolVersion,
   SUPPORTED_PROTOCOL_VERSIONS,
   type Implementation,
   type InitializeResult,
+  type PathStyle,
   type Snapshot,
 } from "@microsoft/agent-host-protocol";
 import { ROOT_CHANNEL } from "./channels.js";
@@ -36,6 +39,13 @@ export interface InitializeRequest {
   serverSeq: number;
   /** The file URI of the opencode instance's working directory, when known. */
   defaultDirectory?: string;
+  /**
+   * The host environment's path grammar, stamped onto the result's
+   * `environment` (AHP 1.1.0 `HostEnvironment.pathStyle`): clients parse
+   * and format native paths with it instead of inferring from their own
+   * environment. The host serves a single OS, so it is always populated.
+   */
+  pathStyle: PathStyle;
   /**
    * Resolve a snapshot for an `initialSubscriptions` entry; null when the
    * channel is not subscribable (it is simply omitted from the result).
@@ -116,6 +126,7 @@ export async function handleInitialize(req: InitializeRequest): Promise<Initiali
       protocolVersion: version,
       serverSeq: req.serverSeq,
       serverInfo: req.serverInfo,
+      environment: { pathStyle: req.pathStyle },
       snapshots,
       ...(req.defaultDirectory ? { defaultDirectory: req.defaultDirectory } : {}),
     },

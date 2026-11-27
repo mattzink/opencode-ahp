@@ -87,6 +87,36 @@ describe("multi-chat", () => {
     h.stop();
   }, 10000);
 
+  it("createChat honors the client-selected title and falls back to Chat N when absent", async () => {
+    const h = makeHarness();
+    h.init(1, "c1");
+    await waitInit(h, 1);
+    const sess = "mc-title";
+    await setupSession(h, sess);
+    await subscribe(h, 1, sessionChannelURI(sess), 420);
+    const peer = "ahp-chat:/titled";
+    const res = await createChat(h, 1, { channel: sessionChannelURI(sess), chat: peer, title: "My titled chat" }, 421);
+    expect(res.error).toBeUndefined();
+    expect(res.result).toBeNull();
+    const added = await waitForAction(h, sessionChannelURI(sess), "session/chatAdded");
+    expect(added.action.summary.title).toBe("My titled chat");
+    const chat = await chatSnapshotState(h, 1, peer, 422);
+    expect(chat.title).toBe("My titled chat");
+
+    // An empty title falls back to the host-minted `Chat N`.
+    const blank = "ahp-chat:/blank";
+    const res2 = await createChat(h, 1, { channel: sessionChannelURI(sess), chat: blank, title: "" }, 423);
+    expect(res2.error).toBeUndefined();
+    const added2 = await waitForAction(
+      h,
+      sessionChannelURI(sess),
+      "session/chatAdded",
+      (a) => a.action.summary.resource === blank,
+    );
+    expect(added2.action.summary.title).toBe("Chat 3");
+    h.stop();
+  });
+
   it("createChat on a working-directories session mints the peer backend in the same location", async () => {
     const h = makeHarness();
     h.init(1, "c1");

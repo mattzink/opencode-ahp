@@ -1,6 +1,6 @@
 /**
  * opencode-ahp — OpenCode V2 plugin: hosts the **Agent Host Protocol
- * (AHP) 1.0.0** in-process so opencode appears as a native agent in the
+ * (AHP)** in-process so opencode appears as a native agent in the
  * VS Code Agents window.
  *
  * This is the only module that touches the plugin `ctx` — everything
@@ -24,6 +24,7 @@
  * Every failure path logs and stays up: a bad client connection or a
  * bridge error must never take down the opencode server (R2).
  */
+import { PathStyle } from "@microsoft/agent-host-protocol";
 import { execFile } from "node:child_process";
 import {
   lstat,
@@ -1026,6 +1027,9 @@ export default Plugin.define({
         ),
         replayWindow: opts.replayWindow,
         defaultDirectory: ctx.location.directory,
+        // AHP 1.1.0: the client's path grammar for this host's native
+        // paths (the client must not infer it from its own environment).
+        pathStyle: process.platform === "win32" ? PathStyle.Windows : PathStyle.Posix,
         changesets: opts.capabilities.changesets,
         terminals: opts.capabilities.terminals,
         spawnPty: createBunSpawnPty(),
@@ -1087,7 +1091,7 @@ export default Plugin.define({
         }
       };
       console.log(
-        `${TAG} AHP 1.0.0 host listening on ws${opts.tls ? "s" : ""}://${opts.host}:${listener.port}${opts.path} ` +
+        `${TAG} AHP 1.1.0 host listening on ws${opts.tls ? "s" : ""}://${opts.host}:${listener.port}${opts.path} ` +
           `(token ${opts.token ? "from options" : "auto-generated"}; health ${opts.healthPath})`,
       );
     } catch (e) {

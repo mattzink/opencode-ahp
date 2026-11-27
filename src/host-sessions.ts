@@ -44,7 +44,7 @@ const LIST_SESSIONS_DEFAULT_LIMIT = 100;
 
 export class HostSessions extends HostChats {
   /**
-   * `createSession` (AHP 1.0.0 session-channel command). Creates a real
+   * `createSession` (AHP session-channel command). Creates a real
    * opencode session, seeds its session/chat stores, publishes the
    * session-channel lifecycle actions, announces the session on the root
    * channel, and responds `null` (per the command contract). The
@@ -145,7 +145,7 @@ export class HostSessions extends HostChats {
       activeClients = [normalizeActiveClient(ac)];
     }
 
-    // `workingDirectories` (AHP 1.0.0): the directory the session's
+    // `workingDirectories`: the directory the session's
     // agent is granted tool access to. The host advertises no
     // multipleWorkingDirectories, so the spec applies — only the first
     // entry is honored (extras are logged and ignored); it must be a
@@ -359,7 +359,7 @@ export class HostSessions extends HostChats {
   }
 
   /**
-   * `disposeSession` (AHP 1.0.0 session-channel command): dispose an AHP
+   * `disposeSession` (AHP session-channel command): dispose an AHP
    * session and every opencode backend behind it — the default backend
    * and each peer chat's backend. Result: `null`; the client's removal
    * signal is the `root/sessionRemoved` notification `removeRecord`
@@ -411,7 +411,7 @@ export class HostSessions extends HostChats {
   }
 
   /**
-   * `listSessions` (AHP 1.0.0 root command): all opencode sessions,
+   * `listSessions` (AHP root command): all opencode sessions,
    * most-recently-modified first, with in-memory cursor pagination.
    * Unknown sessions are lazily registered (so their channels become
    * subscribable); registration is idempotent per opencode session id.
@@ -449,7 +449,7 @@ export class HostSessions extends HostChats {
   }
 
   /**
-   * AHP 1.0.0 root command — the client resolves the session-creation
+   * AHP root command — the client resolves the session-creation
    * config schema. VS Code calls it every time the new-session composer
    * opens and STRICTLY again before the first send of a new session
    * (`_sendNewSessionRequest`), so an unimplemented host makes every

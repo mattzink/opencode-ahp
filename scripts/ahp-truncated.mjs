@@ -189,11 +189,11 @@ try {
   const init = await request("initialize", {
     channel: "ahp-root://",
     clientId,
-    protocolVersions: ["1.0.0"],
+    protocolVersions: ["1.1.0", "1.0.0"],
     initialSubscriptions: ["ahp-root://"],
   });
   if (init.error) fail(1, `initialize: ${JSON.stringify(init.error)}`);
-  check("initialize", init.result?.protocolVersion === "1.0.0", `v${init.result?.protocolVersion}`);
+  check("initialize", init.result?.protocolVersion === "1.1.0", `v${init.result?.protocolVersion}`);
 
   // 2. createSession + subscribe session/chat
   const create = await request("createSession", {

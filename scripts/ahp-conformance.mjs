@@ -4,8 +4,8 @@
  *
  * Runs the official AHP conformance fixtures
  * (microsoft/agent-host-protocol `types/test-cases`) against the
- * `spec/v1.0.0` tag — the corpus matching this repo's strict-pinned
- * `@microsoft/agent-host-protocol@1.0.0`. See docs/testing.md §5.
+ * `spec/v1.1.0` tag — the corpus matching this repo's strict-pinned
+ * `@microsoft/agent-host-protocol@1.1.0`. See docs/testing.md §5.
  *
  * The script works on a throwaway shallow clone in scratch under
  * /tmp/opencode/ — it never touches a local checkout of the AHP repo.
@@ -39,7 +39,7 @@
  * the test toolchain comes from the cloned repo's own node_modules).
  *
  * Usage:
- *   node scripts/ahp-conformance.mjs [--tag spec/v1.0.0]
+ *   node scripts/ahp-conformance.mjs [--tag spec/v1.1.0]
  *     [--repo-url https://github.com/microsoft/agent-host-protocol]
  *     [--dir /tmp/opencode/ahp-conformance] [--keep]
  *
@@ -68,7 +68,7 @@ const arg = (name, dflt) => {
 const has = (name) => argv.includes(name);
 
 const opts = {
-  tag: arg("--tag", "spec/v1.0.0"),
+  tag: arg("--tag", "spec/v1.1.0"),
   repoUrl: arg("--repo-url", "https://github.com/microsoft/agent-host-protocol"),
   dir: arg("--dir", "/tmp/opencode/ahp-conformance"),
   keep: has("--keep"),

@@ -160,7 +160,7 @@ async function main() {
   const init = await rpc.request(ws, "initialize", {
     channel: "ahp-root://",
     clientId,
-    protocolVersions: ["1.0.0"],
+    protocolVersions: ["1.1.0", "1.0.0"],
     initialSubscriptions: ["ahp-root://"],
   });
   if (init.error) fail(1, `initialize failed: ${JSON.stringify(init.error)}`);

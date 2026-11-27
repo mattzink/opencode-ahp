@@ -23,7 +23,7 @@ export const ERROR_PERMISSION_DENIED = -32009;
 /**
  * AHP `AlreadyExists` (-32010): the target resource already exists. This
  * host's use: a `createTerminal` for a channel that is already open.
- * (AHP 1.0.0 defines no "not supported" code — the -32600…-32603
+ * (AHP defines no "not supported" code — the -32600…-32603
  * standard range covers those shapes.)
  */
 export const ERROR_ALREADY_EXISTS = -32010;

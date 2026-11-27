@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { SUPPORTED_PROTOCOL_VERSIONS, type Snapshot } from "@microsoft/agent-host-protocol";
+import { PathStyle, SUPPORTED_PROTOCOL_VERSIONS, type Snapshot } from "@microsoft/agent-host-protocol";
 import {
   ERROR_INVALID_PARAMS,
   ERROR_UNSUPPORTED_PROTOCOL_VERSION,
@@ -15,6 +15,7 @@ function req(params: unknown, extra: Partial<InitializeRequest> = {}): Initializ
     params,
     serverInfo,
     serverSeq: 42,
+    pathStyle: PathStyle.Posix,
     snapshotFor: () => null,
     ...extra,
   };
@@ -85,7 +86,11 @@ describe("handleInitialize: version negotiation", () => {
     Promise.all([
       expect(negotiated(["1.0.1", "1.0.0"])).resolves.toBe("1.0.1"),
       expect(negotiated(["1.9.0"])).resolves.toBe("1.9.0"),
+      expect(negotiated(["1.1.0", "1.0.0"])).resolves.toBe("1.1.0"),
     ]));
+
+  it("echoes the 1.148.0 client's setting-on offer (vendored 1.2.0 dev version)", () =>
+    expect(negotiated(["1.2.0", "1.0.0", "0.9.0", "0.10.0"])).resolves.toBe("1.2.0"));
 
   it("accepts the 0.9.x baseline", () => expect(negotiated(["0.9.5"])).resolves.toBe("0.9.5"));
 
@@ -117,9 +122,15 @@ describe("handleInitialize: result shape", () => {
         serverSeq: 7,
         serverInfo,
         defaultDirectory: "file:///home/x/proj/",
+        environment: { pathStyle: "posix" },
         snapshots: [],
       },
     });
+  });
+
+  it("stamps the platform-detected pathStyle (AHP 1.1.0 environment)", async () => {
+    const out = await handleInitialize(req(okParams(), { pathStyle: PathStyle.Windows }));
+    expect(out).toMatchObject({ ok: true, result: { environment: { pathStyle: "windows" } } });
   });
 
   it("does not set defaultDirectory when unknown", async () => {

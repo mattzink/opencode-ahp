@@ -1,9 +1,8 @@
 # Future work
 
 This document covers **potential work**: candidate extensions, parts
-of the AHP 1.0.0 surface the host does not implement, the upgrade
-outlook for AHP 1.1.0, and upstream changes (opencode, VS Code) that
-would unlock more use cases.
+of the AHP 1.1.0 surface the host does not implement, and upstream
+changes (opencode, VS Code) that would unlock more use cases.
 
 **Nothing in this document is planned or scheduled.** Every item
 carries one or more issues — a missing plugin surface, a missing
@@ -19,10 +18,11 @@ for testing (unit, static, live verification, two-machine, and
 conformance), see [`docs/testing.md`](testing.md).
 
 Protocol facts are verified against the installed
-`@microsoft/agent-host-protocol@1.0.0` dist (the wire ground truth) and
+`@microsoft/agent-host-protocol@1.1.0` dist (the wire ground truth) and
 the upstream [`microsoft/agent-host-protocol`](https://github.com/microsoft/agent-host-protocol)
-repository. opencode findings are verified against
-v2.2.6 source and current `main` where noted.
+repository (the `typescript/v1.1.0` and `spec/v1.1.0` tags). opencode
+findings are verified against the v2.4.1 source and current `main`
+where noted; VS Code findings against the 1.148.0 client.
 
 ---
 
@@ -33,7 +33,8 @@ names its blocker, or the reason it is not worth doing today.
 
 ### 1.1 Elicitation completion (decision pending)
 
-**What it is.** AHP 1.0.0 *elicitation* is the host asking the **user**
+**What it is.** AHP *elicitation* (unchanged through 1.1.0) is the host
+asking the **user**
 for structured input mid-turn — a preference, a clarification, a
 decision, or a URL to review. It is distinct from tool-call confirmation:
 
@@ -149,7 +150,7 @@ one durability gap with a clear implementation path — but it is
 currently asks for it (below), so doing it now would buy nothing
 visible.
 
-**The AHP wire path already exists in 1.0.0:**
+**The AHP wire path already exists:**
 
 - `fetchTurns` (chat channel) — cursor-based; the cursor comes from
   `ChatState.turnsNextCursor` and the command returns an empty result
@@ -164,9 +165,11 @@ persisted messages). The bridge already maps the raw event shapes these
 messages carry into turn state, so hydration is largely re-running the
 existing mappers over durable data.
 
-**Why it stays potential.** The current VS Code 1.145.2 client
-**never requests turn history** (`fetchTurns` is type-only in the
-official TS client), so this work has no user-visible effect until a
+**Why it stays potential.** The current VS Code 1.148.0 client
+**never requests turn history from a direct host** (`fetchTurns` is
+type-only in the official TS client; the client's paged-history path —
+`view: { turns }` subscribe plus `fetchTurns` paging — is
+web-pubsub-relay-only), so this work has no user-visible effect until a
 client — VS Code or another AHP client — starts paging history. It
 becomes worth doing only once that happens.
 
@@ -179,7 +182,7 @@ becomes worth doing only once that happens.
   ([§4.1](#41-opencode--feature-requests-to-file)), not a design choice.
   (The host still *publishes* `chat/pendingMessageRemoved` when a
   steering message is consumed — that direction already works.)
-- **The `always` permission reply** — AHP 1.0.0's
+- **The `always` permission reply** — AHP's
   `chat/toolCallConfirmed` is an `Approved | Denied` union with **no
   reply-mode field**, so the host maps approved → `once`, denied →
   `reject`. opencode's permission reply surface *does* support
@@ -187,10 +190,22 @@ becomes worth doing only once that happens.
   narrows it out for now. This is a **protocol-side watch**: if AHP
   adds a reply mode (or confirmation-option id), the host can map it to
   opencode's `always` decision.
+- **Per-chat configuration (`chat/configChanged`)** — new in AHP 1.1.0
+  and client-dispatchable: `ChatState.config` gives each chat its own
+  values for the session-config properties marked `chatMutable` (e.g.
+  tool auto-approval), so changing them in one chat no longer changes
+  every chat in the session. The host answers it with the
+  unsupported-action echo: its session-config schema advertises an
+  empty property set (so `chatMutable` marks nothing and the client
+  has no per-chat setting to change), and opencode has no per-chat
+  config surface to back it — model, agent, and permission settings are
+  session-scoped. It becomes work when opencode gains a per-chat config
+  knob worth exposing, or a client in the field starts asking for
+  per-chat divergence against this host.
 
 ### 1.5 Multiroot sessions (`multipleWorkingDirectories`)
 
-**What it is.** AHP 1.0.0 carries an
+**What it is.** AHP carries an
 `AgentCapabilities.multipleWorkingDirectories` capability (options
 `immutablePrimary` / `primaryReplacement`): when advertised, a session
 owns a *set* of working directories treated as equal peers — optionally
@@ -216,7 +231,7 @@ send the five multiroot working-directory actions (the rejected echoes in
 [§2.3](#23-client-dispatchable-actions)).
 
 **The blocker is upstream.** opencode's `Location.Ref` is a single
-`directory` (v2.2.7) — a session's agent has tool access confined to its
+`directory` (v2.4.1) — a session's agent has tool access confined to its
 one location. Until opencode gains a multiroot location model, any
 additional working directory would be **metadata-only** for the agent:
 the client could declare it and the host could bookkeep it, but the agent
@@ -224,10 +239,13 @@ would have no tool access to it. That is the request in
 [§4.1](#41-opencode--feature-requests-to-file), item 8.
 
 **No client drives it today.** The capability gates all multiroot
-affordances, and the VS Code 1.145.2 workbench carries no reference to
-`multipleWorkingDirectories` (stable-bundle grep) — nothing
-in the field sends more than one working directory or any of the five
-actions.
+affordances: the VS Code 1.148.0 workbench computes a session's
+working-directory set from the host's root-state agent entries
+(`supportsMultipleWorkingDirectories` reads
+`rootState.agents[provider].capabilities.multipleWorkingDirectories`),
+and this host's root-state agent entries carry no `capabilities` — so
+the workbench computes a single-directory set and never sends more than
+one working directory or any of the five actions.
 
 **What the host-side work would be**, once opencode supports multiroot:
 honor multiple `createSession` entries, handle the five actions (session-
@@ -260,7 +278,7 @@ re-pushes deterministically after its awaited re-reconcile — not from
 a change event). Three gaps, each with a different blocker:
 
 - **MCP status changes — implementable today.** `mcp.status.changed`
-  is on the public event stream the plugin subscribes to (the v2.2.6
+  is on the public event stream the plugin subscribes to (the v2.4.1
   `EventManifest.Server` inventory), but it carries only the server
   name — no state payload. A live re-push would be pure host-side
   work: re-snapshot `ctx.mcp.list()` on the event and publish
@@ -270,14 +288,17 @@ a change event). Three gaps, each with a different blocker:
   healthy server's reconnect included) and no client in the field
   asks for sub-registration freshness in the Customizations panel.
 - **MCP tool changes — upstream blocker.** `mcp.tools.changed` is
-  *not* in the v2.2.6 `EventManifest.Server` inventory: an untyped
+  *not* in the v2.4.1 `EventManifest.Server` inventory: an untyped
   `ctx.event.subscribe` delivers only that inventory (plus `rpc.*`),
   and a typed subscribe resolves against the same inventory — the
   plugin cannot observe the event at all. Re-pushing `serverTools`
   when an MCP server adds or removes tools needs opencode to put the
   event on the public stream ([§4.1](#41-opencode--feature-requests-to-file),
-  item 9). AHP 1.0.0 has no slot for MCP *resources* either — the
-  `Customization` union has no resource type — so
+  item 9) — or to stabilize the MCP Events draft, which 2.4.1 ships
+  unconditionally ([§4.3](#43-opencode-241--the-delta-the-host-is-compatible-with)).
+  AHP has no slot for MCP *resources* either — the
+  `Customization` union gained `McpServerCustomization.children`
+  (MCP-served skills, SEP-2640) but no resource type — so
   `mcp.resources.changed` has nowhere to map.
 - **Client-tool union changes — design choice.** A
   `session/activeClientSet` on any session re-syncs the
@@ -292,11 +313,36 @@ None of the three changes session behavior — the catalog is
 display-only — so the trigger for any of it is a client that needs
 live freshness in the Customizations panel.
 
+### 1.7 Changeset file activity & nonces (AHP 1.1.0)
+
+Two optional 1.1.0 changeset fields the host does not send:
+
+- **`ChangesetFile.status` (the `Editing` bit).** A bitset of per-file
+  activity flags reporting, through the existing changeset snapshots
+  and actions, which files the agent is actively editing. The host
+  sends `{ id, edit, reviewed? }` only — no activity flags — so a
+  client cannot distinguish a mid-edit file from a settled one. The
+  signal the host would use is live: the in-flight file-edit tool
+  call's target path (set the bit on the `toolCall` start, clear it on
+  the result). It stays potential because the field is optional, the
+  1.148.0 client reads `status` with an `isEditing` fallback, and no
+  client in the field depends on it for display.
+- **Changeset file & operation nonces.** 1.1.0 lets a host stamp each
+  `ChangesetFile` (and the operation target) with a nonce and reject
+  operations carried against a superseded state — without a capability
+  or client cooperation. The host's `invokeChangesetOperation`
+  applies/reverts by file id against current disk state, so a stale
+  client operation (sent before a newer turn rewrote the file) is
+  applied against the new state. Backing the nonces is host-side
+  bookkeeping (mint per file-change generation, check on operation);
+  no client in the field sends nonces today, so this is a robustness
+  upgrade, not a gap any current client hits.
+
 ---
 
-## 2. The AHP 1.0.0 surface the host does not implement
+## 2. The AHP 1.1.0 surface the host does not implement
 
-The strict-pinned 1.0.0 package exposes more than the host implements.
+The strict-pinned 1.1.0 package exposes more than the host implements.
 The host implements only what opencode can back and what a conforming
 client actually drives, and never advertises what it does not
 implement. Nothing in this inventory is planned; each entry is a
@@ -310,25 +356,34 @@ back it.
 | Command | Status | opencode backing | Notes |
 | --- | --- | --- | --- |
 | `fetchTurns` | not implemented | **yes** — `ctx.session.context` | Turn history hydration; [§1.3](#13-turn-history-hydration-fetchturns). |
-| `moveChat` | not implemented | no — no session fork/copy API; a chat is 1:1 with its opencode backend session | 1.1.0-in-flight companion action `chat/moved` ([§3.2](#32-what-is-in-flight-on-upstream-main)); VS Code 1.145.2 does not call it. |
+| `moveChat` | not implemented | no — no session fork/copy API; a chat is 1:1 with its opencode backend session | `chat/moved` (its 1.1.0 companion) is host-dispatched on the chat's channel after a cross-session move with the new session, `provider` and `config.schema`; VS Code 1.148.0 does not call it. |
 | `completions` | not implemented | **partially** — `ctx.experimental.generate` (stateless model generation) | A mapping is implementable today; no client in the field drives it against this host. |
 | `sessionConfigCompletions` | **intentionally unreachable** | n/a — `resolveSessionConfig` answers an empty schema | The client-side guard ("property not advertised") makes the command unreachable; never advertise what we don't implement. |
-| `resourceRequest` / `resourceCopy` / `resourceMove` / `resourceDelete` / `resourceWrite` | not implemented (the read family is: `resourceRead` for changeset content, plus the folder-picker trio `resourceResolve` / `resourceList` / `resourceMkdir` — design §6) | AHP's resource family is formally **bidirectional** (client → host is permitted) | Implementing the write/copy/move family is a file-access policy decision (a remote client writing into the location directory); the VS Code client drives the folder-picker trio plus `resourceRead` against this host. |
+| `resourceRequest` / `resourceCopy` / `resourceMove` / `resourceDelete` / `resourceWrite` | not implemented (the read family is: `resourceRead` for changeset content, plus the folder-picker trio `resourceResolve` / `resourceList` / `resourceMkdir` — design §6) | AHP's resource family is formally **bidirectional** (client → host is permitted) | Implementing the write/copy/move family is a file-access policy decision (a remote client writing into the location directory); the VS Code client drives the folder-picker trio plus `resourceRead` against this host. 1.1.0's ranged `resourceRead` (`position` / `length`, `size` in the result) is not honored — the spec-permissive receiver behavior: the host ignores the range and returns the whole resource without `size`. |
 | `createResourceWatch` | not implemented | no watch subscription on the plugin surface | Long-lived file-change streams on `ahp-resource-watch:` channels; needs the upstream request in [§4.1](#41-opencode--feature-requests-to-file). |
-| `authenticate` (+ `auth/required`) | not implemented | the host authenticates with the transport token; no OAuth flows | AHP's auth surface is for OAuth / protected-resource challenges (e.g. per-MCP-server auth); this host exposes no MCP servers. |
-| `runAutomation` / `fetchAutomationRuns` / `listAutomationTriggerDefinitions` | not implemented | no scheduled-automation concept in opencode | See the automations stability watch in [§3](#3-ahp-110-status-and-upgrade-path); the reserved `capabilities.automations: false` option is already in place. |
+| `authenticate` (+ `auth/required`) | not implemented | the host authenticates with the transport token; no OAuth flows | AHP's auth surface is for OAuth / protected-resource challenges (e.g. per-MCP-server auth); this host exposes no MCP servers. `accountId` / `target` (1.1.0) are unimplemented with it. |
+| `createTcpConnection` | not implemented | none — no raw TCP byte-stream surface | New in 1.1.0: opens a host-side TCP connection onto a private `ahp-tcp:` channel, gated by the `tcpConnections` capability the host does not advertise ([§2.2](#22-channels)). |
+| `runAutomation` / `fetchAutomationRuns` / `listAutomationTriggerDefinitions` | not implemented | **yes** — the 2.4.1 automations system (`ctx.experimental.automation`, `At` / `Every` / `Cron` / `Event` triggers, top-level `automations` key, default on) — the host bridges none of it to AHP | See the automations stability watch in [§3](#3-ahp-110-released-2026-11-12-and-pinned); the reserved `capabilities.automations: false` option is already in place. |
 
 ### 2.2 Channels
 
 - **`ahp-automations://` + `ahp-automation-run:`** — the automation
   catalogue and automation-run channels. Nuance worth stating plainly:
-  these are shipped **inside the published 1.0.0 package** at
-  *"1.0 - Early development"* stability — they are not "1.1 territory"
-  in the version sense; **stability, not version, is the right frame**.
-  They are in flux, and opencode has no corresponding concept (no
-  scheduled, trigger-based agent runs).
+  these are shipped **inside the published package** (1.0.0 first, still
+  at *"1.0 - Early development"* stability in 1.1.0) — **stability, not
+  version, is the right frame**. They are in flux, and the host
+  implements none of this surface; opencode 2.4.1's own automations
+  system ([§4.3](#43-opencode-241--the-delta-the-host-is-compatible-with))
+  would be the backing for a host bridge, but nothing wires it to AHP
+  today.
 - **`ahp-canvas:`** — *"1 - Experimental"*; per-canvas presentation
-  channels. No canvas concept in opencode.
+  channels. No canvas concept in opencode. (Below-stable churn is real:
+  1.1.0 renamed `CanvasState.url` to `uri`.)
+- **`ahp-tcp:`** — new in 1.1.0: private channels forwarding a host-side
+  TCP connection (`createTcpConnection` in [§2.1](#21-commands); the
+  `tcp/data` / `tcp/eof` / `tcp/reset` notifications in
+  [§2.4](#24-notifications)). Gated by the `tcpConnections` capability,
+  which the host does not advertise.
 - **`ahp-resource-watch:`** — see `createResourceWatch` above.
 - **OTLP notifications** (`otlp/exportLogs` / `otlp/exportTraces` /
   `otlp/exportMetrics`) — host → client telemetry export. The host logs
@@ -351,6 +406,9 @@ back it.
   send them ([§1.5](#15-multiroot-sessions-multipleworkingdirectories)).
 - `inputAnswerChanged` / `inputCompleted` — elicitation;
   [§1.1](#11-elicitation-completion-decision-pending).
+- `configChanged` — new in 1.1.0 and client-dispatchable (per-chat
+  values for the session-config properties marked `chatMutable`);
+  answered with the unsupported-action echo — [§1.4](#14-small-chat-surface-gaps).
 
 **Session** — unhandled:
 
@@ -374,8 +432,6 @@ back it.
   settles the connection either way (the reload awaits it), so there
   is no blocking-versus-background start distinction to back the
   action.
-- `configChanged` — 1.1.0-in-flight ([§3.2](#32-what-is-in-flight-on-upstream-main));
-  not part of the 1.0.0 wire; listed for completeness.
 
 **Accepted as client-local no-ops** (echoed; the state is
 client-bookkeeping only): `chat/draftChanged`, `chat/isReadChanged`,
@@ -395,73 +451,109 @@ synthetic terminals are read-only renderings of shell-tool calls
   bring-up work. The host never emits progress today; a candidate if
   session creation ever gets slow.
 - **`auth/required`** — see `authenticate` above.
+- **`channel/frame` / `channel/credit` / `channel/snapshot`** — new in
+  1.1.0: windowed delivery, a per-subscription flow-control offer the
+  client makes on `subscribe` (`flowControl`) that the host can accept
+  with window limits in the result (the snapshot then travels as the
+  first data message instead of inside the result). The host does not
+  accept the offer — its `subscribe` results carry no `flowControl` — so
+  it never sends frames or credit, and unframed delivery is unchanged.
+- **`tcp/data` / `tcp/eof` / `tcp/reset`** — new in 1.1.0; the data
+  plane of the `ahp-tcp:` channels ([§2.2](#22-channels)). Not sent (no
+  `tcpConnections` capability).
 - **`otlp/*`** — see [§2.2](#22-channels).
 - **`setClientManagedSettingsPermissions`** — *not* AHP; a
-  VS Code-specific post-init notification with no 1.0.0 counterpart.
-  Accepted and logged as a no-op (the connection must stay up) —
-  [design.md §6](design.md#6-command-surface).
+  VS Code-specific post-init notification with no AHP
+  counterpart. Accepted and logged as a no-op (the connection must stay
+  up) — [design.md §6](design.md#6-command-surface).
 
 ---
 
-## 3. AHP 1.1.0: status and upgrade path
+## 3. AHP 1.1.0: released 2026-11-12 and pinned
 
-The upgrade is **potential, not planned** — nothing on the client side
-can force it, and nothing in the current feature set needs it
-([§3.1](#31-status)). What follows is the state of
-the question, and what an upgrade would involve if and when it becomes
-worth doing.
+The strict pin is 1.1.0 (the `spec/v1.1.0` / `typescript/v1.1.0` tags).
+1.1.0 adds only additive-optional surface to the 1.0 wire — no existing
+behavior changed, and the negotiation rules mean every client that could
+talk to this host before still can (design.md
+[§4](design.md#4-connection-model--handshake)). The host serves the new
+surface where opencode can back it, and answers the rest permissively;
+this section records that disposition and the triggers that would turn
+the unimplemented parts into work.
 
-### 3.1 Status
+### 3.1 What 1.1.0 shipped, and the host disposition
 
-- **npm:** the latest published `@microsoft/agent-host-protocol` is
-  **1.0.0** (published 2026-10-03). There is no 1.1.x release.
-- **Upstream `main`:** `PROTOCOL_VERSION = '1.1.0'` (the development
-  version), but `SUPPORTED_PROTOCOL_VERSIONS` is still
-  `['1.0.0', '0.9.0']` — a 1.1.0-dev client **negotiates down to 1.0.0**,
-  so no client in the field can force this host to upgrade.
-- **Spec changelog:** the
-  [`CHANGELOG.md`](https://github.com/microsoft/agent-host-protocol/blob/main/CHANGELOG.md)
-  carries a `## [1.1.0] — Unreleased` placeholder with no items yet;
-  in-flight protocol changes are tracked via PRs touching `types/` and
-  the per-symbol `ACTION_INTRODUCED_IN` / `NOTIFICATION_INTRODUCED_IN`
-  maps in `types/version/registry.ts`.
+The 1.1.0 release (spec changelog `## [1.1.0] — 2026-11-12`):
 
-### 3.2 What is in flight on upstream main
+- **Served by the host** (the add-ons that rode the bump):
+  `environment.pathStyle` in the `initialize` result (the host's native
+  path grammar, platform-detected at setup — design.md §4) and
+  `CreateChatParams.title` (design.md §6).
+- **Answered permissively** (negotiated 1.1.x connections hit surface
+  the host does not implement): no `tcpConnections` capability
+  advertised (no `ahp-tcp:` channels — [§2.1](#21-commands),
+  [§2.2](#22-channels), [§2.4](#24-notifications)); no windowed
+  delivery accepted on `subscribe` ([§2.4](#24-notifications)); no
+  `multipleChatProviders` capability (the 1.148.0 client's per-chat
+  provider feature stays inert — design.md §4); ranged `resourceRead`
+  not honored ([§2.1](#21-commands)); `ChangesetFile.status` and the
+  changeset file/operation nonces not sent ([§1.7](#17-changeset-file-activity--nonces-ahp-110));
+  `SessionModelInfo.vendor`, the reasoning parts'
+  `startedAt` / `duration`, and `ToolCallResult.resultMetadata` not sent;
+  `chat/configChanged` (client-dispatchable) not driven — the
+  unsupported-action echo ([§1.4](#14-small-chat-surface-gaps),
+  [§2.3](#23-client-dispatchable-actions)); `chat/moved` (host-dispatched)
+  never emitted because `moveChat` is not implemented ([§2.1](#21-commands));
+  `authenticate`'s `accountId` / `target` unimplemented with the rest of
+  the auth surface ([§2.1](#21-commands)); and
+  `McpServerCustomization.children` (MCP-served skills, SEP-2640) not
+  published — the customization catalog carries `serverTools`, not
+  skills (design.md [§7.5](design.md#75-session-customization-catalog)).
+- **Unchanged on the wire** (verified in the bump, no mapping change):
+  elicitation ([§1.1](#11-elicitation-completion-decision-pending)),
+  terminal I/O (design.md [§12](design.md#12-synthetic-terminals)), the
+  permission-reply shape ([§1.4](#14-small-chat-surface-gaps)), and the
+  queued-message/steering mirror rules — 1.1.0's unified
+  `queuedMessages` list + `PendingMessage.kind` coexists with the
+  deprecated `steeringMessage` mirror, and a 1.0.0-negotiating client
+  that reads only the mirror is unaffected (design.md
+  [§8](design.md#8-turn-lifecycle--state-machine)).
 
-Read from the registry maps on `main`:
+### 3.2 Versioning & negotiation today
 
-- **Actions introduced in 1.1.0:** `chat/configChanged`, `chat/moved`
-  (the companion to the 1.0.0 `moveChat` command).
-- **Notifications introduced in 1.1.0:** `channel/frame`,
-  `channel/credit`, `channel/snapshot` — frame-based channel
-  multiplexing over the transport — plus `tcp/data`, `tcp/eof`,
-  `tcp/reset` — a **raw TCP byte-stream surface**. This is a new
-  capability class (byte streams over AHP), not needed by the current
-  feature set.
-- **Stability churn to expect:** the below-stable channels shipped in
-  1.0.0 — automations (*Early development*) and canvas
-  (*Experimental*) — are the likeliest 1.1.0 change surface.
+- **npm:** 1.1.0 is the latest published release and the strict pin.
+  Policy unchanged: AHP stays **strict-pinned** — a future upgrade is a
+  deliberate release, not a `^`-range drift.
+- **Negotiation:** the pinned package's baselines are still
+  `['1.0.0', '0.9.0']`, so a client offering any 1.x or 0.9.x version
+  negotiates the highest string it offered — including offers newer than
+  the pin itself: 1.x is additive-optional over the 1.0 wire, so a
+  `1.2.0` offer is echoed and its newer surface is answered
+  permissively. The 1.148.0 client already offers its vendored
+  development version (`1.2.0`) first when its
+  `chat.agentHost.multipleChatProviders.enabled` setting is on — and
+  negotiates it (design.md §4).
+- **1.2.0:** in flight as a draft on the spec site and upstream
+  `main`; not a published release.
 
-### 3.3 What an upgrade would look like
+### 3.3 Decision triggers to watch
 
-- Bump the strict pin to `@microsoft/agent-host-protocol@1.1.0`.
-  Policy: AHP stays **strict-pinned** — an upgrade is a deliberate
-  release, not a `^`-range drift.
-- **Handshake: no code change.** `src/handshake.ts` delegates to the
-  pinned package's `negotiateProtocolVersion` +
-  `SUPPORTED_PROTOCOL_VERSIONS`; upgrading the package widens the
-  accepted baselines automatically ([design.md §4](design.md#4-connection-model--handshake)).
-- The new surface (frame/credit, `tcp/*`, `configChanged`, `moved`) is
-  additive and opt-in — nothing is required to interoperate.
-- `serverInfo.version` is *this package's* version (read from
-  `package.json` at runtime), not the protocol version — unaffected.
-- **Decision triggers to watch:** automations stabilizing (relevant
-  only if an opencode-side automation concept is ever built — the
-  blocker today is opencode, not the protocol); client adoption of
-  `fetchTurns` (makes [§1.3](#13-turn-history-hydration-fetchturns)
-  user-visible); any 1.1.0 change to elicitation or terminal I/O
-  semantics that alters the mappings in [§1.1](#11-elicitation-completion-decision-pending)
-  / [design.md §12](design.md#12-synthetic-terminals).
+- **AHP automations stabilizing** — the surface is still *"1.0 -
+  Early development"* in 1.1.0 and moving in 1.2.0-dev (the automation
+  round-trips already grew `targets.previousSession` /
+  `targets.chat`). The opencode side is no longer the blocker — 2.4.1's
+  automations system (`ctx.experimental.automation`,
+  [§4.3](#43-opencode-241--the-delta-the-host-is-compatible-with))
+  provides the backing; what remains is the host bridge
+  ([§2.2](#22-channels)) and a client in the field asking for runs.
+- **Client adoption of `fetchTurns`** — makes
+  [§1.3](#13-turn-history-hydration-fetchturns) user-visible.
+- **1.2.0 in flight** — when a client in the field starts driving the
+  1.2.x surface this host answers permissively, re-assess what
+  permissive covers.
+- **Elicitation or terminal I/O changes** — any 1.2.x change to those
+  semantics alters the mappings in
+  [§1.1](#11-elicitation-completion-decision-pending) /
+  [design.md §12](design.md#12-synthetic-terminals).
 
 ---
 
@@ -469,8 +561,8 @@ Read from the registry maps on `main`:
 
 ### 4.1 opencode — feature requests to file
 
-Ordered by impact. Findings verified against v2.2.6 source and current
-`main` (88 commits ahead) where noted.
+Ordered by impact. Findings verified against the v2.4.1 source and
+current `main` where noted.
 
 1. **Auto-boot / server-scoped plugin hook** — the **cold-boot
    residual**. A location boots only on an HTTP request to the opencode
@@ -500,7 +592,7 @@ Ordered by impact. Findings verified against v2.2.6 source and current
    location ([design.md §15.3](design.md#153-location-idle-timeout)).
 3. **`session.update` dropping `archived`** — the plugin host's
    `session.update` forwards only title / metadata / permissions and
-   **silently drops `input.archived`** (v2.2.6 and current dev); HTTP
+   **silently drops `input.archived`** (v2.4.1 and current dev); HTTP
    `PATCH /api/session/{id}` accepts `{archived}`. Consequence: a
    plugin cannot archive a session from the plugin surface — no current
    product consequence.
@@ -519,21 +611,23 @@ Ordered by impact. Findings verified against v2.2.6 source and current
    ([§2.1](#21-commands)). Long-term; no current client need.
 8. **Multiroot sessions** — a session/location model that spans several
    checkouts; opencode's `Location.Ref` is a single `directory`
-   (v2.2.7) and the agent's tool access is confined to it. Would unlock
-   the AHP 1.0.0 `multipleWorkingDirectories` capability
+   (v2.4.1) and the agent's tool access is confined to it. Would unlock
+   the AHP `multipleWorkingDirectories` capability
    ([§1.5](#15-multiroot-sessions-multipleworkingdirectories)); until
    then any additional working directory would be metadata-only to the
    agent. No client in the field drives it today.
  9. **`mcp.tools.changed` on the public event stream** — the event
    exists (ephemeral, `{ server }`) but is absent from the
    `EventManifest.Server` inventory a plugin's event subscription
-   delivers (v2.2.6); adding it would let the host re-push
+   delivers (v2.4.1); adding it would let the host re-push
    `serverTools` when an MCP server adds or removes tools
    ([§1.6](#16-live-re-push-of-the-session-customization-catalog)).
-   Long-term; no current client need. Note: opencode 2.3.x has since
-   shipped a draft MCP Events extension (`experimental.mcp.event`, a
-   per-server subscription) on the public inventory — the likely
-   successor to this request; [§4.3](#43-opencode-23x--the-delta-the-host-is-compatible-with).
+   Long-term; no current client need. Note: opencode 2.4.1 ships the
+   MCP Events surface unconditionally (the `experimental.mcp_events`
+   flag is removed; the per-server subscription and its
+   `experimental.mcp.event` event are on the public inventory) — the
+   likely successor to this request;
+   [§4.3](#43-opencode-241--the-delta-the-host-is-compatible-with).
 10. **Per-MCP-server configuration provenance** — the MCP status list
    a plugin can see is name, title, and status: no config file, no
    key path. The host therefore anchors every `McpServerCustomization`
@@ -555,10 +649,11 @@ remote elicitation — the three that change the shape of the product.
 
 ### 4.2 VS Code — upstream requests & watches
 
-Work candidates the 1.145.2 client (and the two-machine pass,
+Work candidates the 1.148.0 client (and the two-machine pass,
 testing.md §4) point at. The client-behavior facts themselves live in
 design.md — terminal rendering (§12.1), the permission-card UI (§7.4),
-command requirements (§6).
+command requirements (§6), the `multipleChatProviders` handshake
+behavior (§4).
 
 - **Request to VS Code: render session-claimed terminals.** The current
   Agents window renders none of the host's `ahp-terminal:` channels
@@ -571,67 +666,109 @@ command requirements (§6).
   new-session sends. Latent for **every** third-party host — worth a
   host-implementer documentation note.
 - **Clarify with VS Code: what `setClientManagedSettingsPermissions`
-  expects.** VS Code-specific post-init notification with no AHP 1.0.0
+  expects.** VS Code-specific post-init notification with no AHP
   counterpart; the host accepts it as a no-op (design.md §6). If the
   client expects a specific response or behavior, that should be
   documented.
 - **Potential host work: publish `ConfirmationOption`s for a richer
   permission card** (custom labels instead of the plain approve/deny UI
-  whose deny action reads "Skip" — design.md §7.4). An AHP 1.0.0 field,
-  but the options can only express what opencode's permission reply can
+  whose deny action reads "Skip" — design.md §7.4). An AHP field, but
+  the options can only express what opencode's permission reply can
   answer with (`once` / `reject` today) — blocked by the `always` gap
   ([§1.4](#14-small-chat-surface-gaps)).
-- **`fetchTurns` is unused by the 1.145.2 client** (type-only in the
-  official TS client) — turn hydration ([§1.3](#13-turn-history-hydration-fetchturns))
-  has no user-visible effect until client adoption.
+- **`fetchTurns` is unused by the 1.148.0 client against a direct
+  host** (type-only in the official TS client; the client's paged-
+  history path is web-pubsub-relay-only) — turn hydration
+  ([§1.3](#13-turn-history-hydration-fetchturns)) has no user-visible
+  effect until client adoption.
+- **Watch: the 1.148.0 client's per-chat-provider feature
+  (`multipleChatProviders`).** Behind the non-default
+  `chat.agentHost.multipleChatProviders.enabled` setting, the client
+  offers its vendored development protocol version first (negotiated
+  here) and signals the setting in `initialize`'s `_meta`; the feature
+  stays inert because the host advertises no
+  `multipleChatProviders` capability and its re-initialize gate never
+  engages (design.md §4). Backing it would need a per-chat
+  agent/provider knob — the session-config schema is empty and
+  `createChat` takes no agent today — so it is a watch until a client
+  in the field needs per-chat provider divergence.
 - **Watch:** AHP client updates in VS Code that drive more of the
   protocol surface (resource watches, `root/progress`, automations,
   elicitations) — each becomes a candidate for host support in the
-  priority order of [§2](#2-the-ahp-100-surface-the-host-does-not-implement).
+  priority order of [§2](#2-the-ahp-110-surface-the-host-does-not-implement).
 
-### 4.3 opencode 2.3.x — the delta the host is compatible with
+### 4.3 opencode 2.4.1 — the delta the host is compatible with
 
-The plugin's `@opencode/plugin` peer floor is `^2.2.6`, so the 2.3.x
-line it now runs against (2.3.2) is in range. The 2.2.6 → 2.3.2 delta
-is additive for the host: nothing it calls through `ctx.*` changed in a
-breaking way, and the new wire events are dropped as unimplemented
-(graceful). The items below are the parts of the delta worth recording —
-the ones with a future host mapping, or an upstream watch — not a
-per-file changelog. Verified against opencode 2.3.2 source.
+The plugin's `@opencode/plugin` peer floor is `^2.2.6`, so the 2.4.1
+line it now runs against is in range (the published
+`@opencode/plugin@2.4.1` matches the source analyzed here). The
+2.2.6 → 2.4.1 delta is wire-additive for the host: no `ctx.*` member
+was removed or renamed, no manifest event type was removed or reshaped
+(the `EventManifest.Server` diff is additions only), and the
+`session.prompt` / `session.update` / `session.create` payload shapes
+are unchanged — at 2.4.1 the plugin host's `session.update` still
+forwards only title / metadata / permissions, so
+[§4.1](#41-opencode--feature-requests-to-file) item 3 still stands.
+The items below are the parts of the delta worth recording — the ones
+with a future host mapping, or an upstream watch — not a per-file
+changelog. Verified against the opencode 2.4.1 source.
 
-- **New manifest events.** `session.step.first-token` (durable; a
-  first-token latency marker) and `experimental.mcp.event` (ephemeral;
-  one event from an MCP Events subscription). The host drops both as
-  unimplemented today. `session.step.first-token` has no direct AHP
-  1.0.0 slot — mapping it would need a new chat/turn part — so it stays
-  a candidate, not a gap any client hits. `experimental.mcp.event` is
-  the watch below.
-- **MCP Events (draft extension).** opencode 2.3.x ships a draft "MCP
-  Events" surface: a per-server subscription (`pending` → `active` →
-  `ended`) and the `experimental.mcp.event` event, now on the public
-  `EventManifest.Server` inventory a plugin's event subscription
-  delivers. This is upstream's new mechanism for MCP change
-  notifications — the likely successor to the `mcp.tools.changed`
-  request in [§4.1](#41-opencode--feature-requests-to-file) item 9 (and
-  the MCP-change half of [§1.6](#16-live-re-push-of-the-session-customization-catalog)).
-  It is a draft with no compatibility guarantee, and it changes the
-  shape of the request (a subscription + event stream rather than a
-  single `tools.changed` event). Watch it and re-point item 9 / §1.6
-  toward it once it stabilizes. No host work until then — AHP 1.0.0
-  still has no slot for MCP resource-change state, and the event is
-  live-only.
-- **New hook surface, unused.** `SessionHooks.fork` (a `{ sessionID }`
-  hook fired on a session fork) and the `packages/plugin/src/gui` (GUI
-  plugin) surface are new/expanded in 2.3.x. The host is a headless
-  plugin that drives `ctx.session.*` directly and ships no GUI, so
-  neither is applicable today; noted so a fork-aware host (or a GUI
-  front-end) has the seam located.
-
-A few more additive items sit on opencode `main` (32 commits past 2.3.2)
-that are not yet in a release and are not tracked here individually —
-`experimental.model.resolve`, `SessionRequestMessage.metadata`, and a
-`codemode` idle-background kind, among them. They will be re-assessed
-when they land in a release the peer range covers.
+- **New `ctx.experimental.automation` namespace.** `create` / `list` /
+  `delete`, wired in the plugin host with `Permission.Unattended` —
+  the plugin-side API for the new automations system, whose runs are
+  first-class sessions (an `automation` context on tool calls; the
+  `automations` flag was replaced by a top-level `automations: boolean`
+  config key, default on). The host has no AHP-side automations surface
+  ([§2.2](#22-channels)), so this is a watch: it becomes a candidate
+  once AHP automations stabilize and a client in the field asks for
+  runs, with opencode's automation sessions then addressable from the
+  plugin.
+- **MCP Events are now unconditional.** The `experimental.mcp_events`
+  flag is removed (a config that still sets it gets a "removed"
+  diagnostic — a warning, not fatal), and the per-server subscription
+  plus its `experimental.mcp.event` event are always negotiated. This
+  is the likely successor to the `mcp.tools.changed` request
+  ([§4.1](#41-opencode--feature-requests-to-file) item 9; the
+  MCP-change half of [§1.6](#16-live-re-push-of-the-session-customization-catalog)) —
+  the shape is a subscription + event stream rather than a single
+  `tools.changed` event, and the event is live-only. No host work until
+  it stabilizes and AHP has a slot for MCP resource-change state (the
+  `Customization` union still has no resource type — §1.6).
+- **MCP protocol default `"legacy"` → `"auto"`.** MCP servers are now
+  probed for the 2026-07-28 protocol revision, with fallback to
+  legacy. No host code change; behaviorally visible only if an MCP
+  server mishandles the probe — pin `"legacy"` in the location's MCP
+  config then.
+- **New public manifest events.** `experimental.job.updated`
+  (ephemeral; `{ info: Job.Info }`, kinds `shell` / `subagent` /
+  `image` / `video` / `codemode`) and `experimental.push.updated`
+  (ephemeral; mobile push state), alongside the 2.3.x-era
+  `session.step.first-token` (durable) and `experimental.mcp.event`.
+  The host drops all of them as unimplemented today;
+  `session.step.first-token` has no direct AHP slot — mapping it
+  would need a new chat/turn part — so it stays a candidate.
+- **Session-message behavior changes — no host effect (recorded).**
+  The subagent completion inbox `text` wrapper tag changed
+  (`<subagent sessionID=...>` → `<background-result kind="subagent"
+  ...>`), but the host detects these reports by the unchanged
+  `metadata.source: "subagent"` on the synthetic inbox item, and passes
+  the text through — no parsing to update. The image-notice
+  `metadata.source` value and tool name changed
+  (`experimental_image_generate` → `generate_image`; a `generate_video`
+  family is new), and nothing in the host branches on those strings.
+  Recorded so a future turn reader does not re-learn it the hard way.
+- **The idle sweep is unchanged.** Plugin-published events still carry
+  no envelope `location` (the `bus` / `LocationActivity` machinery is
+  unchanged), so `experimental.location_idle_timeout: false` remains
+  mandatory for the AHP location ([§4.1](#41-opencode--feature-requests-to-file)
+  item 2; design.md §15.3).
+- **Permission behavior nuance — no wire change.** The
+  `permission.reply` shape is unchanged; under an automation run
+  (`Permission.Unattended`) a `permission.ask` hook that downgrades
+  `allow` → `ask` now requires an explicit allow, and "allow always"
+  for a web URL saves the site (scheme + host), not the exact URL.
+  Affects automation hook authors, not the host's reply mapping
+  ([§1.4](#14-small-chat-surface-gaps)).
 
 ---
 
@@ -651,7 +788,7 @@ case changes:
   tunnels, TLS reverse proxies) — the native TLS termination shipped;
   the rest is operational, not architectural.
 - **AHP in-flux features** (automations, canvas) — tracked by
-  stability, not version ([§3](#3-ahp-110-status-and-upgrade-path)).
+  stability, not version ([§3](#3-ahp-110-released-2026-11-12-and-pinned)).
 
 ---
 
